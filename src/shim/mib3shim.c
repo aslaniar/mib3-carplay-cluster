@@ -573,7 +573,7 @@ static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
       if (p_CFRelease) p_CFRelease(va);          /* dict retains it */
     }
   }
-  if (p_CFShow) { logline("cluster","CFShow(dict) ->"); p_CFShow(d); }
+  if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow) { logline("cluster","CFShow(dict) ->"); p_CFShow(d); }
 }
 
 /* ==========================================================================
@@ -1076,7 +1076,7 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
     int rc2 = real_AddScreenDisplay(inArray, cu, cfeat, cindev, cfps, cw, chp, cw, chp);
     logkv("AddScreenDisplay","cluster rc",(u64)(u32)rc2,0);
     if (rc2 == 0) add_cluster_fields(inArray, cw, chp);
-    if (p_CFShow && inArray && *inArray) { logline("AddScreenDisplay","CFShow(displays) ->"); p_CFShow(*inArray); }
+    if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow && inArray && *inArray) { logline("AddScreenDisplay","CFShow(displays) ->"); p_CFShow(*inArray); }
   }
   return rc;
 }
@@ -1099,7 +1099,7 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
 
   if (responseOut && *responseOut){
     logline("SessionSetup","response dict:");
-    if (p_CFShow) p_CFShow(*responseOut);
+    if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow) p_CFShow(*responseOut);
   }
 
   /* Handle any type-111 (cluster) stream the unit's dispatcher dropped:
@@ -1135,8 +1135,10 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
   }
 
   /* Inject enabledFeatures = [altScreen, viewAreas, uiContext] if missing.
-   * Gated: inert (no marker) => don't touch the response at all. */
-  if (gate_active() && responseOut && *responseOut && p_CFDictionarySetValue &&
+   * Gated: inert (no marker) => don't touch the response at all.
+   * MIB3_SHIM_ENABLEDFEAT=0 ablates it at runtime (set via target_env.py) so we
+   * can tell whether THIS is what kills the session -- no rebuild required. */
+  if (env_on("MIB3_SHIM_ENABLEDFEAT",1) && gate_active() && responseOut && *responseOut && p_CFDictionarySetValue &&
       p_CFStringCreateWithCString && p_kCFTypeArrayCallBacks) {
     CFStringRef k = p_CFStringCreateWithCString(0,"enabledFeatures",K128);
     if (k && (!p_CFDictionaryGetValue || !p_CFDictionaryGetValue(*responseOut,k))) {
@@ -1152,7 +1154,7 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
         }
         p_CFDictionarySetValue(*responseOut, k, arr);
         logline("SessionSetup","injected enabledFeatures");
-        if (p_CFShow) p_CFShow(*responseOut);
+        if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow) p_CFShow(*responseOut);
       } else {
         logline("SessionSetup","enabledFeatures array alloc failed");
       }
