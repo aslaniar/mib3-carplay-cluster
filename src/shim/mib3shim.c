@@ -114,6 +114,20 @@ static void logline(const char *tag, const char *msg){
   log_open();
   if (logfd >= 0) write(logfd, mem, b.n);
 }
+
+/* ---------------------------------------------------------------------------
+ * INSTRUMENTATION (2026-10-15).
+ *
+ * A raw entry marker that depends on NOTHING -- not resolve(), not the /tmp log
+ * path, not any env. If /dev/shm/mib3shim_hit never appears, the shim was never
+ * entered at all, and the call never reached us.
+ * ------------------------------------------------------------------------- */
+#define O_TRUNC 01000
+static void hit(const char *tag, unsigned long n)
+{
+  int f = open("/dev/shm/mib3shim_hit", O_WRONLY|O_CREAT|O_TRUNC, 0666);
+  if (f >= 0) write(f, tag, n);
+}
 static void logkv(const char *tag, const char *key, u64 v, int hex){
   char mem[256]; buf b={mem,sizeof(mem)-2,0};
   bs(&b,key); bs(&b,"="); if(hex) bhex(&b,v); else bu64(&b,v,10,0);
@@ -1012,6 +1026,8 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
                                      int widthPhysical,
                                      int heightPhysical)
 {
+  hit("ADD\n", 4);                       /* prove entry, independent of everything */
+  logline("AddScreenDisplay","ENTERED");  /* before resolve(): resolve() may fail */
   resolve();
   logline("AddScreenDisplay","CALL");
   log_uuid("AddScreenDisplay/uuid", uuid);
@@ -1063,6 +1079,8 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
  * ========================================================================*/
 void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionaryRef *responseOut)
 {
+  hit("SETUP\n", 6);                      /* prove entry, independent of everything */
+  logline("SessionSetup","ENTERED");       /* before resolve(): resolve() may fail */
   resolve();
   logline("SessionSetup","CALL");
   logkv("SessionSetup","session",(u64)session,1);
