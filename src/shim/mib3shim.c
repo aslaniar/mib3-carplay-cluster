@@ -52,6 +52,33 @@ extern long   write(int fd, const void *buf, unsigned long n);
 extern int    close(int fd);
 
 #define RTLD_NEXT    ((void *)-1L)
+#define RTLD_DEFAULT ((void *)0)
+
+/* ---------------------------------------------------------------------------
+ * Two-tier symbol resolution.
+ *
+ * RTLD_NEXT is correct when this shim is loaded BEFORE the real libraries
+ * (LD_PRELOAD / DT_NEEDED ordering): it finds the next object after us.
+ *
+ * But when the shim is dlopen()ed into a process that is ALREADY RUNNING, it is
+ * appended LAST in the search order -- so RTLD_NEXT finds nothing and EVERY
+ * pointer in resolve() came back NULL. The shim then had no real function to
+ * forward to and broke whatever call it intercepted.
+ *
+ * In that case RTLD_DEFAULT is correct: the real libraries are already in the
+ * global scope and we are last, so the first definition found is the real one.
+ *
+ * Load-time behaviour is unchanged (RTLD_NEXT succeeds and wins); the fallback
+ * only ever runs when RTLD_NEXT fails.
+ * ------------------------------------------------------------------------- */
+extern void *dlsym(void *handle, const char *name);
+static void *R(const char *name)
+{
+  void *p = dlsym(RTLD_NEXT, name);
+  if (!p) p = dlsym(RTLD_DEFAULT, name);
+  return p;
+}
+
 #define O_WRONLY 1
 #define O_CREAT  0100
 #define O_APPEND 02000
@@ -324,61 +351,61 @@ static volatile int saw_main_display = 0;
 static void resolve(void){
   if (resolved) return;
   resolved = 1;
-  p_CFStringCreateWithCString = (fn_CFStringCreateWithCString)dlsym(RTLD_NEXT,"CFStringCreateWithCString");
-  p_CFStringGetCString        = (fn_CFStringGetCString)       dlsym(RTLD_NEXT,"CFStringGetCString");
-  p_CFArrayGetCount           = (fn_CFArrayGetCount)          dlsym(RTLD_NEXT,"CFArrayGetCount");
-  p_CFArrayGetValueAtIndex    = (fn_CFArrayGetValueAtIndex)   dlsym(RTLD_NEXT,"CFArrayGetValueAtIndex");
-  p_CFArrayAppendValue        = (fn_CFArrayAppendValue)       dlsym(RTLD_NEXT,"CFArrayAppendValue");
-  p_CFDictionarySetValue      = (fn_CFDictionarySetValue)     dlsym(RTLD_NEXT,"CFDictionarySetValue");
-  p_CFDictionaryGetValue      = (fn_CFDictionaryGetValue)     dlsym(RTLD_NEXT,"CFDictionaryGetValue");
-  p_CFShow                    = (fn_CFShow)                   dlsym(RTLD_NEXT,"CFShow");
-  p_CFRelease                 = (fn_CFRelease)                dlsym(RTLD_NEXT,"CFRelease");
-  p_CFDictionarySetInt64      = (fn_CFDictionarySetInt64)     dlsym(RTLD_NEXT,"CFDictionarySetInt64");
-  p_CFDictionaryCreateMutable = (fn_CFDictionaryCreateMutable)dlsym(RTLD_NEXT,"CFDictionaryCreateMutable");
-  p_CFDictionaryGetInt64      = (fn_CFDictionaryGetInt64)     dlsym(RTLD_NEXT,"CFDictionaryGetInt64");
-  p_CFGetTypeID               = (fn_CFGetTypeID)              dlsym(RTLD_NEXT,"CFGetTypeID");
-  p_CFArrayGetTypeID          = (fn_CFTypeGetTypeID)          dlsym(RTLD_NEXT,"CFArrayGetTypeID");
-  p_CFDictionaryGetTypeID     = (fn_CFTypeGetTypeID)          dlsym(RTLD_NEXT,"CFDictionaryGetTypeID");
+  p_CFStringCreateWithCString = (fn_CFStringCreateWithCString)R("CFStringCreateWithCString");
+  p_CFStringGetCString        = (fn_CFStringGetCString)       R("CFStringGetCString");
+  p_CFArrayGetCount           = (fn_CFArrayGetCount)          R("CFArrayGetCount");
+  p_CFArrayGetValueAtIndex    = (fn_CFArrayGetValueAtIndex)   R("CFArrayGetValueAtIndex");
+  p_CFArrayAppendValue        = (fn_CFArrayAppendValue)       R("CFArrayAppendValue");
+  p_CFDictionarySetValue      = (fn_CFDictionarySetValue)     R("CFDictionarySetValue");
+  p_CFDictionaryGetValue      = (fn_CFDictionaryGetValue)     R("CFDictionaryGetValue");
+  p_CFShow                    = (fn_CFShow)                   R("CFShow");
+  p_CFRelease                 = (fn_CFRelease)                R("CFRelease");
+  p_CFDictionarySetInt64      = (fn_CFDictionarySetInt64)     R("CFDictionarySetInt64");
+  p_CFDictionaryCreateMutable = (fn_CFDictionaryCreateMutable)R("CFDictionaryCreateMutable");
+  p_CFDictionaryGetInt64      = (fn_CFDictionaryGetInt64)     R("CFDictionaryGetInt64");
+  p_CFGetTypeID               = (fn_CFGetTypeID)              R("CFGetTypeID");
+  p_CFArrayGetTypeID          = (fn_CFTypeGetTypeID)          R("CFArrayGetTypeID");
+  p_CFDictionaryGetTypeID     = (fn_CFTypeGetTypeID)          R("CFDictionaryGetTypeID");
   /* cluster-stream helpers (libAirPlay / libCoreUtils exports) */
-  p_ServerSocketOpen  = (fn_ServerSocketOpen) dlsym(RTLD_NEXT,"ServerSocketOpen");
-  p_NetSocketCreate   = (fn_NetSocketCreate)  dlsym(RTLD_NEXT,"NetSocket_CreateWithNative");
-  p_NetSocketNative   = (fn_NetSocketNative)  dlsym(RTLD_NEXT,"NetSocket_GetNative");
-  p_SocketAccept      = (fn_SocketAccept)     dlsym(RTLD_NEXT,"SocketAccept");
-  p_SocketSetQoS      = (fn_SocketSetQoS)     dlsym(RTLD_NEXT,"SocketSetQoS");
-  p_ScreenCreate      = (fn_ScreenCreate)     dlsym(RTLD_NEXT,"AirPlayReceiverSessionScreen_Create");
-  p_ScreenSetup       = (fn_ScreenSetup)      dlsym(RTLD_NEXT,"AirPlayReceiverSessionScreen_Setup");
-  p_ScreenStart       = (fn_ScreenStart)      dlsym(RTLD_NEXT,"AirPlayReceiverSessionScreen_StartSession");
-  p_ScreenStop        = (fn_ScreenStop)       dlsym(RTLD_NEXT,"AirPlayReceiverSessionScreen_StopSession");
-  p_ScreenDelete      = (fn_ScreenDelete)     dlsym(RTLD_NEXT,"AirPlayReceiverSessionScreen_Delete");
-  p_ScreenProcFrames  = (fn_ScreenProcFrames) dlsym(RTLD_NEXT,"AirPlayReceiverSessionScreen_ProcessFrames");
-  p_ScreenSetSec      = (fn_ScreenSetSec)     dlsym(RTLD_NEXT,"AirPlayReceiverSessionScreen_SetSecurityInfo");
-  p_ScreenSetChaCha   = (fn_ScreenSetChaCha)  dlsym(RTLD_NEXT,"AirPlayReceiverSessionScreen_SetChaChaSecurityInfo");
-  p_ScreenSetTS       = (fn_ScreenSetTS)      dlsym(RTLD_NEXT,"AirPlayReceiverSessionScreen_SetTimeSynchronizer");
-  p_DeriveAES         = (fn_DeriveAES)        dlsym(RTLD_NEXT,"AirPlay_DeriveAESKeySHA512ForScreen");
-  p_pthreadCreate     = (fn_pthreadCreate)    dlsym(RTLD_NEXT,"pthread_create");
-  p_close             = (fn_close)            dlsym(RTLD_NEXT,"close");
-  p_malloc            = (void*(*)(unsigned long)) dlsym(RTLD_NEXT,"malloc");
-  p_free              = (void(*)(void*))          dlsym(RTLD_NEXT,"free");
-  p_realSetSurface    = (fn_SetSurface)       dlsym(RTLD_NEXT,"_Z29CarPlayAppFrameworkSetSurfaceP26CarPlayAppFrameworkPrivatePvj");
+  p_ServerSocketOpen  = (fn_ServerSocketOpen) R("ServerSocketOpen");
+  p_NetSocketCreate   = (fn_NetSocketCreate)  R("NetSocket_CreateWithNative");
+  p_NetSocketNative   = (fn_NetSocketNative)  R("NetSocket_GetNative");
+  p_SocketAccept      = (fn_SocketAccept)     R("SocketAccept");
+  p_SocketSetQoS      = (fn_SocketSetQoS)     R("SocketSetQoS");
+  p_ScreenCreate      = (fn_ScreenCreate)     R("AirPlayReceiverSessionScreen_Create");
+  p_ScreenSetup       = (fn_ScreenSetup)      R("AirPlayReceiverSessionScreen_Setup");
+  p_ScreenStart       = (fn_ScreenStart)      R("AirPlayReceiverSessionScreen_StartSession");
+  p_ScreenStop        = (fn_ScreenStop)       R("AirPlayReceiverSessionScreen_StopSession");
+  p_ScreenDelete      = (fn_ScreenDelete)     R("AirPlayReceiverSessionScreen_Delete");
+  p_ScreenProcFrames  = (fn_ScreenProcFrames) R("AirPlayReceiverSessionScreen_ProcessFrames");
+  p_ScreenSetSec      = (fn_ScreenSetSec)     R("AirPlayReceiverSessionScreen_SetSecurityInfo");
+  p_ScreenSetChaCha   = (fn_ScreenSetChaCha)  R("AirPlayReceiverSessionScreen_SetChaChaSecurityInfo");
+  p_ScreenSetTS       = (fn_ScreenSetTS)      R("AirPlayReceiverSessionScreen_SetTimeSynchronizer");
+  p_DeriveAES         = (fn_DeriveAES)        R("AirPlay_DeriveAESKeySHA512ForScreen");
+  p_pthreadCreate     = (fn_pthreadCreate)    R("pthread_create");
+  p_close             = (fn_close)            R("close");
+  p_malloc            = (void*(*)(unsigned long)) R("malloc");
+  p_free              = (void(*)(void*))          R("free");
+  p_realSetSurface    = (fn_SetSurface)       R("_Z29CarPlayAppFrameworkSetSurfaceP26CarPlayAppFrameworkPrivatePvj");
   /* the framework's per-stream frame entry -- the interception seam (see below).
    * On the unit this is libCarPlayMediaFramework.so; on the desk bench it is the
    * stub preloaded AFTER the shim (LD_PRELOAD="mib3shim.so libstubgfx.so"). */
-  p_realSSPD          = (fn_ScreenStreamProcessData) dlsym(RTLD_NEXT,"ScreenStreamProcessData");
+  p_realSSPD          = (fn_ScreenStreamProcessData) R("ScreenStreamProcessData");
   /* the callbacks structs are data: dlsym returns their addresses.
    * NB: the unit's CoreFoundation Lite exports kCFL* callbacks -- the Apple
    * kCFTypeArrayCallBacks name does NOT exist here (that was a bug). */
-  p_kCFTypeArrayCallBacks     = (void*)                        dlsym(RTLD_NEXT,"kCFLArrayCallBacksCFLTypes");
-  p_kCFLDictKeyCB             = (void*)                        dlsym(RTLD_NEXT,"kCFLDictionaryKeyCallBacksCFLTypes");
-  p_kCFLDictValCB             = (void*)                        dlsym(RTLD_NEXT,"kCFLDictionaryValueCallBacksCFLTypes");
-  p_kCFLBooleanTrue           = (void*)                        dlsym(RTLD_NEXT,"kCFLBooleanTrue");
-  real_AddScreenDisplay       = (fn_AddScreenDisplay)          dlsym(RTLD_NEXT,"AirPlayInfoArrayAddScreenDisplay");
-  real_SessionSetup           = (fn_SessionSetup)              dlsym(RTLD_NEXT,"AirPlayReceiverSessionSetup");
+  p_kCFTypeArrayCallBacks     = (void*)                        R("kCFLArrayCallBacksCFLTypes");
+  p_kCFLDictKeyCB             = (void*)                        R("kCFLDictionaryKeyCallBacksCFLTypes");
+  p_kCFLDictValCB             = (void*)                        R("kCFLDictionaryValueCallBacksCFLTypes");
+  p_kCFLBooleanTrue           = (void*)                        R("kCFLBooleanTrue");
+  real_AddScreenDisplay       = (fn_AddScreenDisplay)          R("AirPlayInfoArrayAddScreenDisplay");
+  real_SessionSetup           = (fn_SessionSetup)              R("AirPlayReceiverSessionSetup");
 
   /* runtime gate: stick-marker scan (opendir/readdir/access from libc) */
-  p_opendir  = (fn_opendir)  dlsym(RTLD_NEXT,"opendir");
-  p_readdir  = (fn_readdir)  dlsym(RTLD_NEXT,"readdir");
-  p_closedir = (fn_closedir) dlsym(RTLD_NEXT,"closedir");
-  p_access   = (fn_access)   dlsym(RTLD_NEXT,"access");
+  p_opendir  = (fn_opendir)  R("opendir");
+  p_readdir  = (fn_readdir)  R("readdir");
+  p_closedir = (fn_closedir) R("closedir");
+  p_access   = (fn_access)   R("access");
 
   /* libAirPlay load base, for the few UNEXPORTED internal helpers we must call
    * by RVA (chacha key derive, screen time-sync callbacks).  R8830L-specific. */
@@ -501,7 +528,7 @@ static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
   /* viewAreas = [ { view rect + safeArea (full panel, drawUIOutsideSafeArea) } ] */
   if (p_CFDictionaryCreateMutable && p_CFDictionarySetInt64 && p_CFArrayAppendValue &&
       p_CFDictionarySetValue && p_kCFTypeArrayCallBacks && p_kCFLDictKeyCB && p_kCFLDictValCB){
-    fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)dlsym(RTLD_NEXT,"CFArrayCreateMutable");
+    fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
     CFMutableArrayRef va = mka ? mka(0,0,p_kCFTypeArrayCallBacks) : 0;
     if (va){
       CFMutableDictionaryRef area = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
@@ -711,7 +738,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
       CFMutableArrayRef streams = (CFMutableArrayRef)p_CFDictionaryGetValue((CFDictionaryRef)response, sstr("streams"));
       int created = 0;
       if (!streams){
-        fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)dlsym(RTLD_NEXT,"CFArrayCreateMutable");
+        fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
         if (mka && p_kCFTypeArrayCallBacks){
           streams = mka(0,0,p_kCFTypeArrayCallBacks);
           if (streams && p_CFDictionarySetValue){ p_CFDictionarySetValue((CFMutableDictionaryRef)response, sstr("streams"), streams); created = 1; }
@@ -818,38 +845,38 @@ static gfx_t g_gfx;
 static void resolve_gfx(void){
   if (g_gfx.resolved) return;
   g_gfx.resolved = 1;
-  p_wl_display_connect   = (fn_wl_connect)       dlsym(RTLD_NEXT,"wl_display_connect");
-  p_wl_display_disconnect= (fn_wl_disp_void)     dlsym(RTLD_NEXT,"wl_display_disconnect");
-  p_wl_display_get_fd    = (fn_wl_disp_int)      dlsym(RTLD_NEXT,"wl_display_get_fd");
-  p_wl_display_roundtrip = (fn_wl_disp_int)      dlsym(RTLD_NEXT,"wl_display_roundtrip");
-  p_wl_display_dispatch_pending = (fn_wl_disp_int)dlsym(RTLD_NEXT,"wl_display_dispatch_pending");
-  p_wl_display_flush     = (fn_wl_disp_int)      dlsym(RTLD_NEXT,"wl_display_flush");
-  p_wl_pmc               = (fn_wl_pmc)           dlsym(RTLD_NEXT,"wl_proxy_marshal_constructor");
-  p_wl_pmcv              = (fn_wl_pmcv)          dlsym(RTLD_NEXT,"wl_proxy_marshal_constructor_versioned");
-  p_wl_proxy_add_listener= (fn_wl_add_listener)  dlsym(RTLD_NEXT,"wl_proxy_add_listener");
-  p_wl_proxy_destroy     = (fn_wl_destroy)       dlsym(RTLD_NEXT,"wl_proxy_destroy");
-  p_wl_egl_window_create = (fn_wl_eglwin_create) dlsym(RTLD_NEXT,"wl_egl_window_create");
-  p_wl_egl_window_destroy= (fn_wl_eglwin_destroy)dlsym(RTLD_NEXT,"wl_egl_window_destroy");
-  p_eglGetDisplay        = (fn_eglGetDisplay)    dlsym(RTLD_NEXT,"eglGetDisplay");
-  p_eglInitialize        = (fn_eglInitialize)    dlsym(RTLD_NEXT,"eglInitialize");
-  p_eglBindAPI           = (fn_eglBindAPI)       dlsym(RTLD_NEXT,"eglBindAPI");
-  p_eglChooseConfig      = (fn_eglChooseConfig)  dlsym(RTLD_NEXT,"eglChooseConfig");
-  p_eglCreateWindowSurface=(fn_eglCreateWindowSurface)dlsym(RTLD_NEXT,"eglCreateWindowSurface");
-  p_eglCreateContext     = (fn_eglCreateContext) dlsym(RTLD_NEXT,"eglCreateContext");
-  p_eglMakeCurrent       = (fn_eglMakeCurrent)   dlsym(RTLD_NEXT,"eglMakeCurrent");
-  p_eglSwapBuffers       = (fn_eglSwapBuffers)   dlsym(RTLD_NEXT,"eglSwapBuffers");
-  p_glClear              = (fn_gl_void1)         dlsym(RTLD_NEXT,"glClear");
-  p_glViewport           = (fn_gl_void4)         dlsym(RTLD_NEXT,"glViewport");
-  p_glGenTextures        = (fn_gl_gen)           dlsym(RTLD_NEXT,"glGenTextures");
-  p_glBindTexture        = (fn_gl_bind)          dlsym(RTLD_NEXT,"glBindTexture");
-  p_glTexImage2D         = (fn_gl_tex)           dlsym(RTLD_NEXT,"glTexImage2D");
-  p_glTexSubImage2D      = (fn_gl_tex)           dlsym(RTLD_NEXT,"glTexSubImage2D");
-  p_glDrawArrays         = (fn_gl_draw)          dlsym(RTLD_NEXT,"glDrawArrays");
-  p_wl_registry_interface      = dlsym(RTLD_NEXT,"wl_registry_interface");
-  p_wl_compositor_interface    = dlsym(RTLD_NEXT,"wl_compositor_interface");
-  p_wl_surface_interface       = dlsym(RTLD_NEXT,"wl_surface_interface");
-  p_ivi_application_interface  = dlsym(RTLD_NEXT,"ivi_application_interface");
-  p_ivi_surface_interface      = dlsym(RTLD_NEXT,"ivi_surface_interface");
+  p_wl_display_connect   = (fn_wl_connect)       R("wl_display_connect");
+  p_wl_display_disconnect= (fn_wl_disp_void)     R("wl_display_disconnect");
+  p_wl_display_get_fd    = (fn_wl_disp_int)      R("wl_display_get_fd");
+  p_wl_display_roundtrip = (fn_wl_disp_int)      R("wl_display_roundtrip");
+  p_wl_display_dispatch_pending = (fn_wl_disp_int)R("wl_display_dispatch_pending");
+  p_wl_display_flush     = (fn_wl_disp_int)      R("wl_display_flush");
+  p_wl_pmc               = (fn_wl_pmc)           R("wl_proxy_marshal_constructor");
+  p_wl_pmcv              = (fn_wl_pmcv)          R("wl_proxy_marshal_constructor_versioned");
+  p_wl_proxy_add_listener= (fn_wl_add_listener)  R("wl_proxy_add_listener");
+  p_wl_proxy_destroy     = (fn_wl_destroy)       R("wl_proxy_destroy");
+  p_wl_egl_window_create = (fn_wl_eglwin_create) R("wl_egl_window_create");
+  p_wl_egl_window_destroy= (fn_wl_eglwin_destroy)R("wl_egl_window_destroy");
+  p_eglGetDisplay        = (fn_eglGetDisplay)    R("eglGetDisplay");
+  p_eglInitialize        = (fn_eglInitialize)    R("eglInitialize");
+  p_eglBindAPI           = (fn_eglBindAPI)       R("eglBindAPI");
+  p_eglChooseConfig      = (fn_eglChooseConfig)  R("eglChooseConfig");
+  p_eglCreateWindowSurface=(fn_eglCreateWindowSurface)R("eglCreateWindowSurface");
+  p_eglCreateContext     = (fn_eglCreateContext) R("eglCreateContext");
+  p_eglMakeCurrent       = (fn_eglMakeCurrent)   R("eglMakeCurrent");
+  p_eglSwapBuffers       = (fn_eglSwapBuffers)   R("eglSwapBuffers");
+  p_glClear              = (fn_gl_void1)         R("glClear");
+  p_glViewport           = (fn_gl_void4)         R("glViewport");
+  p_glGenTextures        = (fn_gl_gen)           R("glGenTextures");
+  p_glBindTexture        = (fn_gl_bind)          R("glBindTexture");
+  p_glTexImage2D         = (fn_gl_tex)           R("glTexImage2D");
+  p_glTexSubImage2D      = (fn_gl_tex)           R("glTexSubImage2D");
+  p_glDrawArrays         = (fn_gl_draw)          R("glDrawArrays");
+  p_wl_registry_interface      = R("wl_registry_interface");
+  p_wl_compositor_interface    = R("wl_compositor_interface");
+  p_wl_surface_interface       = R("wl_surface_interface");
+  p_ivi_application_interface  = R("ivi_application_interface");
+  p_ivi_surface_interface      = R("ivi_surface_interface");
   logline("gfx","resolved");
   logkv("gfx","wl_display_connect",(u64)p_wl_display_connect,1);
   logkv("gfx","eglGetDisplay",(u64)p_eglGetDisplay,1);
@@ -1089,7 +1116,7 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
     CFStringRef k = p_CFStringCreateWithCString(0,"enabledFeatures",K128);
     if (k && (!p_CFDictionaryGetValue || !p_CFDictionaryGetValue(*responseOut,k))) {
       /* build a mutable array of the 3 feature strings */
-      fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)dlsym(RTLD_NEXT,"CFArrayCreateMutable");
+      fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
       CFMutableArrayRef arr = mka ? mka(0,0,p_kCFTypeArrayCallBacks) : 0;
       const char *feats[3] = {"altScreen","viewAreas","uiContext"};
       int i;
@@ -1284,12 +1311,12 @@ static void fmt_2int(char *out, int a, int b){
 static void resolve_bridge(void){
   if (g_br.resolved) return;
   g_br.resolved = 1;
-  p_CinemoCreateConfig     = (fn_CinemoCreate)    dlsym(RTLD_NEXT,"CinemoCreateConfig");
-  p_CinemoCreatePlaylist   = (fn_CinemoCreate)    dlsym(RTLD_NEXT,"CinemoCreatePlaylist");
-  p_CinemoCreateWindow     = (fn_CinemoCreateStr) dlsym(RTLD_NEXT,"CinemoCreateWindow");
-  p_CinemoCreateProjection = (fn_CinemoCreateStr) dlsym(RTLD_NEXT,"CinemoCreateProjection");
-  p_opt_video_device_id    = dlsym(RTLD_NEXT,"CINEMO_OPTION_VIDEO_DEVICE_ID");
-  p_iid_cinemo_option      = dlsym(RTLD_NEXT,"_ZN13ICinemoOption3iidE");
+  p_CinemoCreateConfig     = (fn_CinemoCreate)    R("CinemoCreateConfig");
+  p_CinemoCreatePlaylist   = (fn_CinemoCreate)    R("CinemoCreatePlaylist");
+  p_CinemoCreateWindow     = (fn_CinemoCreateStr) R("CinemoCreateWindow");
+  p_CinemoCreateProjection = (fn_CinemoCreateStr) R("CinemoCreateProjection");
+  p_opt_video_device_id    = R("CINEMO_OPTION_VIDEO_DEVICE_ID");
+  p_iid_cinemo_option      = R("_ZN13ICinemoOption3iidE");
   logline("bridge","resolved");
   logkv("bridge","CinemoCreateConfig",(u64)p_CinemoCreateConfig,1);
   logkv("bridge","CinemoCreatePlaylist",(u64)p_CinemoCreatePlaylist,1);
@@ -1410,7 +1437,7 @@ unsigned long mib3shim_bridge_fails(void){ return g_br.fail_count; }
  *
  * Gate: armed only when the stick marker is present (gate_active()), same as
  * the other seams; MIB3_SHIM_GUARD=0 overrides. Delegation to the real code
- * via dlsym(RTLD_NEXT, <mangled name>) on first use.
+ * via R( <mangled name>) on first use.
  *
  * KNOWN LIMITS (deliberate, benign): the flag is all-or-nothing for the rest
  * of the process lifetime; a single mid-session unsubscribe would mute all
@@ -1435,7 +1462,7 @@ typedef void (*fn_guard_unsub_all)(void*);                  /* (this) */
 typedef void (*fn_guard_unsub_str)(void*, void*);           /* WsClientImpl::unsubscribe(string) */
 
 static void *guard_real(const char *mangled){
-  return dlsym(RTLD_NEXT, mangled);
+  return R( mangled);
 }
 
 /* The exported wrappers. Names are the EXACT mangled identity of the librsic
