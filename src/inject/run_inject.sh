@@ -21,7 +21,7 @@ cp -f "$STICK/mib3shim.so" /dev/shm/mib3shim.so
 chmod 755 /dev/shm/mib3shim.so
 chsmack -a common::lib /dev/shm/mib3shim.so >/dev/null 2>&1
 echo "    label: $(chsmack /dev/shm/mib3shim.so 2>&1)"
-echo "    md5:   $(md5sum /dev/shm/mib3shim.so | cut -d' ' -f1)   want 40769a5f06947007f9da1688dce37b9a"
+echo "    md5:   $(md5sum /dev/shm/mib3shim.so | cut -d' ' -f1)   want 85fb46def13c2628c683e2104c4bf23a"
 
 echo "[*] log + SMACK grants (RAM only)"
 : > /tmp/mib3shim.log

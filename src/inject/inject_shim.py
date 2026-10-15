@@ -101,20 +101,35 @@ def scan_regions(pid):
             if "r" in perms and p.startswith("/") and "mib3shim" not in p
             and (hi - lo) <= 64 * 1024 * 1024]
 
-def find_points_to(pid, value, regions):
-    needle = struct.pack("Q", value)
-    hits = []
+def shim_ranges(pid):
+    """Mappings of the loaded shim(s). A slot pointing anywhere in here is a slot
+    WE patched earlier -- so re-injection can find and repair its own work."""
+    out = []
+    for lo, hi, perms, off, p in maps(pid):
+        if "mib3shim" in p:
+            out.append((lo, hi))
+    return out
+
+def find_slots(pid, real, shim_rng, regions):
+    """Slots to (re)point at the shim: they hold the REAL address (fresh
+    injection), or they point into a shim mapping (a previous injection, which
+    would otherwise leave the new shim unreferenced -- the 0/0 patched case)."""
+    out = []
     for lo, hi, path in regions:
         try:
             data = read_mem(pid, lo, hi - lo)
         except Exception:
             continue
-        i = data.find(needle)
-        while i != -1:
-            if i % 8 == 0:
-                hits.append((lo + i, path))
-            i = data.find(needle, i + 1)
-    return hits
+        for i in xrange(0, len(data) - 7, 8):
+            v = struct.unpack_from("Q", data, i)[0]
+            if v == real:
+                out.append((lo + i, path))
+                continue
+            for a, b in shim_rng:
+                if a <= v < b:
+                    out.append((lo + i, path))
+                    break
+    return out
 
 def main():
     if len(sys.argv) != 3:
@@ -146,7 +161,7 @@ def main():
         shim = shim_base + shim_syms[sym]
         plan.append((sym, lib, real, shim))
         print "[i] %s\n      real = 0x%x  (%s + 0x%x)\n      shim = 0x%x  (shim + 0x%x)" % (
-            sym, real, lib, lib_syms[sym], shim, shim_syms[sym]))
+            sym, real, lib, lib_syms[sym], shim, shim_syms[sym])
 
     attached = []
     try:
@@ -169,9 +184,11 @@ def main():
         print "[+] attached %d thread(s)" % len(attached)
 
         regions = scan_regions(pid)
+        shim_rng = shim_ranges(pid)
+        print "[i] shim mappings: %d" % len(shim_rng)
         for sym, lib, real, shim in plan:
-            hits = find_points_to(pid, real, regions)
-            print "[i] %s: %d pointer(s) to the real function" % (sym, len(hits))
+            hits = find_slots(pid, real, shim_rng, regions)
+            print "[i] %s: %d slot(s) to point at the shim" % (sym, len(hits))
             ok = 0
             for addr, path in hits:
                 try:
@@ -181,8 +198,6 @@ def main():
                 except Exception, e:
                     print "      FAILED  0x%x  in %s : %s" % (addr, path, e)
             print "      -> %d/%d patched" % (ok, len(hits))
-            left = find_points_to(pid, real, regions)
-            print "      -> remaining references to real: %d" % len(left)
     finally:
         import ctypes
         libc = ctypes.CDLL("libc.so.6", use_errno=True)

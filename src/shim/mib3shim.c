@@ -1045,6 +1045,13 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
   int rc = real_AddScreenDisplay(inArray, uuid, features, primaryInputDevice,
                                  maxFPS, widthPixels, heightPixels, widthPhysical, heightPhysical);
 
+  /* INSTRUMENTATION 2026-10-15: the cluster advertisement is gated on four
+   * conditions. Log all of them so a silent skip becomes visible. */
+  logkv("AddScreenDisplay","real rc",(u64)(u32)rc,1);
+  logkv("AddScreenDisplay","saw_main",(u64)(u32)saw_main_display,1);
+  logkv("AddScreenDisplay","ADD_env",(u64)(u32)env_on("MIB3_SHIM_ADD",1),1);
+  logkv("AddScreenDisplay","gate",(u64)(u32)gate_active(),1);
+
   /* 2) advertise the cluster once, after the main display.
    *    RUNTIME GATE: only when the stick marker is present (gate_active()).
    *    If AddScreenDisplay fires before the stick is mounted the marker is
