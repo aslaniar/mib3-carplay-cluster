@@ -360,6 +360,20 @@ static fn_access   p_access;
 static int resolved = 0;
 static volatile int saw_main_display = 0;
 
+/* FIX (2026-10-15): the altScreen ENABLEMENT must be consistent with the altScreen
+ * ADVERTISEMENT.  iOS enforces this: if the control-SETUP response claims
+ * enabledFeatures ∋ "altScreen" it requires >=2 entries in the /info displays
+ * array, and if the flag is absent it requires <=1 (see the reference receiver
+ * luka-dev/mib2q-carplay-rgi: "_carEndpoint_setupStreams" count test).  Telling
+ * iOS "I have an alt screen" while advertising ONE display makes iOS refuse the
+ * session -- the observed "session does not come up".
+ *
+ * So the cluster is a single, process-wide decision: the display is advertised by
+ * the AddScreenDisplay seam (gated MIB3_SHIM_ADD) and that sets this flag; the
+ * SETUP seam injects "altScreen" ONLY when this flag is set.  No flag -> no
+ * cluster -> no altScreen claim -> the response is byte-identical to stock. */
+static volatile int g_cluster_advertised = 0;
+
 #define K128 (0x08000100)   /* kCFStringEncodingUTF8 */
 
 static void resolve(void){
@@ -1012,6 +1026,7 @@ const char *mib3shim_surface_name(void){ return surf_name(); }
 /* runtime-gate test hooks */
 int  mib3shim_marker_present(void){ resolve(); return marker_present(); }
 int  mib3shim_gate_active(void){ resolve(); return gate_active(); }
+int  mib3shim_cluster_advertised(void){ return g_cluster_advertised; }
 
 /* ==========================================================================
  * The display seam.
@@ -1075,7 +1090,8 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
     int cindev = (int)env_num("MIB3_SHIM_CINDEV", 0);
     int rc2 = real_AddScreenDisplay(inArray, cu, cfeat, cindev, cfps, cw, chp, cw, chp);
     logkv("AddScreenDisplay","cluster rc",(u64)(u32)rc2,0);
-    if (rc2 == 0) add_cluster_fields(inArray, cw, chp);
+    if (rc2 == 0){ add_cluster_fields(inArray, cw, chp); g_cluster_advertised = 1; }
+    logkv("AddScreenDisplay","cluster_advertised",(u64)(u32)g_cluster_advertised,0);
     if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow && inArray && *inArray) { logline("AddScreenDisplay","CFShow(displays) ->"); p_CFShow(*inArray); }
   }
   return rc;
@@ -1134,26 +1150,44 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
     }
   }
 
-  /* Inject enabledFeatures = [altScreen, viewAreas, uiContext] if missing.
-   * Gated: inert (no marker) => don't touch the response at all.
-   * MIB3_SHIM_ENABLEDFEAT=0 ablates it at runtime (set via target_env.py) so we
-   * can tell whether THIS is what kills the session -- no rebuild required. */
-  if (env_on("MIB3_SHIM_ENABLEDFEAT",1) && gate_active() && responseOut && *responseOut && p_CFDictionarySetValue &&
+  /* Inject enabledFeatures = [altScreen, viewAreas] if missing.
+   *
+   * FIX (2026-10-15): this is gated on g_cluster_advertised -- i.e. the cluster
+   * display was actually appended by the AddScreenDisplay seam in THIS process.
+   * Claiming "altScreen" without advertising the cluster violates the iOS gate
+   * (altScreen flag => the /info displays array must have >=2 entries), and iOS
+   * then refuses/tears down the session.  Coupling the two makes the advert and
+   * the negotiation a single decision: no cluster -> no claim -> the response is
+   * byte-identical to stock (the known-good path).
+   *
+   * The feature STRINGS were also corrected to match the reference receiver's
+   * working set: it appends exactly "altScreen" and "viewAreas".  The previous
+   * third string, "uiContext", makes iOS read UI-context URLs from the receiver
+   * (endpoint +0x3F / CopyUIContextURLs) -- a capability this unit does not have
+   * -- so it is off by default and only added if MIB3_SHIM_EF_UICONTEXT=1.
+   *
+   * MIB3_SHIM_ENABLEDFEAT=0 ablates the whole injection at runtime (target_env.py). */
+  if (env_on("MIB3_SHIM_ENABLEDFEAT",1) && gate_active() && g_cluster_advertised &&
+      responseOut && *responseOut && p_CFDictionarySetValue &&
       p_CFStringCreateWithCString && p_kCFTypeArrayCallBacks) {
     CFStringRef k = p_CFStringCreateWithCString(0,"enabledFeatures",K128);
     if (k && (!p_CFDictionaryGetValue || !p_CFDictionaryGetValue(*responseOut,k))) {
-      /* build a mutable array of the 3 feature strings */
+      /* build a mutable array of the feature strings */
       fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
       CFMutableArrayRef arr = mka ? mka(0,0,p_kCFTypeArrayCallBacks) : 0;
-      const char *feats[3] = {"altScreen","viewAreas","uiContext"};
+      const char *feats[3]; int nf = 0;
+      feats[nf++] = "altScreen";
+      feats[nf++] = "viewAreas";
+      if (env_on("MIB3_SHIM_EF_UICONTEXT",0)) feats[nf++] = "uiContext";
       int i;
       if (arr){
-        for (i=0;i<3;i++){
+        for (i=0;i<nf;i++){
           CFStringRef f = p_CFStringCreateWithCString(0,feats[i],K128);
           if (f) p_CFArrayAppendValue(arr, f);
         }
         p_CFDictionarySetValue(*responseOut, k, arr);
         logline("SessionSetup","injected enabledFeatures");
+        logkv("SessionSetup","enabledFeatures n",(u64)nf,0);
         if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow) p_CFShow(*responseOut);
       } else {
         logline("SessionSetup","enabledFeatures array alloc failed");
@@ -1161,6 +1195,9 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
     } else {
       logline("SessionSetup","enabledFeatures already present");
     }
+  } else if (env_on("MIB3_SHIM_ENABLEDFEAT",1) && gate_active() && !g_cluster_advertised) {
+    /* the cluster was NOT advertised this process: claim nothing (consistency). */
+    logline("SessionSetup","altScreen not claimed (cluster not advertised)");
   }
 }
 
@@ -1489,7 +1526,17 @@ typedef void (*fn_guard_unsub_all)(void*);                  /* (this) */
 typedef void (*fn_guard_unsub_str)(void*, void*);           /* WsClientImpl::unsubscribe(string) */
 
 static void *guard_real(const char *mangled){
-  return R( mangled);
+  /* RTLD_NEXT ONLY -- deliberately NOT the two-tier R().
+   *
+   * The guard seams only ever sit BEFORE librsic in the search order (LD_PRELOAD
+   * is first).  RTLD_NEXT is the correct "next object after us" lookup there.
+   * RTLD_DEFAULT is POISON for these symbols: when the real symbol is absent
+   * (e.g. the desk bench, which has no librsic) dlsym(RTLD_DEFAULT, mangled)
+   * finds THIS shim's own interposer, so the seam delegates to itself and
+   * recurses/hangs.  (Found 2026-10-15: it made driver_guard hang on the desk for
+   * all three shim builds.)  RTLD_NEXT returns NULL instead, which is exactly
+   * "no real function to forward to". */
+  return dlsym(RTLD_NEXT, mangled);
 }
 
 /* The exported wrappers. Names are the EXACT mangled identity of the librsic
