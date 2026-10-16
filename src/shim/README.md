@@ -34,13 +34,28 @@ appended dict** with `type=111`, `initialURL` and a `viewAreas[]` (+`initialView
 PlayPort/LIVI field-level spec. LG's own call passes `config[0x13]` as `primaryInputDevice`.
 
 **`AirPlayReceiverSessionSetup`** — LG's handler for the iPhone's stream request. The shim logs it,
-injects `enabledFeatures = [altScreen, viewAreas, uiContext]` into the SETUP response (if absent),
-and — the important part — **handles the type-111 stream itself**. The unit's dispatcher inside this
-function only handles types 100/101/102/110 and drops 111; and the session holds exactly **one**
-screen, so a second 110 is impossible. The shim therefore owns a *second* screen object and
-reproduces the unit's `_ScreenSetup` + `_ScreenThread` for it via the exported
-`AirPlayReceiverSessionScreen_*` API, opening a data port and appending `{type:111, dataPort}` to
-the response, then servicing it in its own thread. See `LANE_TYPE111_HANDLER_2026-10-09.md`.
+injects `enabledFeatures = [altScreen, viewAreas]` into the SETUP response (if absent; `uiContext`
+only with `MIB3_SHIM_EF_UICONTEXT=1`), and — the important part — **handles the type-111 stream
+itself**. The unit's dispatcher inside this function only handles types 100/101/102/110 and drops
+111; and the session holds exactly **one** screen, so a second 110 is impossible. The shim therefore
+owns a *second* screen object and reproduces the unit's `_ScreenSetup` + `_ScreenThread` for it via
+the exported `AirPlayReceiverSessionScreen_*` API, opening a data port and appending
+`{type:111, dataPort}` to the response, then servicing it in its own thread. See
+`LANE_TYPE111_HANDLER_2026-10-09.md`.
+
+**`AirPlayCopyServerInfo`** — the `/info` builder (exported by libAirPlay; its intra-lib call goes
+through the PLT/GOT slot `.got+0x3ec40`, so it interposes exactly like the two above). It returns the
+mutable dictionary the unit then serialises with `CFBinaryPlistV0Create` and sends as the `/info`
+response. The shim completes the **modern CarKit display schema** on it — the `AddScreenDisplay` seam
+only reaches the `displays` array and cannot add a sibling top-level key, so this is the only seam
+that can: per display `uid`, `properties:["Instrument Cluster"]` (cluster), a NON-empty
+`initialVideoStreams`, `adjacentViewAreas`, `name`, `maxFPS`, `width/heightPixels`,
+`width/heightPhysical`, and `cornerMasks`/`nightMode`/`limitedUI`/`limitedUIElements`; top-level
+`displayPanels` = the same `[main,cluster]` array, and `extendedFeatures:["altScreen","viewAreas"]`.
+The main display is modernised too (`uid` + `initialVideoStreams` naming its real uuid). Field shapes:
+luka-dev/mib2q-carplay-rgi (verified against the iOS 26.1 CarKit decompile) — see
+`../LANE_ADVERT_COMPLETE_2026-10-15.md`. `MIB3_SHIM_INFO=0` ablates it; nothing is published unless a
+type-111 entry is actually present in `displays`.
 
 ## Environment knobs
 `MIB3_SHIM_ADD=1` (default) advertise the cluster · `MIB3_SHIM_W/H/FPS` = geometry (default
@@ -52,6 +67,9 @@ the response, then servicing it in its own thread. See `LANE_TYPE111_HANDLER_202
 **`MIB3_SHIM_IVIID`** = ivi surface id for that surface (default `0x4d4233`) ·
 **`MIB3_SHIM_SURFNAME`** = its name/`internalIdentifier` (default `mib3-cluster-surface`) ·
 `MIB3_SHIM_SKIP_REAL=1` = test hook (skip the real SessionSetup; harness only) ·
+**`MIB3_SHIM_ENABLEDFEAT=0/1`** (default 1) inject `enabledFeatures` into the SETUP response ·
+**`MIB3_SHIM_INFO=0/1`** (default 1) complete the modern `/info` schema (the `AirPlayCopyServerInfo`
+seam) · **`MIB3_SHIM_NIGHT=0/1`** force the cluster/main `nightMode` (default: copy the main entry) ·
 `MIB3_SHIM_FRAMEDBG=1` = log CarPlay output-surface changes · `MIB3_SHIM_DBG=1` verbose. Logs to
 **`/tmp/mib3shim.log`**.
 

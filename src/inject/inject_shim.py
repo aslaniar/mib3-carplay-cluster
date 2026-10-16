@@ -2,6 +2,13 @@
 # ============================================================================
 # inject_shim.py -- install the shim's seams into an ALREADY RUNNING carplay.
 #
+# v3: SELF-VERIFYING, and py2/py3 compatible (the unit is python2; the desk can
+#     run this file through python3 -m py_compile as a syntax check).
+#     After patching it READS THE SLOTS BACK and asserts each one points at the
+#     intended shim symbol; it fails (non-zero) if a seam has no slot, if a slot
+#     does not verify, or if the on-disk shim's md5 does not match the expected
+#     value.  A "0/0 patched" run can no longer look like success.
+#
 # v2: resolves EVERY address deterministically from the ELF files on disk plus
 #     the process's load bases in /proc/maps. No dlsym inside the target (the v1
 #     dlsym call returned garbage, which silently patched a call slot with a
@@ -12,20 +19,47 @@
 # the GOT slots that already hold the real addresses and repoint them at the
 # shim's own symbols.
 #
-#   /usr/bin/python inject_shim.py <pid> /dev/shm/mib3shim.so
+#   /usr/bin/python inject_shim.py <pid> /dev/shm/mib3shim.so [expected_md5]
 #
 # RAM only; a reboot erases it.
 # ============================================================================
+from __future__ import print_function
 import os, struct, sys
+
+try:
+    xrange
+except NameError:
+    xrange = range
 
 PTRACE_ATTACH = 16
 PTRACE_DETACH = 17
 WALL = getattr(os, "WALL", 0x40000000)
 
+# (symbol, defining library, library whose GOT holds the call slot)
+# AirPlayInfoArrayAddScreenDisplay is called FROM libCarPlayAppFramework, so its
+# slot lives there; the other two are intra-libAirPlay calls via libAirPlay's own
+# PLT, so their slots live in libAirPlay (verified: R_AARCH64_JUMP_SLOT
+# .got+0x3ec40 -> AirPlayCopyServerInfo; .got+0x3e440 -> AirPlayReceiverSessionSetup).
 SEAMS = (
-    ("AirPlayInfoArrayAddScreenDisplay", "libAirPlay.so"),
-    ("AirPlayReceiverSessionSetup",     "libAirPlay.so"),
+    ("AirPlayInfoArrayAddScreenDisplay", "libAirPlay.so", "libCarPlayAppFramework.so"),
+    ("AirPlayReceiverSessionSetup",     "libAirPlay.so", "libAirPlay.so"),
+    ("AirPlayCopyServerInfo",           "libAirPlay.so", "libAirPlay.so"),
 )
+
+def md5_file(path):
+    try:
+        import hashlib
+        h = hashlib.md5()
+        f = open(path, "rb")
+        while True:
+            b = f.read(65536)
+            if not b:
+                break
+            h.update(b)
+        f.close()
+        return h.hexdigest()
+    except Exception:
+        return None
 
 def threads(pid):
     try:
@@ -62,7 +96,7 @@ def elf_dynsym(path):
           for i in range(e_shnum)]
     def sname(i):
         o = sh[e_shstrndx][4] + sh[i][0]
-        return f[o:f.index("\0", o)]
+        return f[o:f.index(b"\0", o)].decode("latin1")
     syms = {}
     for i, s in enumerate(sh):
         if sname(i) != ".dynsym":
@@ -73,7 +107,7 @@ def elf_dynsym(path):
             o = symoff + k * 24
             nameoff, info, other, shndx, val, size = struct.unpack_from("<IBBHQQ", f, o)
             if nameoff:
-                n = f[stroff + nameoff:f.index("\0", stroff + nameoff)]
+                n = f[stroff + nameoff:f.index(b"\0", stroff + nameoff)].decode("latin1")
                 syms[n] = val
     return syms
 
@@ -93,12 +127,14 @@ def write_mem(pid, addr, data):
     finally:
         os.close(fd)
 
-def scan_regions(pid):
-    """File-backed readable mappings -- where GOT slots live. NOT restricted to
-    writable: RELRO remaps .got read-only after relocation. The shim's own
-    mappings are excluded so its saved real pointers are never clobbered."""
+def scan_regions(pid, hold_lib):
+    """File-backed readable mappings OF THE OWNING LIBRARY -- where its GOT slots
+    live. NOT restricted to writable: RELRO remaps .got read-only after
+    relocation. Scanning only the owning library (not every readable region)
+    removes false-positive matches of the same qword elsewhere (e.g. a
+    function-pointer table) -- a stale/bogus slot could otherwise be repointed."""
     return [(lo, hi, p) for lo, hi, perms, off, p in maps(pid)
-            if "r" in perms and p.startswith("/") and "mib3shim" not in p
+            if "r" in perms and p.endswith(hold_lib)
             and (hi - lo) <= 64 * 1024 * 1024]
 
 def shim_ranges(pid):
@@ -110,6 +146,12 @@ def shim_ranges(pid):
             out.append((lo, hi))
     return out
 
+def in_shim(v, shim_rng):
+    for a, b in shim_rng:
+        if a <= v < b:
+            return True
+    return False
+
 def find_slots(pid, real, shim_rng, regions):
     """Slots to (re)point at the shim: they hold the REAL address (fresh
     injection), or they point into a shim mapping (a previous injection, which
@@ -120,50 +162,63 @@ def find_slots(pid, real, shim_rng, regions):
             data = read_mem(pid, lo, hi - lo)
         except Exception:
             continue
-        for i in xrange(0, len(data) - 7, 8):
+        if len(data) < 8:
+            continue
+        for i in xrange(0, len(data) - 8 + 1, 8):
             v = struct.unpack_from("Q", data, i)[0]
-            if v == real:
+            if v == real or in_shim(v, shim_rng):
                 out.append((lo + i, path))
-                continue
-            for a, b in shim_rng:
-                if a <= v < b:
-                    out.append((lo + i, path))
-                    break
     return out
 
 def main():
-    if len(sys.argv) != 3:
-        print "usage: inject_shim.py <pid> </path/to/mib3shim.so>"
+    if len(sys.argv) < 3 or len(sys.argv) > 4:
+        print("usage: inject_shim.py <pid> </path/to/mib3shim.so> [expected_md5]")
         return 2
     pid = int(sys.argv[1]); shim_path = sys.argv[2]
+    want_md5 = sys.argv[3] if len(sys.argv) == 4 else None
     if not os.path.exists(shim_path):
-        print "[!] %s missing" % shim_path
+        print("[!] %s missing" % shim_path)
+        return 1
+
+    got_md5 = md5_file(shim_path)
+    print("[i] shim md5 = %s%s" % (got_md5, ("  want " + want_md5) if want_md5 else ""))
+    if want_md5 and got_md5 and got_md5 != want_md5:
+        print("[!] SHIM MD5 MISMATCH -- refusing to install the wrong artifact")
         return 1
 
     shim_base = load_base(pid, os.path.basename(shim_path))
     if not shim_base:
-        print "[!] the shim is not mapped in pid %d -- dlopen it first" % pid
+        print("[!] the shim is not mapped in pid %d -- dlopen it first (inject.py)" % pid)
         return 1
     shim_syms = elf_dynsym(shim_path)
-    print "[i] shim base = 0x%x" % shim_base
+    shim_rng = shim_ranges(pid)
+    print("[i] shim base = 0x%x   shim mappings = %d" % (shim_base, len(shim_rng)))
 
+    # ---- resolve + validate every plan BEFORE touching the target -------------
     plan = []
-    for sym, lib in SEAMS:
+    for sym, lib, hold in SEAMS:
         lib_base = load_base(pid, lib)
         if not lib_base:
-            print "[!] %s not mapped in the target" % lib
+            print("[!] %s not mapped in the target" % lib)
             return 1
         lib_syms = elf_dynsym("/lge/app_rw/lib64/" + lib)
-        if sym not in lib_syms or sym not in shim_syms:
-            print "[!] %s not found in %s/shim" % (sym, lib)
+        if sym not in lib_syms:
+            print("[!] %s not defined in %s" % (sym, lib))
+            return 1
+        if sym not in shim_syms:
+            print("[!] %s not exported by the shim -- build.sh should have caught this" % sym)
             return 1
         real = lib_base + lib_syms[sym]
         shim = shim_base + shim_syms[sym]
-        plan.append((sym, lib, real, shim))
-        print "[i] %s\n      real = 0x%x  (%s + 0x%x)\n      shim = 0x%x  (shim + 0x%x)" % (
-            sym, real, lib, lib_syms[sym], shim, shim_syms[sym])
+        if not in_shim(shim, shim_rng):
+            print("[!] shim symbol %s (+0x%x) is NOT inside a shim mapping -- abort" % (sym, shim_syms[sym]))
+            return 1
+        plan.append((sym, lib, hold, real, shim))
+        print("[i] %s\n      real = 0x%x  (%s + 0x%x)\n      shim = 0x%x  (shim + 0x%x)\n      slot holder = %s" % (
+            sym, real, lib, lib_syms[sym], shim, shim_syms[sym], hold))
 
     attached = []
+    failures = []
     try:
         for t in threads(pid):
             try:
@@ -179,25 +234,37 @@ def main():
             except Exception:
                 pass
         if not attached:
-            print "[!] could not attach (SMACK blocking ptrace?)"
+            print("[!] could not attach (SMACK blocking ptrace?)")
             return 1
-        print "[+] attached %d thread(s)" % len(attached)
+        print("[+] attached %d thread(s)" % len(attached))
 
-        regions = scan_regions(pid)
-        shim_rng = shim_ranges(pid)
-        print "[i] shim mappings: %d" % len(shim_rng)
-        for sym, lib, real, shim in plan:
+        for sym, lib, hold, real, shim in plan:
+            regions = scan_regions(pid, hold)
+            if not regions:
+                failures.append("%s: no mapped region for %s" % (sym, hold))
+                continue
             hits = find_slots(pid, real, shim_rng, regions)
-            print "[i] %s: %d slot(s) to point at the shim" % (sym, len(hits))
+            print("[i] %s: %d slot(s) to point at the shim" % (sym, len(hits)))
+            if not hits:
+                failures.append("%s: no GOT slot found" % sym)
+                continue
             ok = 0
             for addr, path in hits:
                 try:
                     write_mem(pid, addr, struct.pack("Q", shim))
-                    print "      patched 0x%x  in %s" % (addr, path)
-                    ok += 1
-                except Exception, e:
-                    print "      FAILED  0x%x  in %s : %s" % (addr, path, e)
-            print "      -> %d/%d patched" % (ok, len(hits))
+                    # VERIFY: read the slot back immediately
+                    back = struct.unpack_from("Q", read_mem(pid, addr, 8), 0)[0]
+                    if back == shim:
+                        print("      patched 0x%x  in %s  (verified)" % (addr, path))
+                        ok += 1
+                    else:
+                        print("      VERIFY FAILED 0x%x (read back 0x%x)" % (addr, back))
+                except Exception as e:
+                    print("      FAILED  0x%x  in %s : %s" % (addr, path, e))
+            if ok != len(hits):
+                failures.append("%s: %d/%d verified" % (sym, ok, len(hits)))
+            else:
+                print("      -> %d/%d patched+verified" % (ok, len(hits)))
     finally:
         import ctypes
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -209,11 +276,21 @@ def main():
                 libc.ptrace(PTRACE_DETACH, t, None, None)
             except Exception:
                 pass
-        print "[+] detached %d thread(s)" % len(attached)
+        print("[+] detached %d thread(s)" % len(attached))
 
-    print "[i] NEXT: plug in the iPhone."
-    print "    /dev/shm/mib3shim_hit  appears  => the shim WAS entered"
-    print "    /tmp/mib3shim.log      shows     => how far it got"
+    if failures:
+        print("[!] INSTALL FAILED: " + "; ".join(failures))
+        return 1
+
+    print("[+] ALL SEAMS INSTALLED AND VERIFIED (%d)" % len(plan))
+    print("[i] NEXT: plug in the iPhone.")
+    print("    /dev/shm/mib3shim_hit  appears  => the shim WAS entered")
+    print("    /tmp/mib3shim.log      shows     => how far it got")
+    print("    want: 'init: resolved' -> 'AddScreenDisplay: ADDING cluster display'")
+    print("          -> 'cluster: type=111'")
+    print("          -> 'info: completed: uid/properties/initialVideoStreams + displayPanels'")
+    print("          -> 'cluster: response entry {type:111,dataPort} appended'")
     return 0
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())

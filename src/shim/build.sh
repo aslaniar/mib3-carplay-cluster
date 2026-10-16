@@ -17,4 +17,7 @@ echo "built mib3shim.so ($(wc -c < mib3shim.so) bytes)"
 $READELF -h mib3shim.so | grep -E "Class|Machine|Type"
 echo "--- NEEDED ---"; $READELF -d mib3shim.so | grep NEEDED
 echo "--- GLIBC version refs (want <= 2.23) ---"; $READELF -V mib3shim.so | grep -oE "GLIBC_[0-9.]+" | sort -u
-echo "--- exported seams ---"; $READELF --dyn-syms mib3shim.so | grep -E "FUNC.*GLOBAL.*(AirPlayInfoArrayAddScreenDisplay|AirPlayReceiverSessionSetup)"
+echo "--- exported seams ---"; $READELF --dyn-syms mib3shim.so | grep -E "FUNC.*GLOBAL.*(AirPlayInfoArrayAddScreenDisplay|AirPlayReceiverSessionSetup|AirPlayCopyServerInfo)"
+for s in AirPlayInfoArrayAddScreenDisplay AirPlayReceiverSessionSetup AirPlayCopyServerInfo; do
+  $READELF --dyn-syms mib3shim.so | grep -q "GLOBAL.* $s\$" || { echo "MISSING SEAM: $s"; exit 1; }
+done

@@ -15,13 +15,21 @@
  *                                        with cluster geometry.
  *   AirPlayReceiverSessionSetup       -- log + (optionally) inject the
  *                                        "enabledFeatures" array into the
- *                                        session SETUP response.
+ *                                        session SETUP response; owns the
+ *                                        type-111 stream.
+ *   AirPlayCopyServerInfo             -- complete the modern CarKit /info schema
+ *                                        (uid/properties/initialVideoStreams +
+ *                                        top-level displayPanels/extendedFeatures)
+ *                                        on the mutable /info dict the unit is
+ *                                        about to serialise.
  *
  * Logs to /tmp/mib3shim.log (world-writable tmpfs; SMACK `_`).
  * Env knobs:
- *   MIB3_SHIM_ADD=0/1     advertise the cluster display (default 1)
- *   MIB3_SHIM_W/H/FPS     cluster geometry (default 1280x720@60)
- *   MIB3_SHIM_DBG=0/1     verbose (default 1)
+ *   MIB3_SHIM_ADD=0/1         advertise the cluster display (default 1)
+ *   MIB3_SHIM_W/H/FPS         cluster geometry (default 1280x480@60)
+ *   MIB3_SHIM_INFO=0/1        complete the modern /info schema (default 1)
+ *   MIB3_SHIM_ENABLEDFEAT=0/1 inject enabledFeatures into SETUP (default 1)
+ *   MIB3_SHIM_DBG=0/1         verbose (default 1)
  * ==========================================================================*/
 
 typedef unsigned char      u8;
@@ -238,6 +246,14 @@ typedef void  (*fn_gl_draw)(unsigned,int,int);
 typedef int (*fn_AddScreenDisplay)(CFMutableArrayRef*, CFStringRef,
                                    int, int, int, int, int, int, int);
 typedef void (*fn_SessionSetup)(void*, u64, CFMutableDictionaryRef*);
+/* AirPlayCopyServerInfo(server, arg1, errOut) -> the mutable /info dict.
+ * Verified call site: libAirPlay.so 0xeed4 sets only x0/x1/x2 (3 args) and the
+ * callee prologue reads x0 (server), x1, x2 (err out).  RELOCATION:
+ * R_AARCH64_JUMP_SLOT @ .got+0x3ec40 -> 0xe20c, so the intra-lib call is
+ * interposable exactly like the other two seams.  This is the /info builder:
+ * the dict it returns is CFDictionaryCreateMutable, handed straight to
+ * CFBinaryPlistV0Create and out as the HTTP /info response the phone reads. */
+typedef void *(*fn_CopyServerInfo)(void*, void*, void*);
 
 static fn_CFStringCreateWithCString p_CFStringCreateWithCString;
 static fn_CFStringGetCString        p_CFStringGetCString;
@@ -327,6 +343,7 @@ static void                  *p_ivi_surface_interface;
 
 static fn_AddScreenDisplay real_AddScreenDisplay;
 static fn_SessionSetup     real_SessionSetup;
+static fn_CopyServerInfo   real_CopyServerInfo;
 
 /* ==========================================================================
  * RUNTIME GATE (the physical cure) -- see LANE_PERSISTENCE_INSTALL_2026-10-14.md
@@ -373,6 +390,7 @@ static volatile int saw_main_display = 0;
  * SETUP seam injects "altScreen" ONLY when this flag is set.  No flag -> no
  * cluster -> no altScreen claim -> the response is byte-identical to stock. */
 static volatile int g_cluster_advertised = 0;
+static volatile int g_info_completed = 0;   /* set when the /info seam completed a cluster advert */
 
 #define K128 (0x08000100)   /* kCFStringEncodingUTF8 */
 
@@ -428,6 +446,7 @@ static void resolve(void){
   p_kCFLBooleanTrue           = (void*)                        R("kCFLBooleanTrue");
   real_AddScreenDisplay       = (fn_AddScreenDisplay)          R("AirPlayInfoArrayAddScreenDisplay");
   real_SessionSetup           = (fn_SessionSetup)              R("AirPlayReceiverSessionSetup");
+  real_CopyServerInfo         = (fn_CopyServerInfo)            R("AirPlayCopyServerInfo");
 
   /* runtime gate: stick-marker scan (opendir/readdir/access from libc) */
   p_opendir  = (fn_opendir)  R("opendir");
@@ -446,6 +465,7 @@ static void resolve(void){
   logkv("init","p_CFDictionaryCreateMutable",(u64)p_CFDictionaryCreateMutable,1);
   logkv("init","real_AddScreenDisplay",(u64)real_AddScreenDisplay,1);
   logkv("init","real_SessionSetup",(u64)real_SessionSetup,1);
+  logkv("init","real_CopyServerInfo",(u64)real_CopyServerInfo,1);
   logkv("init","p_realSSPD",(u64)p_realSSPD,1);
 }
 
@@ -536,23 +556,57 @@ static CFMutableDictionaryRef last_dict(CFMutableArrayRef *inArray){
 }
 static CFStringRef sstr(const char *s){ return p_CFStringCreateWithCString ? p_CFStringCreateWithCString(0,s,K128) : 0; }
 
+/* set-and-release helpers.  The KEY strings (and, for dsetv, the VALUE string)
+ * have +1 from CFStringCreateWithCString; the dict retains them, so we release
+ * our own reference immediately.  The previous code created a fresh key with
+ * sstr() at every call site and never released it -- one leaked CFString per key
+ * on every cluster advertisement.  Values handed to dseto are BORROWED by the
+ * caller (already +1 elsewhere or a CF constant) and are NOT released here. */
+static void dseti(CFMutableDictionaryRef d, const char *key, s64 v){
+  if (!d || !p_CFDictionarySetInt64) return;
+  CFStringRef k = sstr(key);
+  if (k){ p_CFDictionarySetInt64(d, k, v); if (p_CFRelease) p_CFRelease(k); }
+}
+static void dsetv(CFMutableDictionaryRef d, const char *key, const char *val){
+  if (!d || !p_CFDictionarySetValue) return;
+  CFStringRef k = sstr(key), v = sstr(val);
+  if (k && v) p_CFDictionarySetValue(d, k, v);
+  if (p_CFRelease){ if (v) p_CFRelease(v); if (k) p_CFRelease(k); }
+}
+static void dseto(CFMutableDictionaryRef d, const char *key, const void *obj){
+  if (!d || !p_CFDictionarySetValue || !obj) return;
+  CFStringRef k = sstr(key);
+  if (k){ p_CFDictionarySetValue(d, k, obj); if (p_CFRelease) p_CFRelease(k); }
+}
+/* get helpers that create+release the key (the old call sites leaked one
+ * CFString per read).  dgetk returns a BORROWED value (the dict owns it). */
+static void *dgetk(CFDictionaryRef d, const char *key){
+  if (!d || !p_CFDictionaryGetValue) return 0;
+  CFStringRef k = sstr(key); void *v = 0;
+  if (k){ v = (void*)p_CFDictionaryGetValue(d, k); if (p_CFRelease) p_CFRelease(k); }
+  return v;
+}
+static s64 dgeti64k(CFDictionaryRef d, const char *key, s64 dflt){
+  if (!d || !p_CFDictionaryGetValue || !p_CFDictionaryGetInt64) return dflt;
+  CFStringRef k = sstr(key); s64 v = dflt;
+  if (k){ if (p_CFDictionaryGetValue(d, k)) v = p_CFDictionaryGetInt64(d, k, 0);
+          if (p_CFRelease) p_CFRelease(k); }
+  return v;
+}
+
 static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
   CFMutableDictionaryRef d = last_dict(inArray);
   if (!d){ logline("cluster","no dict to annotate"); return; }
 
   /* type = 111 (alt / instrument-cluster stream) */
-  if (p_CFDictionarySetInt64){
-    int dtype = (int)env_num("MIB3_SHIM_TYPE", 111);
-    p_CFDictionarySetInt64(d, sstr("type"), (s64)dtype);
-    logkv("cluster","type",(u64)(u32)dtype,0);
-  }
+  { int dtype = (int)env_num("MIB3_SHIM_TYPE", 111);
+    dseti(d, "type", (s64)dtype);
+    logkv("cluster","type",(u64)(u32)dtype,0); }
   /* initialURL -- the cluster scene Apple Maps should render */
-  if (p_CFDictionarySetValue){
-    char *url = getenv("MIB3_SHIM_URL");
+  { char *url = getenv("MIB3_SHIM_URL");
     if (!url || !url[0]) url = "maps:/car/instrumentcluster/map";
-    p_CFDictionarySetValue(d, sstr("initialURL"), sstr(url));
-    logline("cluster/initialURL", url);
-  }
+    dsetv(d, "initialURL", url);
+    logline("cluster/initialURL", url); }
   /* viewAreas = [ { view rect + safeArea (full panel, drawUIOutsideSafeArea) } ] */
   if (p_CFDictionaryCreateMutable && p_CFDictionarySetInt64 && p_CFArrayAppendValue &&
       p_CFDictionarySetValue && p_kCFTypeArrayCallBacks && p_kCFLDictKeyCB && p_kCFLDictValCB){
@@ -562,23 +616,23 @@ static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
       CFMutableDictionaryRef area = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
       CFMutableDictionaryRef safe = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
       if (area && safe){
-        p_CFDictionarySetInt64(area, sstr("widthPixels"),  (s64)cw);
-        p_CFDictionarySetInt64(area, sstr("heightPixels"), (s64)chp);
-        p_CFDictionarySetInt64(area, sstr("originXPixels"),(s64)0);
-        p_CFDictionarySetInt64(area, sstr("originYPixels"),(s64)0);
-        p_CFDictionarySetInt64(safe, sstr("widthPixels"),  (s64)cw);
-        p_CFDictionarySetInt64(safe, sstr("heightPixels"), (s64)chp);
-        p_CFDictionarySetInt64(safe, sstr("originXPixels"),(s64)0);
-        p_CFDictionarySetInt64(safe, sstr("originYPixels"),(s64)0);
-        if (p_kCFLBooleanTrue && p_CFDictionarySetValue){
+        dseti(area, "widthPixels",  (s64)cw);
+        dseti(area, "heightPixels", (s64)chp);
+        dseti(area, "originXPixels",(s64)0);
+        dseti(area, "originYPixels",(s64)0);
+        dseti(safe, "widthPixels",  (s64)cw);
+        dseti(safe, "heightPixels", (s64)chp);
+        dseti(safe, "originXPixels",(s64)0);
+        dseti(safe, "originYPixels",(s64)0);
+        if (p_kCFLBooleanTrue){
           /* kCFLBooleanTrue is a CFBooleanRef *variable* (8-byte object): deref once. */
           void *btrue = *(void **)p_kCFLBooleanTrue;
-          if (btrue) p_CFDictionarySetValue(safe, sstr("drawUIOutsideSafeArea"), btrue);
+          if (btrue) dseto(safe, "drawUIOutsideSafeArea", btrue);
         }
-        p_CFDictionarySetValue(area, sstr("safeArea"), safe);
+        dseto(area, "safeArea", safe);
         p_CFArrayAppendValue(va, area);
-        p_CFDictionarySetValue(d, sstr("viewAreas"), va);
-        p_CFDictionarySetInt64(d, sstr("initialViewArea"), (s64)0);
+        dseto(d, "viewAreas", va);
+        dseti(d, "initialViewArea", 0);
         logline("cluster","viewAreas added");
       }
       /* release OUR +1 on area/safe (va retains area, area retains safe); the
@@ -588,6 +642,279 @@ static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
     }
   }
   if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow) { logline("cluster","CFShow(dict) ->"); p_CFShow(d); }
+}
+
+/* ==========================================================================
+ * /info COMPLETION -- the MODERN CarKit display schema (2026-10-15).
+ *
+ * THE GAP.  The unit's libAirPlay 320.17.4 builds `/info` in
+ * AirPlayCopyServerInfo(): it copies `displays` (and `extendedFeatures`,
+ * `audioFormats`, ...) from the platform dict into a CFMutableDictionary and
+ * returns it -- and the caller (libAirPlay 0xcc98, the /info HTTP handler)
+ * serialises that SAME dict with CFBinaryPlistV0Create.  LG's
+ * CarPlayConfiguration::setDisplays fills `displays` via
+ * AirPlayInfoArrayAddScreenDisplay, whose entries use the OLD 210 schema:
+ * identifier key `uuid`, and NO `initialVideoStreams`.  iOS-26-era CarKit
+ * (CRDisplayInfo / CARSessionConfiguration, verified against the working
+ * receivers) requires the NEW schema at the display-dict level and a SEPARATE
+ * top-level key `displayPanels`; a `displays` entry it cannot parse makes it
+ * reject the whole array and teardown-loop the session.
+ *
+ * Required fields (field-by-field, from luka-dev/mib2q-carplay-rgi
+ * hook/altscreen/altscreen_hook.c, itself verified against the iOS 26.1 CarKit
+ * decompile -- see LANE_ADVERT_COMPLETE_2026-10-15.md for the full table):
+ *   per display :  uid (CarKit initWithPhysicalScreenDictionary reads "uid";
+ *                  missing -> CRDisplayInfo nil -> the whole displays array is
+ *                  rejected), uuid (AirPlaySender picks 110 vs 111 by a
+ *                  uuid-vs-display-0 compare), name, type, maxFPS,
+ *                  width/heightPixels, width/heightPhysical, viewAreas,
+ *                  initialViewArea, adjacentViewAreas,
+ *                  initialVideoStreams (MUST be a present, NON-empty array or
+ *                  CRDisplayInfo returns nil), plus cornerMasks / nightMode /
+ *                  limitedUI / limitedUIElements;
+ *   cluster only:  properties = ["Instrument Cluster"]  (-> CarKit
+ *                  supportsInstrumentClusterContent),
+ *   top level   :  displayPanels = the same [main,cluster] array (the
+ *                  CARSessionConfiguration consumer; without it the cluster is
+ *                  unrecognized and iOS never proposes altScreen), and
+ *                  extendedFeatures = ["altScreen","viewAreas"] (the /info
+ *                  advertisement; a SEPARATE message from the SETUP response's
+ *                  `enabledFeatures`).
+ *
+ * THE WIRING IS PROVEN FROM THE BINARY (R8830L, disassembly):
+ *   1. CarPlayConfiguration::setDisplays (libCarPlayAppFramework 0x236e4) calls
+ *      AirPlayInfoArrayAddScreenDisplay(&this[0x88], ...) -- the array our first
+ *      seam appends the cluster entry to.
+ *   2. CarPlayServerCallbacks::copyRequiredProperty(key=="displays", fw)
+ *      (0x1db88) returns [fw+0x310].  CarPlayConfiguration is the sub-object at
+ *      fw+0x288 (proved by the sibling case: key "audioFormats" returns
+ *      [fw+0x288] and calls CarPlayConfiguration::getDeviceID(fw+0x288)), so
+ *      fw+0x310 == config[0x88] -- EXACTLY the array from (1).
+ *   3. AirPlayCopyServerInfo (libAirPlay 0xe3d8-0xe3ec) calls
+ *      AirPlayReceiverServerPlatformCopyProperty(server,1,"displays",..) -> (2)
+ *      -> CFDictionarySetValue(info,"displays",thatArray).
+ *   4. The /info HTTP handler (libAirPlay 0xcc98) serialises that dict with
+ *      CFBinaryPlistV0Create.  So this seam sees the SAME array the first seam
+ *      annotated.
+ * Also proved: CarPlayServerCallbacks::copyExtendedFeatures (0x1dc54) BUILDS
+ * `extendedFeatures` from LG flags (`enhancedRequestCarUI` @[fw+0x300],
+ * `vocoderInfo` @[fw+0x3f8]) -- so on this unit the key is often PRESENT without
+ * altScreen, which is why we MERGE rather than skip-if-present or clobber.
+ *
+ * HONEST SCOPE.  The field SET is SUPPORTED (a working reference receiver,
+ * verified against the iOS 26.1 CarKit decompile), not PROVEN against this
+ * unit's own libraries -- the unit's libAirPlay has no `uid`/`displayPanels`/
+ * `initialVideoStreams` strings at all, so there is nothing in the binary to
+ * confirm the consumer side.  What IS proven here: the seam exists and is
+ * interposable (exported symbol + JUMP_SLOT relocation), the array it completes
+ * is the one the /info response carries (above), and the object the shim
+ * produces serialises with the unit's own CFBinaryPlistV0Create and satisfies
+ * the two-display/altScreen invariant.  The car decides the rest.
+ *
+ * Everything is gated on the CLUSTER ENTRY ACTUALLY BEING PRESENT (type==111 in
+ * `displays`): if it is not there we publish NEITHER displayPanels NOR
+ * extendedFeatures, so the 2-display/altScreen contract can never be advertised
+ * without the second display -- the same both-ways discipline as
+ * g_cluster_advertised (see LANE_SESSION_FIX_2026-10-15.md).
+ * ========================================================================*/
+
+#define MIB3_CLUSTER_TYPE  111
+
+/* process-lifetime key/value cache: created once, never released (bounded, and
+ * /info is a cold path so this is not a hot-loop allocation). */
+static CFStringRef g_k_uid, g_k_uuid, g_k_name, g_k_type, g_k_props, g_k_ivs,
+                   g_k_adj, g_k_corner, g_k_night, g_k_lui, g_k_luie,
+                   g_k_dp, g_k_ef, g_k_displays, g_k_ox, g_k_oy, g_k_z,
+                   g_v_ic, g_v_alt, g_v_va;
+static int g_info_keys_ready = 0;
+static void info_keys_init(void){
+  if (g_info_keys_ready) return;
+  g_k_uid      = sstr("uid");
+  g_k_uuid     = sstr("uuid");
+  g_k_name     = sstr("name");
+  g_k_type     = sstr("type");
+  g_k_props    = sstr("properties");
+  g_k_ivs      = sstr("initialVideoStreams");
+  g_k_adj      = sstr("adjacentViewAreas");
+  g_k_corner   = sstr("cornerMasks");
+  g_k_night    = sstr("nightMode");
+  g_k_lui      = sstr("limitedUI");
+  g_k_luie     = sstr("limitedUIElements");
+  g_k_dp       = sstr("displayPanels");
+  g_k_ef       = sstr("extendedFeatures");
+  g_k_displays = sstr("displays");
+  g_k_ox       = sstr("originXPixels");
+  g_k_oy       = sstr("originYPixels");
+  g_k_z        = sstr("zIndex");
+  g_v_ic       = sstr("Instrument Cluster");
+  g_v_alt      = sstr("altScreen");
+  g_v_va       = sstr("viewAreas");
+  /* Only latch once the CF runtime actually returned the strings: a first /info
+   * that raced a not-yet-ready runtime must retry, not latch NULL forever. */
+  if (g_k_uid && g_k_uuid && g_k_name && g_k_type && g_k_props && g_k_ivs &&
+      g_k_adj && g_k_corner && g_k_night && g_k_lui && g_k_luie && g_k_dp &&
+      g_k_ef && g_k_displays && g_k_ox && g_k_oy && g_k_z && g_v_ic && g_v_alt &&
+      g_v_va)
+    g_info_keys_ready = 1;
+}
+
+static int is_array(CFTypeRef v){
+  return v && p_CFGetTypeID && p_CFArrayGetTypeID &&
+         (p_CFGetTypeID(v) == p_CFArrayGetTypeID());
+}
+static int is_dict(CFTypeRef v){
+  return v && p_CFGetTypeID && p_CFDictionaryGetTypeID &&
+         (p_CFGetTypeID(v) == p_CFDictionaryGetTypeID());
+}
+static s64 dict_i64(CFDictionaryRef d, CFStringRef k){
+  if (!p_CFDictionaryGetValue || !p_CFDictionaryGetInt64 || !d || !k) return 0;
+  if (!p_CFDictionaryGetValue(d, k)) return 0;          /* absent -> 0 */
+  return p_CFDictionaryGetInt64(d, k, 0);
+}
+
+/* one initialVideoStreams entry: {originXPixels,originYPixels,uuid,zIndex}
+ * (CarKit CARStreamInfo::initWithDictionary).  uuidRef is borrowed. */
+static CFMutableDictionaryRef mk_stream(CFStringRef uuidRef){
+  if (!p_CFDictionaryCreateMutable || !p_kCFLDictKeyCB || !p_kCFLDictValCB) return 0;
+  CFMutableDictionaryRef d = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
+  if (!d) return 0;
+  if (p_CFDictionarySetInt64){
+    p_CFDictionarySetInt64(d, g_k_ox, 0);
+    p_CFDictionarySetInt64(d, g_k_oy, 0);
+    p_CFDictionarySetInt64(d, g_k_z, 0);
+  }
+  if (uuidRef && p_CFDictionarySetValue) p_CFDictionarySetValue(d, g_k_uuid, uuidRef);
+  return d;
+}
+static CFMutableArrayRef mk_stream_array(CFStringRef uuidRef){
+  fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
+  if (!mka || !p_kCFTypeArrayCallBacks) return 0;
+  CFMutableArrayRef a = mka(0,1,p_kCFTypeArrayCallBacks);
+  if (!a) return 0;
+  CFMutableDictionaryRef s = mk_stream(uuidRef);
+  if (s){ p_CFArrayAppendValue(a, s); if (p_CFRelease) p_CFRelease(s); } /* array retains */
+  return a;
+}
+static CFMutableArrayRef mk_empty_array(void){
+  fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
+  return (mka && p_kCFTypeArrayCallBacks) ? mka(0,0,p_kCFTypeArrayCallBacks) : 0;
+}
+
+/* Complete ONE display dict to the modern schema.  is_cluster adds
+ * name+properties (the "Instrument Cluster" marks).  Idempotent: a key already
+ * present is left alone (a later /info may re-request the same cached dict). */
+static int info_complete_entry(CFMutableDictionaryRef d, int is_cluster, s64 night){
+  if (!d || !p_CFDictionarySetValue || !p_CFDictionaryGetValue) return 0;
+  CFTypeRef uuidv = p_CFDictionaryGetValue(d, g_k_uuid);
+  if (!is_dict(d)) return 0;
+
+  /* uid = uuid  (CarKit and displayPanels both read "uid"; a missing uid makes
+   * CRDisplayInfo init return nil -> the whole displays array is rejected). */
+  if (uuidv && !p_CFDictionaryGetValue(d, g_k_uid)) p_CFDictionarySetValue(d, g_k_uid, uuidv);
+
+  if (is_cluster){
+    if (!p_CFDictionaryGetValue(d, g_k_name)) p_CFDictionarySetValue(d, g_k_name, g_v_ic);
+    if (!p_CFDictionaryGetValue(d, g_k_props)){
+      CFMutableArrayRef pr = mk_empty_array();
+      if (pr && g_v_ic) p_CFArrayAppendValue(pr, g_v_ic);
+      if (pr){ p_CFDictionarySetValue(d, g_k_props, pr); if (p_CFRelease) p_CFRelease(pr); }
+    }
+  }
+
+  /* per-display scalars a real HU sends; incomplete dicts are accepted at ADD
+   * but rejected at SESSION start (0 s teardown). */
+  if (p_CFDictionarySetInt64){
+    if (!p_CFDictionaryGetValue(d, g_k_corner)) p_CFDictionarySetInt64(d, g_k_corner, 0);
+    if (!p_CFDictionaryGetValue(d, g_k_lui))    p_CFDictionarySetInt64(d, g_k_lui, 0);
+    p_CFDictionarySetInt64(d, g_k_night, night);
+  }
+  if (!p_CFDictionaryGetValue(d, g_k_luie)){
+    CFMutableArrayRef luie = mk_empty_array();
+    if (luie){ p_CFDictionarySetValue(d, g_k_luie, luie); if (p_CFRelease) p_CFRelease(luie); }
+  }
+
+  /* initialVideoStreams -- REQUIRED, present and NON-empty. */
+  if (!p_CFDictionaryGetValue(d, g_k_ivs) && uuidv){
+    CFMutableArrayRef ivs = mk_stream_array((CFStringRef)uuidv);
+    if (ivs){ p_CFDictionarySetValue(d, g_k_ivs, ivs); if (p_CFRelease) p_CFRelease(ivs); }
+  }
+
+  /* adjacentViewAreas -- present (may be empty) on the cluster. */
+  if (is_cluster && !p_CFDictionaryGetValue(d, g_k_adj)){
+    CFMutableArrayRef adj = mk_empty_array();
+    if (adj){ p_CFDictionarySetValue(d, g_k_adj, adj); if (p_CFRelease) p_CFRelease(adj); }
+  }
+  return 1;
+}
+
+/* Returns 1 iff a cluster entry was found and completed.  Exported for the
+ * harness as mib3shim_complete_info(). */
+static int info_complete(CFMutableDictionaryRef info){
+  if (!info || !p_CFDictionaryGetValue || !p_CFArrayGetCount ||
+      !p_CFArrayGetValueAtIndex) return 0;
+  info_keys_init();
+  if (!g_info_keys_ready){ logline("info","keys unavailable -- skipped"); return 0; }
+
+  CFTypeRef dv = p_CFDictionaryGetValue(info, g_k_displays);
+  if (!is_array(dv)){ logline("info","no displays array in /info"); return 0; }
+  CFArrayRef arr = (CFArrayRef)dv;
+  CFIndex n = p_CFArrayGetCount(arr), i;
+
+  CFMutableDictionaryRef cluster = 0, main = 0;
+  for (i = 0; i < n; i++){
+    CFTypeRef e = p_CFArrayGetValueAtIndex(arr, i);
+    if (!is_dict(e)) continue;
+    s64 t = dict_i64((CFDictionaryRef)e, g_k_type);
+    if ((int)t == MIB3_CLUSTER_TYPE && !cluster) cluster = (CFMutableDictionaryRef)e;
+    else if (!main) main = (CFMutableDictionaryRef)e;   /* display-0 / main */
+  }
+  if (!cluster){ logline("info","no cluster entry in displays -- publish nothing"); return 0; }
+
+  s64 night = main ? dict_i64(main, g_k_night) : 0;
+  if (getenv("MIB3_SHIM_NIGHT")) night = (s64)env_on("MIB3_SHIM_NIGHT",0);
+  if (main)    info_complete_entry(main, 0, night);
+  info_complete_entry(cluster, 1, night);
+
+  /* top-level keys: publish the SAME array under displayPanels, and the /info
+   * feature advertisement.  Only when the cluster exists (above).
+   *
+   * displayPanels: set unconditionally (= the displays array) -- nothing in the
+   * unit provides this key at all, and the reference overwrites it too.
+   * extendedFeatures: MERGE, not skip or clobber.  The unit's libAirPlay reads
+   * this key from the platform (it has native support), so a value may already
+   * be present; overwriting could drop a real feature and skipping-if-present
+   * could leave altScreen out.  Append our two strings iff missing. */
+  p_CFDictionarySetValue(info, g_k_dp, arr);
+  {
+    CFMutableArrayRef ef = mk_empty_array();
+    if (ef){
+      /* carry over any existing strings except the two we control */
+      CFTypeRef cur = p_CFDictionaryGetValue(info, g_k_ef);
+      if (is_array(cur)){
+        CFIndex m = p_CFArrayGetCount((CFArrayRef)cur), j;
+        for (j = 0; j < m; j++){
+          CFTypeRef s = p_CFArrayGetValueAtIndex((CFArrayRef)cur, j);
+          if (s && p_CFStringGetCString){
+            char tmp[64]; tmp[0]=0;
+            if (p_CFStringGetCString((CFStringRef)s, tmp, sizeof(tmp), K128)){
+              const char *a="altScreen", *b="viewAreas"; int ka=0, kb=0;
+              while (a[ka] && tmp[ka] && a[ka]==tmp[ka]) ka++;
+              while (b[kb] && tmp[kb] && b[kb]==tmp[kb]) kb++;
+              if ((a[ka]==0 && tmp[ka]==0) || (b[kb]==0 && tmp[kb]==0)) continue;
+              p_CFArrayAppendValue(ef, s);
+            }
+          }
+        }
+      }
+      if (g_v_alt) p_CFArrayAppendValue(ef, g_v_alt);
+      if (g_v_va)  p_CFArrayAppendValue(ef, g_v_va);
+      p_CFDictionarySetValue(info, g_k_ef, ef);
+      if (p_CFRelease) p_CFRelease(ef);
+    }
+  }
+  logline("info","completed: uid/properties/initialVideoStreams + displayPanels + extendedFeatures");
+  logkv("info","displays count",(u64)n,0);
+  return 1;
 }
 
 /* ==========================================================================
@@ -628,7 +955,6 @@ static int bridge_active(void);
 static int cluster_on_frame(const void *data, unsigned long len, unsigned long ts);
 static unsigned long g_cluster_frames;
 
-#define MIB3_CLUSTER_TYPE  111
 #define SCREEN_SOCK_QOS    0xc
 #define TIMESYNC_CB1_RVA   0x13b84   /* FUN_00113b84  (unexported) */
 #define TIMESYNC_CB2_RVA   0x13b48   /* FUN_00113b48  (unexported) */
@@ -711,7 +1037,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   if (p_ScreenCreate(&screen) != 0 || !screen){ logline("cluster","Create failed"); return -1; }
   p_ScreenSetup(screen, streamDict);
 
-  long connID = p_CFDictionaryGetInt64 ? (long)p_CFDictionaryGetInt64(streamDict, sstr("streamConnectionID"), 0) : 0;
+  long connID = (long)dgeti64k((CFDictionaryRef)streamDict, "streamConnectionID", 0);
   if (!connID){ logline("cluster","no streamConnectionID"); goto fail_screen; }
 
   void *hk = *(void**)((char*)session + 0x478);   /* pairVerifySession (HomeKit) */
@@ -758,18 +1084,21 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   /* append {type:111, dataPort:port} to response["streams"].  Mirrors the unit's
    * _AddResponseStream (which CFReleases the array after inserting it). */
   if (p_CFDictionaryCreateMutable && p_CFDictionarySetInt64 && p_CFArrayAppendValue &&
-      p_CFDictionaryGetValue && p_kCFLDictKeyCB && p_kCFLDictValCB && sstr("type")){
+      p_CFDictionaryGetValue && p_CFDictionarySetValue && p_kCFLDictKeyCB && p_kCFLDictValCB){
     CFMutableDictionaryRef desc = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
     if (desc){
-      p_CFDictionarySetInt64(desc, sstr("type"), MIB3_CLUSTER_TYPE);
-      p_CFDictionarySetInt64(desc, sstr("dataPort"), (s64)port);
-      CFMutableArrayRef streams = (CFMutableArrayRef)p_CFDictionaryGetValue((CFDictionaryRef)response, sstr("streams"));
+      dseti(desc, "type", MIB3_CLUSTER_TYPE);
+      dseti(desc, "dataPort", (s64)port);
+      CFMutableArrayRef streams = 0;
+      { CFStringRef ks = sstr("streams");
+        if (ks){ streams = (CFMutableArrayRef)p_CFDictionaryGetValue((CFDictionaryRef)response, ks);
+                 if (p_CFRelease) p_CFRelease(ks); } }
       int created = 0;
       if (!streams){
         fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
         if (mka && p_kCFTypeArrayCallBacks){
           streams = mka(0,0,p_kCFTypeArrayCallBacks);
-          if (streams && p_CFDictionarySetValue){ p_CFDictionarySetValue((CFMutableDictionaryRef)response, sstr("streams"), streams); created = 1; }
+          if (streams){ dseto((CFMutableDictionaryRef)response, "streams", streams); created = 1; }
         }
       }
       if (streams) p_CFArrayAppendValue(streams, desc);
@@ -1127,7 +1456,7 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
    * the stick mount); absent the marker we forward and do nothing. */
   if (env_on("MIB3_SHIM_ADD",1) && gate_active() && session && request && responseOut && *responseOut &&
       p_CFDictionaryGetValue && p_CFArrayGetCount && p_CFArrayGetValueAtIndex){
-    CFTypeRef rv = p_CFDictionaryGetValue((CFDictionaryRef)request, sstr("streams"));
+    CFTypeRef rv = dgetk((CFDictionaryRef)request, "streams");
     int isarr = 0;
     if (rv){
       isarr = 1;
@@ -1141,7 +1470,7 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
         void *sd = (void*)p_CFArrayGetValueAtIndex(reqStreams, i);
         if (!sd) continue;
         if (p_CFGetTypeID && p_CFDictionaryGetTypeID && p_CFGetTypeID(sd) != p_CFDictionaryGetTypeID()) continue;
-        s64 t = p_CFDictionaryGetInt64 ? p_CFDictionaryGetInt64((CFDictionaryRef)sd, sstr("type"), 0) : 0;
+        s64 t = dgeti64k((CFDictionaryRef)sd, "type", 0);
         if ((int)t == MIB3_CLUSTER_TYPE){
           logline("SessionSetup","type-111 stream -> cluster_setup");
           cluster_setup(session, sd, *responseOut);
@@ -1183,23 +1512,64 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
       if (arr){
         for (i=0;i<nf;i++){
           CFStringRef f = p_CFStringCreateWithCString(0,feats[i],K128);
-          if (f) p_CFArrayAppendValue(arr, f);
+          if (f){ p_CFArrayAppendValue(arr, f); if (p_CFRelease) p_CFRelease(f); } /* array retains */
         }
         p_CFDictionarySetValue(*responseOut, k, arr);
+        if (p_CFRelease) p_CFRelease(arr);      /* dict retained it */
         logline("SessionSetup","injected enabledFeatures");
         logkv("SessionSetup","enabledFeatures n",(u64)nf,0);
         if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow) p_CFShow(*responseOut);
       } else {
         logline("SessionSetup","enabledFeatures array alloc failed");
       }
+      if (p_CFRelease) p_CFRelease(k);        /* dict retained it */
     } else {
       logline("SessionSetup","enabledFeatures already present");
+      if (p_CFRelease && k) p_CFRelease(k);   /* not stored -> release our +1 */
     }
   } else if (env_on("MIB3_SHIM_ENABLEDFEAT",1) && gate_active() && !g_cluster_advertised) {
     /* the cluster was NOT advertised this process: claim nothing (consistency). */
     logline("SessionSetup","altScreen not claimed (cluster not advertised)");
   }
 }
+
+/* ==========================================================================
+ * The /info seam.
+ *
+ * Interposes AirPlayCopyServerInfo -- the function that BUILDS the /info dict
+ * the phone reads (displays, extendedFeatures, audioFormats, ...).  The unit's
+ * own /info HTTP handler (libAirPlay 0xcc98) calls it via the PLT stub at
+ * 0x9640 and serialises the returned dict with CFBinaryPlistV0Create.
+ *
+ * Why here and not the display-array seam: `displayPanels` is a DIFFERENT
+ * TOP-LEVEL key of the /info dictionary.  AirPlayInfoArrayAddScreenDisplay only
+ * reaches the `displays` array, so it can never add a sibling top-level key.
+ * This seam hands us the whole mutable /info dict, so it is the only place the
+ * modern schema can be completed.
+ *
+ * MIB3_SHIM_INFO=0 ablates it at runtime (target_env.py).  When the gate is off
+ * or the cluster was never advertised, the returned dict is byte-identical to
+ * stock (info_complete publishes nothing without a type-111 entry).
+ * ========================================================================*/
+void *AirPlayCopyServerInfo(void *a0, void *a1, void *a2)
+{
+  hit("INFO\n", 5);                       /* prove entry, independent of everything */
+  resolve();
+  void *info = 0;
+  if (real_CopyServerInfo)
+    info = real_CopyServerInfo(a0, a1, a2);
+  else
+    logline("CopyServerInfo","no real fn!");
+  if (info && env_on("MIB3_SHIM_INFO",1) && gate_active()){
+    int done = info_complete((CFMutableDictionaryRef)info);
+    g_info_completed = done;
+  }
+  return info;
+}
+
+/* exported for the harness: drive the /info completion on a synthesised dict. */
+int  mib3shim_complete_info(void *info){ resolve(); return info_complete((CFMutableDictionaryRef)info); }
+int  mib3shim_info_completed(void){ return g_info_completed; }
 
 /* ==========================================================================
  * HALF-2 diagnostic: observe the CarPlay OUTPUT surface (the delivery input).
