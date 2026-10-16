@@ -1,8 +1,16 @@
 # shim/ — the CarPlay cluster shim (MIB3 LG / R8830L)
 
+> **The deploy section below is SUPERSEDED and FATAL on this unit — do NOT use it.** The shim is
+> delivered by **INJECTION into the live `carplay` process** (`shim/inject/run_inject.sh`), **not**
+> `LD_PRELOAD` + `systemctl restart carplay`: the stock binary starts in secure-exec mode (the
+> `security.SMACK64EXEC` file xattr) so the loader ignores preloads, **and** the unit resets whenever
+> CarPlay is unhealthy, so a restart is a guaranteed reboot. See
+> **`MIB3_RE/LANE_LIVE_SESSION_2026-10-16.md`** and `LANE_INJECTION_2026-10-15.md`. Everything below
+> on the **seams and the `MIB3_SHIM_*` knobs is current**; only the delivery/deploy text is not.
+
 The `.so` that makes the head unit advertise a **second (instrument-cluster) display** to the
-iPhone, so iOS opens the **type-111** Apple Maps cluster stream. Loaded into the `carplay` service
-via `LD_PRELOAD`; no LG binary is modified.
+iPhone, so iOS opens the **type-111** Apple Maps cluster stream. Injected into the live `carplay`
+process; no LG binary is modified.
 
 ## Files
 - `mib3shim.c` — the shim (interposes two seams).
@@ -123,7 +131,7 @@ forwarder when the log is off. Delivery of the decoded frames to the cluster is 
 RSI/display-management config + a cluster surface) — see `LANE_CLUSTER_DELIVERY_2026-10-09.md` and
 `cluster_swap.sh`.
 
-> Geometry (`MIB3_SHIM_W/H/FPS`) defaults to `1280×720@60` but the cluster's real pixel size is
+> Geometry (`MIB3_SHIM_W/H/FPS`) defaults to `1280×480@30` but the cluster's real pixel size is
 > **not in the unit's static data** (the ViWi specs are schemas; it's runtime). Treat the default
 > as unverified and set it for the actual panel. See `LANE_TYPE111_HANDLER_2026-10-09.md`.
 

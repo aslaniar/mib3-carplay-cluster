@@ -17,7 +17,7 @@
 # ============================================================================
 set -u
 STICK="$(cd "$(dirname "$0")" && pwd)"
-WANT_MD5=249767df02ae4b0338f32c5604f0dd17
+WANT_MD5=bfd129e89420e3a1cb5c9666b144ef5f
 fail(){ echo "[!] $*"; echo "[!] ABORT -- nothing persisted; a reboot is the full undo"; exit 1; }
 
 CP="$(pidof carplay)"

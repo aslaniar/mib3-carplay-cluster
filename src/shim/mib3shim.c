@@ -159,6 +159,10 @@ typedef CFMutableDictionaryRef (*fn_CFDictionaryCreateMutable)(CFAllocatorRef,CF
 typedef s64         (*fn_CFDictionaryGetInt64)(CFDictionaryRef,const void*,s64);
 typedef unsigned long (*fn_CFGetTypeID)(CFTypeRef);
 typedef unsigned long (*fn_CFTypeGetTypeID)(void);
+/* for the value dumper */
+typedef CFIndex     (*fn_CFDictionaryGetCount)(CFDictionaryRef);
+typedef CFArrayRef  (*fn_CFDictionaryCopyKeys)(CFAllocatorRef,CFDictionaryRef);
+typedef long long   (*fn_CFGetInt64)(CFTypeRef,int*);
 
 /* --- cluster-stream (type 111) path: exported unit helpers the shim reuses --- */
 typedef int  (*fn_ServerSocketOpen)(unsigned, int, int, int, int*, int, int*);
@@ -179,6 +183,13 @@ typedef int  (*fn_DeriveAES)(void*, int, s64, void*, void*);
 typedef int  (*fn_pthreadCreate)(void**, const void*, void*(*)(void*), void*);
 typedef int  (*fn_close)(int);
 typedef int  (*fn_chachaDerive)(void*, s64, int, int, void*); /* returns int status (0=ok) */
+/* wire crypto (unit's own CFLite/ChaCha primitives) -- see stock FUN_00115800 */
+typedef void (*fn_cx_init)(void*, const void*, const void*);      /* ctx,key,nonce */
+typedef void (*fn_cx_aad)(void*, const void*, unsigned long);     /* ctx,aad,len  */
+typedef long (*fn_cx_dec)(void*, const void*, long, void*);       /* ctx,src,len,dst -> plainlen */
+typedef long (*fn_cx_ver)(void*, const void*, long, int*);        /* ctx,tag,len,&ok */
+typedef int  (*fn_ctr_init)(void*, const void*, const void*);     /* AES_CTR_Init(ctx,key,iv) */
+typedef int  (*fn_ctr_upd)(void*, const void*, long, void*);      /* AES_CTR_Update(ctx,src,len,dst) */
 /* half-2 diagnostic: the CarPlay output-surface selector (C++ mangled). */
 typedef int  (*fn_SetSurface)(void*, void*, unsigned);
 /* The framework's per-stream FRAME ENTRY (libCarPlayMediaFramework.so, exported
@@ -245,7 +256,7 @@ typedef void  (*fn_gl_draw)(unsigned,int,int);
 /* NB: the 7 numeric args are 32-bit (undefined4 in the plugin) -- match the ABI. */
 typedef int (*fn_AddScreenDisplay)(CFMutableArrayRef*, CFStringRef,
                                    int, int, int, int, int, int, int);
-typedef void (*fn_SessionSetup)(void*, u64, CFMutableDictionaryRef*);
+typedef int  (*fn_SessionSetup)(void*, void*, void**, int);   /* real ABI (rgi reference): returns the setup status, 4 args */
 /* AirPlayCopyServerInfo(server, arg1, errOut) -> the mutable /info dict.
  * Verified call site: libAirPlay.so 0xeed4 sets only x0/x1/x2 (3 args) and the
  * callee prologue reads x0 (server), x1, x2 (err out).  RELOCATION:
@@ -270,10 +281,17 @@ static fn_CFDictionaryGetInt64      p_CFDictionaryGetInt64;
 static fn_CFGetTypeID               p_CFGetTypeID;
 static fn_CFTypeGetTypeID           p_CFArrayGetTypeID;
 static fn_CFTypeGetTypeID           p_CFDictionaryGetTypeID;
+static fn_CFTypeGetTypeID           p_CFStringGetTypeID;
+static fn_CFTypeGetTypeID           p_CFNumberGetTypeID;
+static fn_CFTypeGetTypeID           p_CFBooleanGetTypeID;
+static fn_CFDictionaryGetCount      p_CFDictionaryGetCount;
+static fn_CFDictionaryCopyKeys      p_CFDictionaryCopyKeys;
+static fn_CFGetInt64                p_CFGetInt64;
 static void *p_kCFTypeArrayCallBacks;
 static void *p_kCFLDictKeyCB;
 static void *p_kCFLDictValCB;
 static void *p_kCFLBooleanTrue;
+static void *p_kCFLBooleanFalse;
 
 /* cluster-stream (type 111) helpers + libAirPlay base (for RVA calls) */
 static fn_ServerSocketOpen  p_ServerSocketOpen;
@@ -291,6 +309,12 @@ static fn_ScreenSetSec      p_ScreenSetSec;
 static fn_ScreenSetChaCha   p_ScreenSetChaCha;
 static fn_ScreenSetTS       p_ScreenSetTS;
 static fn_DeriveAES         p_DeriveAES;
+static fn_cx_init           p_cx_init;
+static fn_cx_aad            p_cx_aad;
+static fn_cx_dec            p_cx_dec;
+static fn_cx_ver            p_cx_ver;
+static fn_ctr_init          p_ctr_init;
+static fn_ctr_upd           p_ctr_upd;
 static fn_pthreadCreate     p_pthreadCreate;
 static fn_close             p_close;
 static void *(*p_malloc)(unsigned long);
@@ -412,6 +436,12 @@ static void resolve(void){
   p_CFGetTypeID               = (fn_CFGetTypeID)              R("CFGetTypeID");
   p_CFArrayGetTypeID          = (fn_CFTypeGetTypeID)          R("CFArrayGetTypeID");
   p_CFDictionaryGetTypeID     = (fn_CFTypeGetTypeID)          R("CFDictionaryGetTypeID");
+  p_CFStringGetTypeID         = (fn_CFTypeGetTypeID)          R("CFStringGetTypeID");
+  p_CFNumberGetTypeID         = (fn_CFTypeGetTypeID)          R("CFNumberGetTypeID");
+  p_CFBooleanGetTypeID        = (fn_CFTypeGetTypeID)          R("CFBooleanGetTypeID");
+  p_CFDictionaryGetCount      = (fn_CFDictionaryGetCount)     R("CFDictionaryGetCount");
+  p_CFDictionaryCopyKeys      = (fn_CFDictionaryCopyKeys)     R("CFDictionaryCopyKeys");
+  p_CFGetInt64                = (fn_CFGetInt64)               R("CFGetInt64");
   /* cluster-stream helpers (libAirPlay / libCoreUtils exports) */
   p_ServerSocketOpen  = (fn_ServerSocketOpen) R("ServerSocketOpen");
   p_NetSocketCreate   = (fn_NetSocketCreate)  R("NetSocket_CreateWithNative");
@@ -428,6 +458,12 @@ static void resolve(void){
   p_ScreenSetChaCha   = (fn_ScreenSetChaCha)  R("AirPlayReceiverSessionScreen_SetChaChaSecurityInfo");
   p_ScreenSetTS       = (fn_ScreenSetTS)      R("AirPlayReceiverSessionScreen_SetTimeSynchronizer");
   p_DeriveAES         = (fn_DeriveAES)        R("AirPlay_DeriveAESKeySHA512ForScreen");
+  p_cx_init           = (fn_cx_init)          R("chacha20_poly1305_init_64x64");
+  p_cx_aad            = (fn_cx_aad)           R("chacha20_poly1305_add_aad");
+  p_cx_dec            = (fn_cx_dec)           R("chacha20_poly1305_decrypt");
+  p_cx_ver            = (fn_cx_ver)           R("chacha20_poly1305_verify");
+  p_ctr_init          = (fn_ctr_init)         R("AES_CTR_Init");
+  p_ctr_upd           = (fn_ctr_upd)          R("AES_CTR_Update");
   p_pthreadCreate     = (fn_pthreadCreate)    R("pthread_create");
   p_close             = (fn_close)            R("close");
   p_malloc            = (void*(*)(unsigned long)) R("malloc");
@@ -444,6 +480,7 @@ static void resolve(void){
   p_kCFLDictKeyCB             = (void*)                        R("kCFLDictionaryKeyCallBacksCFLTypes");
   p_kCFLDictValCB             = (void*)                        R("kCFLDictionaryValueCallBacksCFLTypes");
   p_kCFLBooleanTrue           = (void*)                        R("kCFLBooleanTrue");
+  p_kCFLBooleanFalse          = (void*)                        R("kCFLBooleanFalse");
   real_AddScreenDisplay       = (fn_AddScreenDisplay)          R("AirPlayInfoArrayAddScreenDisplay");
   real_SessionSetup           = (fn_SessionSetup)              R("AirPlayReceiverSessionSetup");
   real_CopyServerInfo         = (fn_CopyServerInfo)            R("AirPlayCopyServerInfo");
@@ -602,11 +639,14 @@ static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
   { int dtype = (int)env_num("MIB3_SHIM_TYPE", 111);
     dseti(d, "type", (s64)dtype);
     logkv("cluster","type",(u64)(u32)dtype,0); }
-  /* initialURL -- the cluster scene Apple Maps should render */
+  /* initialURL -- the cluster scene Apple Maps should render.
+   * MIB3_SHIM_NOURL=1 omits it (the rgi reference's cluster dict has NO initialURL). */
+  if (!env_on("MIB3_SHIM_NOURL",0)){
   { char *url = getenv("MIB3_SHIM_URL");
     if (!url || !url[0]) url = "maps:/car/instrumentcluster/map";
     dsetv(d, "initialURL", url);
     logline("cluster/initialURL", url); }
+  }
   /* viewAreas = [ { view rect + safeArea (full panel, drawUIOutsideSafeArea) } ] */
   if (p_CFDictionaryCreateMutable && p_CFDictionarySetInt64 && p_CFArrayAppendValue &&
       p_CFDictionarySetValue && p_kCFTypeArrayCallBacks && p_kCFLDictKeyCB && p_kCFLDictValCB){
@@ -772,6 +812,98 @@ static s64 dict_i64(CFDictionaryRef d, CFStringRef k){
   return p_CFDictionaryGetInt64(d, k, 0);
 }
 
+/* keys we dump out of any dict.  SAFE: CFDictionaryGetValue only.  We do NOT
+ * use CFDictionaryCopyKeys -- on the unit's CFLite it corrupted the dict we
+ * dumped (the SETUP response then failed to serialise: -6732), verified on the
+ * desk rig (RESPONSE_BROKEN vs RESPONSE_WELLFORMED with it off). */
+static const char *g_dump_keys[] = {
+  "displays","displayPanels","extendedFeatures","streams","enabledFeatures",
+  "timingPort","eventPort","keepAlivePort","features","statusFlags","model",
+  "name","deviceID","uuid","uid","type","properties","primaryInputDevice",
+  "maxFPS","widthPixels","heightPixels","widthPhysical","heightPhysical",
+  "viewAreas","initialViewArea","adjacentViewAreas","initialVideoStreams",
+  "initialURL","cornerMasks","nightMode","limitedUI","limitedUIElements","edid",
+  "safeArea","originXPixels","originYPixels","zIndex","drawUIOutsideSafeArea",
+  "audioFormats","audioLatencies","hidDevices","modes","sourceVersion",
+  "manufacturer","bluetoothIDs","rightHandDrive","keepAliveLowPower",
+  "keepAliveSendStatsAsBody","macAddress","systemBuildVersion","osVersion", 0
+};
+static void dump_cf(const char *tag, CFTypeRef v, int depth);
+static void dump_known(const char *tag, CFDictionaryRef d){
+  int i;
+  for (i = 0; g_dump_keys[i]; i++){
+    CFTypeRef v = dgetk(d, g_dump_keys[i]);
+    if (!v) continue;
+    logline(tag, g_dump_keys[i]);
+    dump_cf(tag, v, 1);
+  }
+}
+
+/* ---- value dumper: log a whole CF tree (bounded) so we can see exactly what
+ * we hand the phone.  One log line per key/scalar, depth-indented. ---------- */
+static void dump_cf(const char *tag, CFTypeRef v, int depth){
+  char b[240];
+  unsigned long t;
+  int i;
+  if (depth > 6){ logline(tag, "        ...(max depth)"); return; }
+  if (!v){ logline(tag, "<null>"); return; }
+  t = p_CFGetTypeID ? p_CFGetTypeID(v) : 0;
+  if (p_CFStringGetTypeID && t == p_CFStringGetTypeID()){
+    b[0]=0; for (i=0; i<depth && i<20; i++) b[i]=' '; b[i]=0;
+    if (p_CFStringGetCString && p_CFStringGetCString((CFStringRef)v, b+i, sizeof(b)-i, K128))
+      logline(tag, b);
+    else logline(tag, "<string>");
+    return;
+  }
+  if (p_CFNumberGetTypeID && t == p_CFNumberGetTypeID()){
+    s64 n = p_CFGetInt64 ? (s64)p_CFGetInt64(v, 0) : 0;
+    logkv(tag, p_CFGetInt64 ? "num" : "num(?)", (u64)n, 0);
+    return;
+  }
+  if (p_CFBooleanGetTypeID && t == p_CFBooleanGetTypeID()){
+    logline(tag, (p_kCFLBooleanTrue && v == *(void**)p_kCFLBooleanTrue) ? "bool=true" : "bool=false");
+    return;
+  }
+  if (p_CFArrayGetTypeID && t == p_CFArrayGetTypeID()){
+    CFIndex k, m = p_CFArrayGetCount((CFArrayRef)v);
+    logkv(tag, "array[count]", (u64)m, 0);
+    for (k=0;k<m && k<64;k++) dump_cf(tag, (CFTypeRef)p_CFArrayGetValueAtIndex((CFArrayRef)v,k), depth+1);
+    return;
+  }
+  if (p_CFDictionaryGetTypeID && t == p_CFDictionaryGetTypeID()){
+    CFIndex m = p_CFDictionaryGetCount ? p_CFDictionaryGetCount((CFDictionaryRef)v) : -1;
+    logkv(tag, "dict[count]", (u64)m, 0);
+    dump_known(tag, (CFDictionaryRef)v);   /* known keys only (GetValue) -- safe */
+    return;
+  }
+  logline(tag, "<other type>");
+}
+
+/* Does the display list already carry a type-111 (cluster) entry?  Makes the
+ * advertisement idempotent PER DISPLAY LIST.  LG rebuilds `displays` on every
+ * session, so the old "add once per process" latch meant only the FIRST phone
+ * plug after injection ever advertised -- and every later plug still claimed
+ * altScreen while showing one display (the 1-display/altScreen contradiction
+ * that kills the session).  Correct whether the array persists or is rebuilt. */
+static int array_has_cluster(CFMutableArrayRef *inArray){
+  if (!inArray || !*inArray) return 0;
+  if (!p_CFArrayGetCount || !p_CFArrayGetValueAtIndex || !p_CFGetTypeID ||
+      !p_CFDictionaryGetTypeID || !p_CFDictionaryGetValue || !p_CFDictionaryGetInt64)
+    return 0;
+  info_keys_init();
+  if (!g_info_keys_ready || !g_k_type) return 0;
+  CFArrayRef a = *inArray;
+  CFIndex n = p_CFArrayGetCount(a), i;
+  int want = (int)env_num("MIB3_SHIM_TYPE", MIB3_CLUSTER_TYPE);
+  for (i = 0; i < n; i++){
+    CFTypeRef e = p_CFArrayGetValueAtIndex(a, i);
+    if (!e || p_CFGetTypeID(e) != p_CFDictionaryGetTypeID()) continue;
+    if (!p_CFDictionaryGetValue((CFDictionaryRef)e, g_k_type)) continue;
+    if ((int)p_CFDictionaryGetInt64((CFDictionaryRef)e, g_k_type, 0) == want) return 1;
+  }
+  return 0;
+}
+
 /* one initialVideoStreams entry: {originXPixels,originYPixels,uuid,zIndex}
  * (CarKit CARStreamInfo::initWithDictionary).  uuidRef is borrowed. */
 static CFMutableDictionaryRef mk_stream(CFStringRef uuidRef){
@@ -824,7 +956,12 @@ static int info_complete_entry(CFMutableDictionaryRef d, int is_cluster, s64 nig
   /* per-display scalars a real HU sends; incomplete dicts are accepted at ADD
    * but rejected at SESSION start (0 s teardown). */
   if (p_CFDictionarySetInt64){
-    if (!p_CFDictionaryGetValue(d, g_k_corner)) p_CFDictionarySetInt64(d, g_k_corner, 0);
+    if (!p_CFDictionaryGetValue(d, g_k_corner)){
+      /* LIVI sends cornerMasks as a BOOLEAN (false), not an int. */
+      void *bf = p_kCFLBooleanFalse ? *(void**)p_kCFLBooleanFalse : 0;
+      if (bf && p_CFDictionarySetValue) p_CFDictionarySetValue(d, g_k_corner, bf);
+      else p_CFDictionarySetInt64(d, g_k_corner, 0);
+    }
     if (!p_CFDictionaryGetValue(d, g_k_lui))    p_CFDictionarySetInt64(d, g_k_lui, 0);
     p_CFDictionarySetInt64(d, g_k_night, night);
   }
@@ -849,6 +986,59 @@ static int info_complete_entry(CFMutableDictionaryRef d, int is_cluster, s64 nig
 
 /* Returns 1 iff a cluster entry was found and completed.  Exported for the
  * harness as mib3shim_complete_info(). */
+/* displayPanels in the LIVI shape (info.rs:319 add_display_panels): a panel
+ * per display with uid="{uuid}-panel", the display's size, properties
+ * (showsInstruments for the cluster) and initialVideoStreams=[{uuid}].  The
+ * previous code set displayPanels = the same `displays` array. */
+static void panels_build(CFMutableDictionaryRef info){
+  CFTypeRef dv;
+  fn_CFArrayCreateMutable mka;
+  CFMutableArrayRef panels;
+  CFStringRef k_sh;
+  CFIndex n, i;
+  info_keys_init();
+  if (!g_info_keys_ready || !p_CFDictionaryGetValue || !p_CFDictionaryCreateMutable) return;
+  dv = p_CFDictionaryGetValue(info, g_k_displays);
+  if (!is_array(dv)) return;
+  mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
+  if (!mka || !p_kCFTypeArrayCallBacks) return;
+  panels = mka(0,0,p_kCFTypeArrayCallBacks);
+  if (!panels) return;
+  k_sh = sstr("showsInstruments");
+  n = p_CFArrayGetCount((CFArrayRef)dv);
+  for (i = 0; i < n; i++){
+    CFMutableDictionaryRef d = (CFMutableDictionaryRef)p_CFArrayGetValueAtIndex((CFArrayRef)dv, i);
+    CFStringRef uuid; CFMutableDictionaryRef panel;
+    char ub[64]; char pb[80]; unsigned long k = 0, j = 0;
+    if (!is_dict(d)) continue;
+    uuid = (CFStringRef)p_CFDictionaryGetValue(d, g_k_uuid);
+    if (!uuid || !p_CFStringGetCString) continue;
+    ub[0] = 0;
+    if (!p_CFStringGetCString(uuid, ub, sizeof(ub), K128)) continue;
+    while (ub[k] && k < 60){ pb[k] = ub[k]; k++; }
+    while (j < 8 && k < 79){ pb[k++] = "-panel"[j++]; }  /* uid = uuid + "-panel" */
+    pb[k] = 0;
+    panel = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
+    if (!panel) continue;
+    { CFStringRef puid = p_CFStringCreateWithCString(0, pb, K128);
+      if (puid){ dseto(panel, "uid", puid); if (p_CFRelease) p_CFRelease(puid); } }
+    dseti(panel, "widthPixels",   dgeti64k(d, "widthPixels", 0));
+    dseti(panel, "heightPixels",  dgeti64k(d, "heightPixels", 0));
+    dseti(panel, "widthPhysical", dgeti64k(d, "widthPhysical", 0));
+    dseti(panel, "heightPhysical",dgeti64k(d, "heightPhysical", 0));
+    { int iscl = ((int)dict_i64(d, g_k_type) == MIB3_CLUSTER_TYPE);
+      CFMutableArrayRef pr = mk_empty_array();
+      if (pr){ if (iscl && k_sh) p_CFArrayAppendValue(pr, k_sh); dseto(panel, "properties", pr); if (p_CFRelease) p_CFRelease(pr); } }
+    { CFMutableArrayRef ivs = mk_stream_array(uuid);
+      if (ivs){ dseto(panel, "initialVideoStreams", ivs); if (p_CFRelease) p_CFRelease(ivs); } }
+    p_CFArrayAppendValue(panels, panel);
+    if (p_CFRelease) p_CFRelease(panel);
+  }
+  logkv("info","displayPanels count",(u64)p_CFArrayGetCount(panels),0);
+  dseto(info, "displayPanels", panels);
+  if (p_CFRelease) p_CFRelease(panels);   /* info retains it */
+}
+
 static int info_complete(CFMutableDictionaryRef info){
   if (!info || !p_CFDictionaryGetValue || !p_CFArrayGetCount ||
       !p_CFArrayGetValueAtIndex) return 0;
@@ -872,7 +1062,7 @@ static int info_complete(CFMutableDictionaryRef info){
 
   s64 night = main ? dict_i64(main, g_k_night) : 0;
   if (getenv("MIB3_SHIM_NIGHT")) night = (s64)env_on("MIB3_SHIM_NIGHT",0);
-  if (main)    info_complete_entry(main, 0, night);
+  if (main && env_on("MIB3_SHIM_MAINMOD",1)) info_complete_entry(main, 0, night);
   info_complete_entry(cluster, 1, night);
 
   /* top-level keys: publish the SAME array under displayPanels, and the /info
@@ -884,7 +1074,12 @@ static int info_complete(CFMutableDictionaryRef info){
    * this key from the platform (it has native support), so a value may already
    * be present; overwriting could drop a real feature and skipping-if-present
    * could leave altScreen out.  Append our two strings iff missing. */
-  p_CFDictionarySetValue(info, g_k_dp, arr);
+  /* displayPanels: LIVI-shaped panels (uid="{uuid}-panel" + showsInstruments +
+   * initialVideoStreams).  MIB3_SHIM_PANELS=0 restores the old behaviour
+   * (displayPanels = the same displays array). */
+  if (env_on("MIB3_SHIM_PANELS",1)) panels_build(info);
+  else p_CFDictionarySetValue(info, g_k_dp, arr);
+  (void)arr;
   {
     CFMutableArrayRef ef = mk_empty_array();
     if (ef){
@@ -906,8 +1101,10 @@ static int info_complete(CFMutableDictionaryRef info){
           }
         }
       }
-      if (g_v_alt) p_CFArrayAppendValue(ef, g_v_alt);
-      if (g_v_va)  p_CFArrayAppendValue(ef, g_v_va);
+      if (env_on("MIB3_SHIM_EXTFEAT",1)){    /* refs (LIVI/PlayPort) OMIT these here; rgi adds them (not the +0x3E gate) */
+        if (g_v_alt) p_CFArrayAppendValue(ef, g_v_alt);
+        if (g_v_va)  p_CFArrayAppendValue(ef, g_v_va);
+      }
       p_CFDictionarySetValue(info, g_k_ef, ef);
       if (p_CFRelease) p_CFRelease(ef);
     }
@@ -982,103 +1179,164 @@ static int cl_stream_has(void *s){
  * global that a later setup could overwrite (that was the UAF/corruption path). */
 typedef struct {
   void *screen; int lsock; void *session; int flags; void *stream;
+  unsigned char key[32]; int keylen; int cipher; long counter;   /* B: stream crypto */
 } cl_ctx;
 
 static void *cluster_thread(void *arg){
+  extern long read(int, void*, unsigned long);
   cl_ctx *c = (cl_ctx*)arg;
   int connfd = -1;
-  logline("cluster/thread","started");
+  logline("cluster/thread","started (self-contained receiver)");
   if (!c) return 0;
-  if (p_SocketAccept && c->lsock >= 0 && p_SocketAccept(c->lsock, 10, &connfd, 0) == 0 && connfd >= 0){
+  extern int accept(int, void*, unsigned int*);
+  logkv("cluster/thread","listening fd",(u64)(u32)c->lsock,0);
+  logline("cluster/thread","waiting for the phone to connect");
+  if (c->lsock >= 0) connfd = accept(c->lsock, 0, 0);   /* blocking */
+  logkv("cluster/thread","conn fd",(u64)(u32)connfd,0);
+  if (connfd >= 0){
     if (p_close){ p_close(c->lsock); }
     c->lsock = -1;
-    void *ns = 0;
-    if (p_NetSocketCreate && p_NetSocketCreate(&ns, connfd) == 0){
-      connfd = -1;
-      if (p_NetSocketNative && p_SocketSetQoS) p_SocketSetQoS(p_NetSocketNative(ns), SCREEN_SOCK_QOS);
-      if (p_ScreenSetTS && g_libap_base){
-        void *ctx[3];
-        ctx[0] = c->session;
-        ctx[1] = (void*)(g_libap_base + TIMESYNC_CB1_RVA);
-        ctx[2] = (void*)(g_libap_base + TIMESYNC_CB2_RVA);
-        p_ScreenSetTS(c->screen, ctx);
+    logline("cluster/thread","stream connected -- draining");
+    /* STAGE 1 (no stock screen): own the socket so the phone keeps sending and
+     * the session holds, and the MAIN screen is never bound.  Decrypt
+     * (AES-CTR / chacha20-poly1305 per the stream's security) + decode into the
+     * cluster surface plugs in HERE -- that is Part B. */
+    if (p_close){
+      static char rbuf[65536];
+      static unsigned char hdr[128];
+      static unsigned char cxbuf[512];
+      long frames = 0, configs = 0, others = 0;
+      int stop = 0;
+      logkv("cluster/thread","cipher",(u64)(u32)c->cipher,0);
+      while (!stop){
+        long got = 0, n;
+        /* 128-byte screen header (bodySize u32 LE @0, opcode @4) */
+        while (got < 128){ n = read(connfd, hdr + got, 128 - got); if (n <= 0){ stop = 1; break; } got += n; }
+        if (stop) break;
+        {
+          unsigned bs = (unsigned)(unsigned char)hdr[0] | ((unsigned)(unsigned char)hdr[1] << 8) |
+                        ((unsigned)(unsigned char)hdr[2] << 16) | ((unsigned)(unsigned char)hdr[3] << 24);
+          unsigned op = (unsigned char)hdr[4];
+          if (bs > (8u << 20)){ logkv("cluster/thread","bad bodySize",(u64)bs,0); break; }
+          got = 0;
+          while (got < (long)bs){ n = read(connfd, rbuf + got, (long)bs - got); if (n <= 0){ stop = 1; break; } got += n; }
+          if (stop) break;
+          if (op == 1){ configs++; logkv("cluster/thread","codec-config body",(u64)bs,0); }
+          else if (op == 0){
+            long pl = 0;
+            if (c->cipher == 2 && p_cx_init && p_cx_aad && p_cx_dec){
+              unsigned char nonce[12]; int k; unsigned long long ctr = (unsigned long long)c->counter;
+              for (k = 0; k < 8; k++) nonce[k] = (unsigned char)(ctr >> (k * 8));
+              for (k = 8; k < 12; k++) nonce[k] = 0;
+              p_cx_init(cxbuf, c->key, nonce);
+              p_cx_aad(cxbuf, hdr, 128);
+              pl = p_cx_dec(cxbuf, rbuf, (long)bs, rbuf);   /* in place */
+            } else if (c->cipher == 1 && p_ctr_init && p_ctr_upd){
+              p_ctr_init(cxbuf, c->key, c->key + 16);
+              p_ctr_upd(cxbuf, rbuf, (long)bs, rbuf); pl = (long)bs;
+            }
+            c->counter++; frames++;
+            if ((frames & 0x3f) == 1){
+              char hs[40]; int k; const char *H = "0123456789abcdef";
+              unsigned lim = (bs < 16) ? (unsigned)bs : 16u;
+              for (k = 0; k < (int)lim; k++){ unsigned char cc = (unsigned char)rbuf[k]; hs[k*2]=H[cc>>4]; hs[k*2+1]=H[cc&15]; }
+              hs[lim*2] = 0;
+              logkv("cluster/thread","frame",(u64)frames,0);
+              logkv("cluster/thread","body",(u64)bs,0);
+              logkv("cluster/thread","plain",(u64)pl,0);
+              logline("cluster/thread/plain-head", hs);   /* want 00000001 (H.264 NAL) */
+            }
+          } else others++;
+        }
       }
-      if (p_ScreenStart && c->session &&
-          p_ScreenStart(c->screen, *(void**)((char*)c->session + 0x28)) == 0){
-        /* per-stream identity: StartSession created the ScreenStream at
-         * AirPlayReceiverSessionScreen+0x328 (corpus: StopSession does
-         * ScreenStreamStop(*(this+0x328)); ProcessFrames calls
-         * ScreenStreamProcessData(param_1[0x65]) -- 0x65*8 = 0x328). */
-        void *st = *(void**)((char*)c->screen + 0x328);
-        c->stream = st;
-        if (st && cl_stream_add(st) != 0)
-          logline("cluster/stream","WARN registry full -> this stream will NOT be diverted");
-        logkv("cluster/stream","ScreenStream",(u64)st,1);
-        if (p_ScreenProcFrames) p_ScreenProcFrames(c->screen, ns, c->flags);
-        if (st) cl_stream_remove(st);       /* stream ended: stop diverting it */
-      }
+      logkv("cluster/thread","frames total",(u64)frames,0);
+      logkv("cluster/thread","configs",(u64)configs,0);
+      logkv("cluster/thread","other-opcodes",(u64)others,0);
+      logline("cluster/thread","stream closed");
     }
-    if (connfd >= 0 && p_close) p_close(connfd);
+    if (p_close) p_close(connfd);
+  } else {
+    logline("cluster/thread","accept failed or none");
   }
-  if (p_ScreenStop) p_ScreenStop(c->screen);
-  if (p_ScreenDelete){ p_ScreenDelete(c->screen); logline("cluster/thread","screen deleted"); } /* F7: Stop does not free */
   logline("cluster/thread","exit");
   if (p_free) p_free(c);
   return 0;
+}
+
+/* ---- our own listener (exactly what LIVI and PlayPort do) -----------------
+ * Both working receivers bind a WILDCARD, EPHEMERAL TCP listener and advertise
+ * whatever port the OS assigns.  The unit's ServerSocketOpen binds via an
+ * internal family value and the phone never reached it (live: accept rc -6722 =
+ * kTimeoutErr). */
+static int own_listen(int *out_port){
+  extern int socket(int, int, int);
+  extern int setsockopt(int, int, int, const void*, unsigned int);
+  extern int bind(int, const void*, unsigned int);
+  extern int listen(int, int);
+  extern int getsockname(int, void*, unsigned int*);
+  extern int close(int);
+  struct in6 { unsigned char b[16]; };
+  struct sa6 { unsigned short family, port; unsigned int flow; struct in6 addr; unsigned int scope; };
+  int fd, one = 1;
+  struct sa6 sa, got; unsigned int glen = sizeof(got), i;
+  unsigned char *p;
+  fd = socket(10 /*AF_INET6*/, 1 /*SOCK_STREAM*/, 0);
+  if (fd < 0) return -1;
+  setsockopt(fd, 1 /*SOL_SOCKET*/, 2 /*SO_REUSEADDR*/, &one, sizeof(one));
+  { int zero = 0;
+    int r = setsockopt(fd, 41 /*IPPROTO_IPV6*/, 26 /*IPV6_V6ONLY*/, &zero, sizeof(zero));
+    logkv("cluster/listen","IPV6_V6ONLY=0 rc",(u64)(u32)r,0); }
+  p = (unsigned char*)&sa; for (i = 0; i < sizeof(sa); i++) p[i] = 0;
+  sa.family = 10;
+  /* Prefer the NATIVE alt port 6031 (0x178F): MHI3 selects -6030 for type 110
+   * and -6031 for type 111, and the wired phone connects the cluster stream to
+   * 6031 (rgi altscreen_hook.c:1758).  Fall back to ephemeral only if busy. */
+  sa.port = (unsigned short)((6031 << 8) | (6031 >> 8));   /* network byte order 0x8F17 */
+  if (bind(fd, &sa, sizeof(sa)) != 0){
+    sa.port = 0;
+    if (bind(fd, &sa, sizeof(sa)) != 0){ close(fd); return -1; }
+  }
+  if (listen(fd, 8) != 0){ close(fd); return -1; }
+  *out_port = 0;
+  if (getsockname(fd, &got, &glen) == 0){
+    *out_port = (int)(((got.port & 0xff) << 8) | (got.port >> 8));   /* ntohs */
+    logkv("cluster/listen","bound family",(u64)(u32)got.family,0);
+    logkv("cluster/listen","bound port",(u64)(u32)(*out_port),0);
+  }
+  return fd;
 }
 
 /* Set up a second screen for a type-111 stream dict and append
  * {type:111, dataPort} to response["streams"].  Returns 0 on success. */
 static int cluster_setup(void *session, void *streamDict, void *response){
   if (!session || !streamDict || !response){ logline("cluster","bad args"); return -1; }
-  if (!p_ScreenCreate || !p_ScreenSetup){ logline("cluster","screen API missing"); return -1; }
-
-  void *screen = 0;
-  if (p_ScreenCreate(&screen) != 0 || !screen){ logline("cluster","Create failed"); return -1; }
-  p_ScreenSetup(screen, streamDict);
-
+  /* SELF-CONTAINED RECEIVER -- no stock ScreenStream.
+   * A stock alt screen binds the MAIN display and starts a second in-dio OMX
+   * decoder on this unit: black main screen + decoder crash (the reference
+   * receiver luka-dev/mib2q-carplay-rgi hit the identical wall and abandoned the
+   * stock screen entirely).  So we own the listener and service the stream
+   * ourselves; nothing here touches the unit's screen/stream machinery. */
   long connID = (long)dgeti64k((CFDictionaryRef)streamDict, "streamConnectionID", 0);
-  if (!connID){ logline("cluster","no streamConnectionID"); goto fail_screen; }
+  logkv("cluster","streamConnectionID",(u64)connID,0);
 
-  void *hk = *(void**)((char*)session + 0x478);   /* pairVerifySession (HomeKit) */
-  if (!hk){
-    unsigned char key[16], iv[16];
-    if (!p_DeriveAES){ logline("cluster","no AES derive"); goto fail_screen; }
-    p_DeriveAES((char*)session + 0x268, 0x10, connID, key, iv);
-    /* the unit checks SetSecurityInfo's return (corpus _ScreenSetup, AES branch)
-     * and aborts on failure -> mirror it (fail closed; DeriveAES's return the
-     * unit ignores, so we do too). */
-    if (p_ScreenSetSec && p_ScreenSetSec(screen, key, iv) != 0){
-      logline("cluster","SetSecurityInfo failed"); goto fail_screen;
-    }
-    logline("cluster","security: AES");
+  /* Stream key: mirror stock _ScreenSetup (corpus libAirPlay case 0x6e) --
+   * AES when session+0x478==0, else chacha via the unit's FUN_001163d8.
+   * AES: 16-byte key at [0..16) + 16-byte IV at [16..32). */
+  unsigned char skey[32]; int keylen = 0, cipher = 0, i;
+  for (i = 0; i < 32; i++) skey[i] = 0;
+  if (*(void**)((char*)session + 0x478) == 0){
+    if (p_DeriveAES){ p_DeriveAES((char*)session + 0x268, 0x10, connID, skey, skey + 16);
+                      keylen = 16; cipher = 1; logline("cluster","key: AES-CTR"); }
+    else logline("cluster","no AES derive");
   } else {
-    unsigned char key[32];
-    fn_chachaDerive ch;
-    if (!g_libap_base){ logline("cluster","no lib base for chacha"); goto fail_screen; }
-    ch = (fn_chachaDerive)(g_libap_base + CHACHA_DERIVE_RVA);
-    /* The unit calls FUN_001163d8((long)session + 0x478, connID, 0,0, &key):
-     * the ADDRESS of the pairVerifySession field, which FUN dereferences
-     * (*param_1 == 0 / PairingSessionDeriveKey(*param_1,...)).  Passing the
-     * field VALUE (hk) would make FUN deref the session object itself.
-     * FUN returns an int STATUS (0 = success), not void: disasm at 0x163d8 ends
-     * `mov w0,w19; ret`, and the unit's own callers test it (libAirPlay 0x1ab60:
-     * `bl 0x163d8; str w0; cbz w0`; corpus _ScreenSetup case 0x6e).  Mirror the
-     * unit and fail CLOSED -- an uninitialised key buffer must not be installed. */
-    if (ch((char*)session + 0x478, connID, 0, 0, key) != 0){
-      logline("cluster","chacha derive failed"); goto fail_screen;
-    }
-    if (p_ScreenSetChaCha) p_ScreenSetChaCha(screen, key, 0x20);
-    logline("cluster","security: chacha (RVA)");
+    fn_chachaDerive ch = g_libap_base ? (fn_chachaDerive)(g_libap_base + CHACHA_DERIVE_RVA) : 0;
+    if (ch && ch((char*)session + 0x478, connID, 0, 0, skey) == 0){
+      keylen = 32; cipher = 2; logline("cluster","key: chacha20-poly1305"); }
+    else logline("cluster","chacha derive failed");
   }
 
-  int port = 0, lsock = -1;
-  unsigned family = *(unsigned short*)((char*)session + 0xec);
-  if (!p_ServerSocketOpen ||
-      p_ServerSocketOpen(family, 1 /*SOCK_STREAM*/, 6 /*TCP*/, 0xffffe872, &port, 0xfffd4000, &lsock) != 0){
-    logline("cluster","ServerSocketOpen failed"); goto fail_screen;
-  }
-  if (p_SocketSetQoS) p_SocketSetQoS(lsock, SCREEN_SOCK_QOS);
+  int port = 0, lsock = own_listen(&port);
+  if (lsock < 0){ logline("cluster","own listener failed"); goto fail_sock; }
   logkv("cluster","dataPort",(u64)(u32)port,0);
 
   /* append {type:111, dataPort:port} to response["streams"].  Mirrors the unit's
@@ -1102,6 +1360,20 @@ static int cluster_setup(void *session, void *streamDict, void *response){
         }
       }
       if (streams) p_CFArrayAppendValue(streams, desc);
+      /* dump exactly what the response's streams array now holds */
+      if (streams && p_CFArrayGetCount && p_CFArrayGetValueAtIndex && p_CFGetTypeID && p_CFDictionaryGetTypeID){
+        CFIndex j, m = p_CFArrayGetCount(streams);
+        logkv("cluster","response streams count",(u64)(u32)m,0);
+        for (j = 0; j < m; j++){
+          void *e = (void*)p_CFArrayGetValueAtIndex(streams, j);
+          if (e && p_CFGetTypeID(e) == p_CFDictionaryGetTypeID()){
+            s64 et = dgeti64k((CFDictionaryRef)e, "type", -1);
+            s64 ep = dgeti64k((CFDictionaryRef)e, "dataPort", -1);
+            logkv("cluster","  stream type",(u64)et,0);
+            logkv("cluster","  stream dataPort",(u64)ep,0);
+          }
+        }
+      }
       if (p_CFRelease) p_CFRelease(desc);         /* array retains it */
       if (created && p_CFRelease) p_CFRelease(streams); /* dict retains it */
       logline("cluster","response entry {type:111,dataPort} appended");
@@ -1114,11 +1386,11 @@ static int cluster_setup(void *session, void *streamDict, void *response){
    *   1. the shim's own Cinemo pipeline (decode bridge) -- Cinemo owns the ivi
    *      surface and decodes+renders the cluster frames into it;
    *   2. the shim's own Wayland/EGL surface (fallback, no decode). */
-  if (env_on("MIB3_SHIM_SURFACE",1)){
+  if (env_on("MIB3_SHIM_SURFACE",0)){
     int cw  = (int)env_num("MIB3_SHIM_W",1280);
     int chp = (int)env_num("MIB3_SHIM_H",480);
     unsigned iviid = (unsigned)env_num("MIB3_SHIM_IVIID",0x4d4233); /* 'MB3' */
-    if (env_on("MIB3_SHIM_BRIDGE",1) && bridge_create(cw, chp, iviid) == 0){
+    if (env_on("MIB3_SHIM_BRIDGE",0) && bridge_create(cw, chp, iviid) == 0){
       logline("cluster","route-B Cinemo bridge ready (Cinemo decodes+renders)");
       logline("cluster/surfname", surf_name());
     } else if (surface_create(cw, chp, iviid) == 0){
@@ -1137,7 +1409,9 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   }
   cl_ctx *c = (cl_ctx*)p_malloc(sizeof(cl_ctx));
   if (!c){ logline("cluster","ctx alloc failed"); goto fail_sock; }
-  c->screen = screen; c->lsock = lsock; c->session = session; c->stream = 0;
+  c->screen = 0; c->lsock = lsock; c->session = session; c->stream = 0;
+  { int j; for (j = 0; j < 32; j++) c->key[j] = skey[j]; }
+  c->keylen = keylen; c->cipher = cipher; c->counter = 0;
   {
     char *cfg = (char*)(*(void**)((char*)session + 0x10));
     c->flags = cfg ? *(int*)(cfg + 0xac) : 0;
@@ -1152,9 +1426,6 @@ static int cluster_setup(void *session, void *streamDict, void *response){
 
 fail_sock:
   if (p_close && lsock >= 0) p_close(lsock);
-fail_screen:
-  if (p_ScreenStop) p_ScreenStop(screen);
-  if (p_ScreenDelete){ p_ScreenDelete(screen); logline("cluster","screen deleted (fail path)"); } /* F7 */
   return -1;
 }
 
@@ -1360,6 +1631,38 @@ int  mib3shim_cluster_advertised(void){ return g_cluster_advertised; }
 /* ==========================================================================
  * The display seam.
  * ========================================================================*/
+/* ---- run banner ----------------------------------------------------------
+ * Visual discriminator for the APPEND-only log: no more "read the tail and
+ * guess where the run starts".  Printed as the first thing on the session-start
+ * seam, so every phone plug is unambiguously bracketed with its own config.
+ * Time is epoch % 86400 -> HH:MM:SS; the unit runs UTC. */
+static long g_run_no = 0;
+static void run_banner(void){
+  extern long time(long *);
+  extern int  getpid(void);
+  long t = time(0);
+  int  tzh = (int)env_num("MIB3_SHIM_TZ", 12);           /* hours WEST of the unit clock (tuned: unit clock is +4h) */
+  long sod = (t - (long)tzh * 3600) % 86400; if (sod < 0) sod += 86400;
+  int hh = (int)(sod / 3600), mm = (int)((sod % 3600) / 60), ss = (int)(sod % 60);
+  char mem[512]; buf b = { mem, sizeof(mem)-2, 0 };
+  bs(&b,"\n[mib3shim] ================================================================\n");
+  bs(&b,"[mib3shim] ====== RUN "); bu64(&b,(u64)(++g_run_no),10,0);
+  bs(&b,"  pid="); bu64(&b,(u64)getpid(),10,0);
+  bs(&b,"  "); bu64(&b,(u64)hh,10,2); bs(&b,":"); bu64(&b,(u64)mm,10,2);
+  bs(&b,":"); bu64(&b,(u64)ss,10,2); bs(&b," PST");
+  bs(&b," ======\n");
+  bs(&b,"[mib3shim] ====== knobs:  ADD="); bu64(&b,(u64)env_on("MIB3_SHIM_ADD",1),10,0);
+  bs(&b,"  INFO="); bu64(&b,(u64)env_on("MIB3_SHIM_INFO",1),10,0);
+  bs(&b,"  ENABLEDFEAT="); bu64(&b,(u64)env_on("MIB3_SHIM_ENABLEDFEAT",1),10,0);
+  bs(&b,"  GATE="); bu64(&b,(u64)gate_active(),10,0);
+  bs(&b,"  SURFACE="); bu64(&b,(u64)env_on("MIB3_SHIM_SURFACE",0),10,0);
+  bs(&b," ======\n");
+  bs(&b,"[mib3shim] ================================================================\n");
+  mem[b.n]=0;
+  log_open();
+  if (logfd >= 0) write(logfd, mem, b.n);
+}
+
 int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
                                      CFStringRef uuid,
                                      int features,
@@ -1371,6 +1674,7 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
                                      int heightPhysical)
 {
   hit("ADD\n", 4);                       /* prove entry, independent of everything */
+  run_banner();                          /* ==== RUN n / knobs ==== : per-plug discriminator */
   logline("AddScreenDisplay","ENTERED");  /* before resolve(): resolve() may fail */
   resolve();
   logline("AddScreenDisplay","CALL");
@@ -1396,18 +1700,25 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
   logkv("AddScreenDisplay","ADD_env",(u64)(u32)env_on("MIB3_SHIM_ADD",1),1);
   logkv("AddScreenDisplay","gate",(u64)(u32)gate_active(),1);
 
-  /* 2) advertise the cluster once, after the main display.
+  /* 2) advertise the cluster for THIS display list, after the main display.
    *    RUNTIME GATE: only when the stick marker is present (gate_active()).
-   *    If AddScreenDisplay fires before the stick is mounted the marker is
-   *    absent and nothing is advertised -- fail-safe to stock (see the lane doc
-   *    for the live-confirmable "is AddScreenDisplay boot-time or session-time"
-   *    question). */
-  if (rc == 0 && !saw_main_display && env_on("MIB3_SHIM_ADD",1) && gate_active()) {
+   *    IDEMPOTENT PER LIST (not one-shot per process): add the cluster iff the
+   *    list does not already carry a type-111 entry.  LG rebuilds `displays`
+   *    every session, so the old one-shot latch meant only the FIRST phone plug
+   *    after injection advertised -- later plugs still claimed altScreen with
+   *    one display (contradiction -> session killed). */
+  if (rc == 0 && env_on("MIB3_SHIM_ADD",1) && gate_active()) {
+    if (array_has_cluster(inArray)) {
+      g_cluster_advertised = 1;   /* present this session -> keep the claim consistent */
+      logline("AddScreenDisplay","cluster already in displays -- no re-add");
+    } else {
     saw_main_display = 1;
-    CFStringRef cu = p_CFStringCreateWithCString ? p_CFStringCreateWithCString(0,"MIB3-KOMBI-0001",K128) : 0;
+    char *cu_env = getenv("MIB3_SHIM_CUUID");
+    const char *cu_s = (cu_env && cu_env[0]) ? cu_env : "4d494233-0000-4000-8000-000000000001";
+    CFStringRef cu = p_CFStringCreateWithCString ? p_CFStringCreateWithCString(0,cu_s,K128) : 0;
     int cw   = (int)env_num("MIB3_SHIM_W", 1280);
     int chp  = (int)env_num("MIB3_SHIM_H", 480);   /* grounded cluster default: 1280x480 (LANE_SURFACE_BINDING_DESK §3a) */
-    int cfps = (int)env_num("MIB3_SHIM_FPS", 60);
+    int cfps = (int)env_num("MIB3_SHIM_FPS", 30);  /* refs: rgi/PlayPort advertise 30 (LIVI 60) */
     logline("AddScreenDisplay","ADDING cluster display");
     log_uuid("AddScreenDisplay/cluster-uuid", cu);
     logkv("AddScreenDisplay","cluster widthPixels",(u64)(u32)cw,0);
@@ -1415,13 +1726,17 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
     logkv("AddScreenDisplay","cluster maxFPS",(u64)(u32)cfps,0);
     /* cluster features/inputDevice: PlayPort's cluster config uses 0/0;
      * LIVI's working stack uses features=0x0A, primaryInputDevice=3. Env-tunable. */
-    int cfeat  = (int)env_num("MIB3_SHIM_CFEAT", 0);
+    int cfeat  = (int)env_num("MIB3_SHIM_CFEAT", 0x0A);  /* LIVI/PlayPort: HIGH_FIDELITY_TOUCH|KNOBS = 0x0A */
     int cindev = (int)env_num("MIB3_SHIM_CINDEV", 0);
-    int rc2 = real_AddScreenDisplay(inArray, cu, cfeat, cindev, cfps, cw, chp, cw, chp);
+    /* real PHYSICAL size in mm, NOT the pixel size (LIVI mm_at_dpi / rgi 292x110) */
+    int cwph = (int)env_num("MIB3_SHIM_CWPHY", 292);
+    int chph = (int)env_num("MIB3_SHIM_CHPHY", 110);
+    int rc2 = real_AddScreenDisplay(inArray, cu, cfeat, cindev, cfps, cw, chp, cwph, chph);
     logkv("AddScreenDisplay","cluster rc",(u64)(u32)rc2,0);
     if (rc2 == 0){ add_cluster_fields(inArray, cw, chp); g_cluster_advertised = 1; }
     logkv("AddScreenDisplay","cluster_advertised",(u64)(u32)g_cluster_advertised,0);
     if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow && inArray && *inArray) { logline("AddScreenDisplay","CFShow(displays) ->"); p_CFShow(*inArray); }
+    }
   }
   return rc;
 }
@@ -1429,7 +1744,7 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
 /* ==========================================================================
  * The session-setup seam.
  * ========================================================================*/
-void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionaryRef *responseOut)
+int AirPlayReceiverSessionSetup(void *session, void *request, void **responseOut, int a4)
 {
   hit("SETUP\n", 6);                      /* prove entry, independent of everything */
   logline("SessionSetup","ENTERED");       /* before resolve(): resolve() may fail */
@@ -1439,8 +1754,10 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
   logkv("SessionSetup","request",(u64)request,1);
   logkv("SessionSetup","responseOut",(u64)responseOut,1);
 
+  int ret = 0, handled111 = 0;
   if (real_SessionSetup && !env_on("MIB3_SHIM_SKIP_REAL",0))
-    real_SessionSetup(session, request, responseOut);
+    ret = real_SessionSetup(session, request, responseOut, a4);   /* propagate the real status */
+  logkv("SessionSetup","real ret",(u64)(u32)ret,1);
 
   if (responseOut && *responseOut){
     logline("SessionSetup","response dict:");
@@ -1473,7 +1790,7 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
         s64 t = dgeti64k((CFDictionaryRef)sd, "type", 0);
         if ((int)t == MIB3_CLUSTER_TYPE){
           logline("SessionSetup","type-111 stream -> cluster_setup");
-          cluster_setup(session, sd, *responseOut);
+          if (cluster_setup(session, sd, *responseOut) == 0) handled111 = 1;
         }
       }
     }
@@ -1504,9 +1821,10 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
       /* build a mutable array of the feature strings */
       fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
       CFMutableArrayRef arr = mka ? mka(0,0,p_kCFTypeArrayCallBacks) : 0;
-      const char *feats[3]; int nf = 0;
-      feats[nf++] = "altScreen";
+      const char *feats[4]; int nf = 0;
+      feats[nf++] = "iAPChannel";     /* PlayPort sends this; rgi inherits it from stock */
       feats[nf++] = "viewAreas";
+      feats[nf++] = "altScreen";
       if (env_on("MIB3_SHIM_EF_UICONTEXT",0)) feats[nf++] = "uiContext";
       int i;
       if (arr){
@@ -1531,6 +1849,12 @@ void AirPlayReceiverSessionSetup(void *session, u64 request, CFMutableDictionary
     /* the cluster was NOT advertised this process: claim nothing (consistency). */
     logline("SessionSetup","altScreen not claimed (cluster not advertised)");
   }
+  if (handled111 && ret != 0){ logkv("SessionSetup","forcing ret 0 (real was)",(u64)(u32)ret,0); ret = 0; }
+  if (env_on("MIB3_SHIM_DUMP",1) && responseOut && *responseOut){
+    logline("dump/setup","-------- SETUP response we hand the phone --------");
+    dump_cf("dump/setup", (CFTypeRef)*responseOut, 0);
+  }
+  return ret;      /* the seam ABI returns int (setup status); propagate stock's result */
 }
 
 /* ==========================================================================
@@ -1555,6 +1879,9 @@ void *AirPlayCopyServerInfo(void *a0, void *a1, void *a2)
 {
   hit("INFO\n", 5);                       /* prove entry, independent of everything */
   resolve();
+  /* count every /info the phone asks for: the documented flow has a SECOND /info
+   * (the follow-up GetInfo carrying altScreenURLs) before the 111 stream. */
+  { static int info_calls = 0; info_calls++; logkv("CopyServerInfo","CALL #",(u64)info_calls,0); }
   void *info = 0;
   if (real_CopyServerInfo)
     info = real_CopyServerInfo(a0, a1, a2);
@@ -1563,6 +1890,19 @@ void *AirPlayCopyServerInfo(void *a0, void *a1, void *a2)
   if (info && env_on("MIB3_SHIM_INFO",1) && gate_active()){
     int done = info_complete((CFMutableDictionaryRef)info);
     g_info_completed = done;
+  }
+  /* MIB3_SHIM_FEATURES=<dec> overrides the top-level /info `features` capability
+   * mask (the stock LG value differs from the working receivers' 0x615653aee2). */
+  { unsigned long long f = (unsigned long long)env_num("MIB3_SHIM_FEATURES", 0);
+    if (f && info && p_CFDictionarySetInt64){
+      CFStringRef k = sstr("features");
+      if (k){ p_CFDictionarySetInt64((CFMutableDictionaryRef)info, k, (s64)f);
+              if (p_CFRelease) p_CFRelease(k);
+              logkv("info","features override",f,0); }
+    } }
+  if (env_on("MIB3_SHIM_DUMP",1) && info){
+    logline("dump/info","========== /info dict we hand the phone ==========");
+    dump_cf("dump/info", (CFTypeRef)info, 0);
   }
   return info;
 }

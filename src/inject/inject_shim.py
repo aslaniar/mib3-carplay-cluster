@@ -111,6 +111,59 @@ def elf_dynsym(path):
                 syms[n] = val
     return syms
 
+def _elf_sections(f):
+    e_shoff     = struct.unpack_from("<Q", f, 0x28)[0]
+    e_shentsize = struct.unpack_from("<H", f, 0x3a)[0]
+    e_shnum     = struct.unpack_from("<H", f, 0x3c)[0]
+    e_shstrndx  = struct.unpack_from("<H", f, 0x3e)[0]
+    sh = [struct.unpack_from("<IIQQQQIIQQ", f, e_shoff + i * e_shentsize)
+          for i in range(e_shnum)]
+    return sh, e_shstrndx
+
+def elf_jumpslots(path, want):
+    """r_offsets of R_AARCH64_JUMP_SLOT relocations whose symbol is `want`.
+
+    This is the DETERMINISTIC way to find a seam's GOT slot.  A value scan
+    cannot tell two seams in the SAME library apart once one of them has been
+    repointed into a shim (both slots then 'point into a shim'), which is how
+    SessionSetup's slot was stolen by CopyServerInfo (LANE bug 2026-10-16)."""
+    f = open(path, "rb").read()
+    sh, shstrndx = _elf_sections(f)
+    def sname(i):
+        o = sh[shstrndx][4] + sh[i][0]
+        return f[o:f.index(b"\0", o)].decode("latin1")
+    dynidx = None
+    for i, s in enumerate(sh):
+        if sname(i) == ".dynsym":
+            dynidx = i
+            break
+    if dynidx is None:
+        return []
+    symoff = sh[dynidx][4]
+    stroff = sh[sh[dynidx][6]][4]
+    def symname(k):
+        o = symoff + k * 24
+        nameoff = struct.unpack_from("<I", f, o)[0]
+        if not nameoff:
+            return ""
+        return f[stroff + nameoff:f.index(b"\0", stroff + nameoff)].decode("latin1")
+    out = []
+    for s in sh:
+        if s[1] != 4 or s[9] != 24:        # SHT_RELA with 24-byte entries
+            continue
+        reloff, relsize = s[4], s[5]
+        for k in range(relsize // 24):
+            r_offset, r_info, _ = struct.unpack_from("<QQq", f, reloff + k * 24)
+            if (r_info & 0xffffffff) == 1026 and symname(r_info >> 32) == want:
+                out.append(r_offset)
+    return out
+
+def mapped_path(pid, suffix):
+    for lo, hi, perms, off, path in maps(pid):
+        if off == "00000000" and path.endswith(suffix):
+            return path
+    return None
+
 def read_mem(pid, addr, n):
     fd = os.open("/proc/%d/mem" % pid, os.O_RDONLY)
     try:
@@ -239,18 +292,28 @@ def main():
         print("[+] attached %d thread(s)" % len(attached))
 
         for sym, lib, hold, real, shim in plan:
-            regions = scan_regions(pid, hold)
-            if not regions:
-                failures.append("%s: no mapped region for %s" % (sym, hold))
+            hold_base = load_base(pid, hold)
+            hold_path = mapped_path(pid, hold)
+            if not hold_base or not hold_path:
+                failures.append("%s: %s not mapped" % (sym, hold))
                 continue
-            hits = find_slots(pid, real, shim_rng, regions)
-            print("[i] %s: %d slot(s) to point at the shim" % (sym, len(hits)))
+            # DETERMINISTIC: the slot is the JUMP_SLOT relocation for this
+            # symbol in the CALLING library.  (A value scan cannot separate two
+            # seams that share a library -- that is the bug this replaces.)
+            offs = elf_jumpslots(hold_path, sym)
+            hits = [(hold_base + o, hold_path) for o in offs]
+            print("[i] %s: %d relocation slot(s) in %s" % (sym, len(hits), hold))
             if not hits:
-                failures.append("%s: no GOT slot found" % sym)
+                failures.append("%s: no JUMP_SLOT relocation in %s" % (sym, hold))
                 continue
             ok = 0
             for addr, path in hits:
                 try:
+                    old = struct.unpack_from("Q", read_mem(pid, addr, 8), 0)[0]
+                    # sanity: holds the real symbol, or a previous shim's addr
+                    if old != real and not in_shim(old, shim_rng):
+                        print("      SKIP 0x%x: holds 0x%x (neither real nor a shim addr)" % (addr, old))
+                        continue
                     write_mem(pid, addr, struct.pack("Q", shim))
                     # VERIFY: read the slot back immediately
                     back = struct.unpack_from("Q", read_mem(pid, addr, 8), 0)[0]
