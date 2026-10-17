@@ -115,10 +115,12 @@ presenter_ok() {
   [ -n "$P" ] || P="$(pids_of mib3surface)"
   [ -n "$P" ] || P="$(pids_of mib3clusterhelper)"
   if [ -n "$P" ]; then say "presenter/helper pid=$P"; return 0; fi
-  say "WARN: no presenter (mib3egl2/mib3egl/mib3surface/mib3clusterhelper) is running."
-  say "      Start one FIRST, e.g.:"
+  say "WARN: no presenter (mib3egl/mib3egl2/mib3surface/mib3clusterhelper) is running."
+  say "      Start the PERSISTENT presenter FIRST, e.g.:"
   say "        XDG_RUNTIME_DIR=/run/platform/weston WAYLAND_DISPLAY=wayland-0 \\"
-  say "          nohup /tmp/kit/mib3egl2 $OURID 1280 480 3600 00ff00 --fps 10 >/dev/null 2>&1 &"
+  say "          nohup /tmp/kit/mib3egl $OURID 1280 480 --persist >/dev/null 2>&1 &"
+  say "      (mib3egl owns ivi $OURID and never exits; for a bounded diagnostic run use"
+  say "       mib3egl2 $OURID 1280 480 3600 00ff00 --fps 10 instead.)"
   return 1
 }
 surface_has_buffer() {   # read-only check: does ivi 3000 carry a buffer?
