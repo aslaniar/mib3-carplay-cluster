@@ -24,9 +24,11 @@ set -e
 CC=/opt/homebrew/opt/llvm/bin/clang
 LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
+# run from the script's own directory so the relative source paths resolve
+cd "$(dirname "$0")" || exit 1
 MD5SUM() { if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
 
-ROOTFS="$(cd ../../../R8830L_ROOTFS && pwd)"
+ROOTFS="$(cd "$(dirname "$0")/../../../R8830L_ROOTFS" && pwd)"
 LIBC="$ROOTFS/lib64/libc.so.6"
 LIBDL="$ROOTFS/lib64/libdl-2.23.so"
 WLCLIENT="$ROOTFS/usr/lib64/libwayland-client.so.0.3.0"
@@ -46,6 +48,12 @@ build_wl() {
       -Wl,-e,_start -o "$2" "$1" "$LIBC" "$LIBDL" "$WLCLIENT"
   echo "  -> $2 ($(wc -c < "$2") bytes)"
 }
+# libc only (no Wayland/EGL) -- the RGBA feeder
+build_libc() {
+  $CC --target=aarch64-linux-gnu -O2 -nostdlib -fPIE -fuse-ld=$LLD \
+      -Wl,-e,_start -o "$2" "$1" "$LIBC" "$LIBDL"
+  echo "  -> $2 ($(wc -c < "$2") bytes)"
+}
 # wayland + EGL/GLES (dmabuf presenter)
 build_egl() {
   $CC --target=aarch64-linux-gnu -O2 -nostdlib -fPIE -fuse-ld=$LLD \
@@ -57,6 +65,8 @@ build_wl  mib3surface.c mib3surface
 build_egl mib3egl.c     mib3egl
 # mib3egl2: the explicit-EGL-config diagnostic presenter (same lib set as mib3egl).
 [ -f mib3egl2.c ] && build_egl mib3egl2.c mib3egl2
+# rgba_feed: push a known RGBA frame into a presenter's --rgba-sock (libc only).
+[ -f rgba_feed.c ] && build_libc rgba_feed.c rgba_feed
 
 # Route-B RTP/MPEG-TS sender.  NOTE: mib3clusterstream.c is a normal HOSTED program
 # (it #includes <stdio.h>/<sys/socket.h>), so it needs an aarch64 *libc sysroot*
@@ -74,7 +84,7 @@ fi
 
 echo
 echo "--- sanity: machine + NEEDED (want AArch64, only unit sonames) ---"
-for b in mib3surface mib3egl mib3egl2 mib3clusterstream; do
+for b in mib3surface mib3egl mib3egl2 rgba_feed mib3clusterstream; do
   [ -f "$b" ] || continue
   printf '%s: ' "$b"
   $READELF -h "$b" | grep -o 'AArch64'
@@ -84,8 +94,10 @@ done
 echo
 echo "--- known-good md5s (reproduce byte-identical with this script) ---"
 echo "  mib3surface       d09cd0dad7045fac206f400e04ae0188"
-echo "  mib3egl           f2fd174c2012e429b1a71b733006c45e"
+echo "  mib3egl2          ef73fdd517afff801f77606ccf700791"
+echo "  (mib3egl/rgba_feed are pinned in harness/run_delivery.sh -- they change when their source does)"
 echo "  (actual, this build:)"
-for b in mib3surface mib3egl mib3egl2 mib3clusterstream; do
+for b in mib3surface mib3egl mib3egl2 rgba_feed mib3clusterstream; do
   [ -f "$b" ] && printf '  %-16s %s\n' "$b" "$(MD5SUM "$b")"
 done
+exit 0

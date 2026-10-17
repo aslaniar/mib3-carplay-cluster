@@ -6,7 +6,9 @@ set -e
 CC=/opt/homebrew/opt/llvm/bin/clang
 LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
-ROOTFS="$(cd ../../R8830L_ROOTFS && pwd)"
+# run from the script's own directory so the relative source paths resolve
+cd "$(dirname "$0")" || exit 1
+ROOTFS="$(cd "$(dirname "$0")/../../R8830L_ROOTFS" && pwd)"
 LIBC="$ROOTFS/lib64/libc.so.6"
 LIBDL="$(ls "$ROOTFS"/lib64/libdl-*.so 2>/dev/null | head -n1)"
 echo "linking against: $LIBC  $LIBDL"

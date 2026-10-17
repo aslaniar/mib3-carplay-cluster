@@ -35,25 +35,29 @@
 #   silently break the shim's logging: THE LABEL TRAP.)
 # ============================================================================
 set -u
-RSI=127.0.0.1
-DMP=49600                 # displaymanagement
-MRP=49500                 # maprenderer
-LOGPORT=54321             # MS-S live log (the oracle)
+# All of these are overridable so the controller can be exercised against a MOCK RSI
+# on the desk (harness/run_delivery.sh).  On the unit the defaults are the live values.
+RSI="${MIB3_DLV_RSI:-127.0.0.1}"
+DMP="${MIB3_DLV_DMP:-49600}"      # displaymanagement
+MRP="${MIB3_DLV_MRP:-49500}"      # maprenderer
+LOGPORT="${MIB3_DLV_LOGPORT:-54321}"  # MS-S live log (the oracle)
 SPNAME=navi-kombi-streamparameters
 NAVNAME=navi-kombi-renderingsurface
 OURNAME=test
 OURID=3000
 
 stick_path() {
+  [ -n "${MIB3_DLV_STICK:-}" ] && { printf '%s' "$MIB3_DLV_STICK"; return 0; }
   for d in /tmp/USB/PORT1 /tmp/USB/PORT2 /tmp/USB/PORT3 /tmp/USB/PORT4; do
     [ -d "$d/PART1" ] && { printf '%s/PART1' "$d"; return 0; }
   done
   return 1
 }
 if STICK="$(stick_path)"; then
+  mkdir -p "$STICK" 2>/dev/null
   BCF="$STICK/deliver.bc"; MSSLOG="$STICK/mss.log"; SAVE="$STICK/deliver_nav.json"; LOCK="$STICK/deliver.lock"
 else
-  BCF=/dev/shm/deliver.bc; MSSLOG=/dev/shm/mss.log; SAVE=/dev/shm/deliver_nav.json; LOCK=/dev/shm/deliver.lock
+  BCF="${MIB3_DLV_RAM:-/dev/shm}/deliver.bc"; MSSLOG="${MIB3_DLV_RAM:-/dev/shm}/mss.log"; SAVE="${MIB3_DLV_RAM:-/dev/shm}/deliver_nav.json"; LOCK="${MIB3_DLV_RAM:-/dev/shm}/deliver.lock"
 fi
 
 bc() { printf '[%s] %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$*" >> "$BCF" 2>/dev/null; sync 2>/dev/null; \
@@ -75,11 +79,14 @@ acquire() {
 release() { [ -n "${LOCK:-}" ] && [ -f "$LOCK/pid" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK" 2>/dev/null; }
 
 # --- tiny RSI helpers ----------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+pids_of() { if have pidof; then pidof "$1" 2>/dev/null; elif have pgrep; then pgrep -x "$1" 2>/dev/null; fi; }
 h() { _m="$1"; _u="$2"; _b="${3:-}"
   if [ -n "$_b" ]; then curl -sS --max-time 8 -X "$_m" -H 'Content-Type: application/json' --data "$_b" "$_u"
   else curl -sS --max-time 8 -X "$_m" "$_u"; fi; }
 de() { tr -d '\\'; }
-line_of() { printf '%s' "$1" | sed 's/},{/}\n{/g' | grep "\"name\":\"$2\"" | head -n1; }
+line_of() { printf '%s' "$1" | sed 's/},{/}\
+{/g' | grep "\"name\":\"$2\"" | head -n1; }
 uri_of()  { line_of "$1" "$2" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p' | de | head -n1; }
 id_of()   { line_of "$1" "$2" | sed -n 's/.*"internalIdentifier":"\([^"]*\)".*/\1/p' | head -n1; }
 uris() { curl -sS --max-time 8 "http://$RSI:$DMP/displaymanagement/renderingSurfaces"; }
@@ -88,7 +95,7 @@ sps()  { curl -sS --max-time 8 "http://$RSI:$DMP/displaymanagement/streamParamet
 valid_uri() { case "$1" in /displaymanagement/renderingSurfaces/*|/displaymanagement/streamParameters/*|/displaymanagement/displays/*) return 0;; *) return 1;; esac; }
 
 oracle_on() {
-  for p in $(pidof curl 2>/dev/null); do grep -qa "54321" /proc/$p/cmdline 2>/dev/null && kill "$p" 2>/dev/null; done
+  for p in $(pids_of curl); do grep -qa "54321" /proc/$p/cmdline 2>/dev/null && kill "$p" 2>/dev/null; done
   : > "$MSSLOG" 2>/dev/null
   nohup sh -c "curl -sN --max-time 3600 http://$RSI:$LOGPORT/ > $MSSLOG 2>/dev/null" >/dev/null 2>&1 &
   sleep 2
@@ -101,12 +108,12 @@ oracle_tail() {
     | sed 's/^.*\]//' | grep -avE "avg time" | tail -n 24
   echo "--- (end) ---"
 }
-msf_fds() { ls -l /proc/"$(pidof multi-screen-server 2>/dev/null)"/fd 2>/dev/null | grep -cE 'video|ion|dri'; }
+msf_fds() { ls -l /proc/"$(pids_of multi-screen-server)"/fd 2>/dev/null | grep -cE 'video|ion|dri'; }
 
 presenter_ok() {
-  P="$(pidof mib3egl2 2>/dev/null)"; [ -n "$P" ] || P="$(pidof mib3egl 2>/dev/null)"
-  [ -n "$P" ] || P="$(pidof mib3surface 2>/dev/null)"
-  [ -n "$P" ] || P="$(pidof mib3clusterhelper 2>/dev/null)"
+  P="$(pids_of mib3egl2)"; [ -n "$P" ] || P="$(pids_of mib3egl)"
+  [ -n "$P" ] || P="$(pids_of mib3surface)"
+  [ -n "$P" ] || P="$(pids_of mib3clusterhelper)"
   if [ -n "$P" ]; then say "presenter/helper pid=$P"; return 0; fi
   say "WARN: no presenter (mib3egl2/mib3egl/mib3surface/mib3clusterhelper) is running."
   say "      Start one FIRST, e.g.:"
@@ -124,7 +131,8 @@ surface_has_buffer() {   # read-only check: does ivi 3000 carry a buffer?
 status() {
   R="$(uris)"; D="$(disps)"; S="$(sps)"
   echo "== stick / lock =="; echo "  stick    : ${STICK:-<none - RAM fallback>}"; echo "  lock     : $LOCK $([ -d "$LOCK" ] && echo '(HELD pid'"$(cat "$LOCK/pid" 2>/dev/null)"')')"
-  echo "== elements =="; printf '%s' "$R" | sed 's/},{/}\n{/g' | grep -o '"internalIdentifier":"[^"]*","name":"[^"]*"'
+  echo "== elements =="; printf '%s' "$R" | sed 's/},{/}\
+{/g' | grep -o '"internalIdentifier":"[^"]*","name":"[^"]*"'
   echo "== wanted uris =="
   echo "  display          : $(uri_of "$D" navi-kombi-display)"
   echo "  streamParameters : $(uri_of "$S" $SPNAME)"
@@ -183,7 +191,7 @@ do_apply() {
   sleep 4
   oracle_tail
   bc "apply:done"
-  verify
+  do_verify
 }
 
 do_restore() {
@@ -211,7 +219,7 @@ do_restore() {
 do_verify() {
   _ok=1
   R="$(uris)"; GOT="$(id_of "$R" $OURNAME)"; [ "$GOT" = "$OURID" ] || { say "VERIFY FAIL: our element id='$GOT' (want $OURID)"; _ok=0; }
-  pidof multi-screen-server >/dev/null 2>&1 || { say "VERIFY FAIL: multi-screen-server not running"; _ok=0; }
+  [ -n "$(pids_of multi-screen-server)" ] || { say "VERIFY FAIL: multi-screen-server not running"; _ok=0; }
   grep -aq "startShare \[id = $OURID\]" "$MSSLOG" 2>/dev/null && say "VERIFY OK: MS-S did startShare [id = $OURID]" || say "VERIFY ?: no 'startShare [id = $OURID]' in the oracle yet"
   _f="$(msf_fds)"; [ "${_f:-0}" -ge 10 ] && say "VERIFY OK: MS-S fds=$_f (streaming)" || say "VERIFY ?: MS-S fds=$_f (6=parked, 11=streaming)"
   [ "$_ok" = "1" ] && say "verify: PASS (element owned)" || say "verify: FAIL"
