@@ -484,6 +484,9 @@ static fn_CinemoCreateStr  p_CinemoCreateWindow;
 static fn_CinemoCreateStr  p_CinemoCreateProjection;
 static void               *p_opt_video_device_id;   /* &CINEMO_OPTION_VIDEO_DEVICE_ID */
 static void               *p_iid_cinemo_option;     /* &ICinemoOption::iid */
+/* The playback ICinemoOption keys the framework sets in screenSetup() (2026-10-17). */
+static void               *p_opt_aspect, *p_opt_max_res, *p_opt_frame_drop, *p_opt_max_fps,
+                          *p_opt_dist_en, *p_opt_dist_delay, *p_opt_hw_decode;
 
 /* route-B graphics symbols (resolved lazily in resolve_gfx) */
 static fn_wl_connect          p_wl_display_connect;
@@ -2621,6 +2624,18 @@ typedef struct {
   unsigned long feed_count, fail_count;
 } bridge_t;
 static bridge_t g_br;
+/* Stub playback event handler.  The framework passes a real one
+ * (CinemoMediaEngineUtils::handlePlaybackEvents); our bridge passed 0.  If the
+ * device delivers its "decoded/please render" notification to that handler and
+ * nobody is listening, it has nowhere to go -- which would explain a fully set-up
+ * EGL context (trace: eglCreateWindowSurface + eglMakeCurrent) and ZERO swaps. */
+static unsigned long g_br_events;
+static long bridge_event_handler(void *self, void *ev){
+  (void)self; (void)ev;
+  g_br_events++;
+  if (g_br_events == 1 || (g_br_events % 100) == 0) logkv("bridge","playback event",g_br_events,0);
+  return 0;
+}
 
 static void *vslot(void *obj, unsigned off){
   if (!obj) return 0;
@@ -2650,6 +2665,13 @@ static void resolve_bridge(void){
   p_CinemoCreateProjection = (fn_CinemoCreateStr) R("CinemoCreateProjection");
   p_opt_video_device_id    = R("CINEMO_OPTION_VIDEO_DEVICE_ID");
   p_iid_cinemo_option      = R("_ZN13ICinemoOption3iidE");
+  p_opt_aspect             = R("CINEMO_OPTION_VIDEO_ASPECT");
+  p_opt_max_res            = R("CINEMO_OPTION_VIDEO_MAX_RESOLUTION");
+  p_opt_frame_drop         = R("CINEMO_OPTION_VIDEO_FRAME_DROP_THRESHOLD");
+  p_opt_max_fps            = R("CINEMO_OPTION_VIDEO_MAX_RENDERED_FPS");
+  p_opt_dist_en            = R("CINEMO_OPTION_DISTRIBUTED_ENABLE");
+  p_opt_dist_delay         = R("CINEMO_OPTION_DISTRIBUTED_DELAY_MS");
+  p_opt_hw_decode          = R("CINEMO_OPTION_VIDEO_HARDWARE_DECODE");
   logline("bridge","resolved");
   logkv("bridge","CinemoCreateConfig",(u64)p_CinemoCreateConfig,1);
   logkv("bridge","CinemoCreatePlaylist",(u64)p_CinemoCreatePlaylist,1);
@@ -2714,7 +2736,50 @@ static int bridge_create(int w, int h, unsigned ivi_id){
   { fn_vc1 f = (fn_vc1)vslot(g_br.playlist, 0x128);
     if (!f || f(g_br.playlist, &g_br.playback) != 0 || !g_br.playback){ logline("bridge","FAIL: playlist->CreatePlayback"); goto fail; } }
   { fn_vc2 f = (fn_vc2)vslot(g_br.playback, 0x28);
-    if (f) f(g_br.playback, 0, 0); }                 /* set event handler (none needed) */
+    /* (playback, self, handler) -- the framework passes all three; we passed (0,0).
+     * MIB3_SHIM_BRIDGE_EVH=0 ablates. */
+    if (f){
+      if (env_on("MIB3_SHIM_BRIDGE_EVH",1)) f(g_br.playback, 0, (void*)bridge_event_handler);
+      else f(g_br.playback, 0, 0);
+    } }
+  /* ---- THE OPTIONS BLOCK (2026-10-17) ------------------------------------
+   * The framework's CinemoMediaEngineUtils::screenSetup() sets these on the playback's
+   * ICinemoOption (playback->[0x10](pb,&opt,ICinemoOption::iid), then opt->[0x28] per key)
+   * BEFORE it calls GetVideoDevice.  Our bridge skipped them entirely.  Without
+   * VIDEO_HARDWARE_DECODE="TRUE" the pipeline can end up on the "Dummy"/"Painter"
+   * swap chain (NmeSwapChain::Create, corpus libNmeVideoDevice 0x124be0) which produces
+   * NO real surface buffer -- exactly the observed "decodes, but the ivi surface stays
+   * 0x0" wall.  Values are read out of the framework's own rodata pool
+   * (libCarPlayMediaFramework.so, imagebase 0x100000): "Native" / "1920x1080" / "50" /
+   * "60000" / "FALSE" / "0" / "TRUE".  Single change; MIB3_SHIM_BRIDGE_OPTS=0 ablates it. */
+  if (env_on("MIB3_SHIM_BRIDGE_OPTS",1) && p_iid_cinemo_option){
+    void *opts = 0;
+    fn_vc2 getopt = (fn_vc2)vslot(g_br.playback, 0x10);
+    void *iid = *(void**)p_iid_cinemo_option;
+    int rc = getopt ? (int)getopt(g_br.playback, &opts, iid) : -1;
+    logkv("bridge","playback->[0x10] options rc",(u64)(unsigned)rc,0);
+    if (rc == 0 && opts){
+      fn_vc2 setopt = (fn_vc2)vslot(opts, 0x28);
+      if (setopt){
+        struct { void *sym; const char *val; } o[7];
+        int k, okc = 0, lastrc = 0;
+        o[0].sym = p_opt_aspect;     o[0].val = "Native";
+        o[1].sym = p_opt_max_res;    o[1].val = "1920x1080";
+        o[2].sym = p_opt_frame_drop; o[2].val = "50";
+        o[3].sym = p_opt_max_fps;    o[3].val = "60000";
+        o[4].sym = p_opt_dist_en;    o[4].val = "FALSE";
+        o[5].sym = p_opt_dist_delay; o[5].val = "0";
+        o[6].sym = p_opt_hw_decode;  o[6].val = "TRUE";
+        for (k = 0; k < 7; k++){
+          if (!o[k].sym) continue;
+          lastrc = (int)setopt(opts, *(void**)o[k].sym, (void*)o[k].val);
+          if (lastrc == 0) okc++;
+        }
+        logkv("bridge","options set ok",(u64)okc,0);
+        logkv("bridge","options lastrc",(u64)(unsigned)lastrc,0);
+      } else logline("bridge","FAIL: options->[0x28] missing");
+    } else if (rc != 0) logline("bridge","FAIL: playback->[0x10] options");
+  }
   { fn_vc2 f = (fn_vc2)vslot(g_br.cfg, 0x30);
     /* the framework LOADS the option id from the symbol (it dereferences the GOT
      * entry: `uVar3 = *(undefined8 *)PTR_CINEMO_OPTION_VIDEO_DEVICE_ID`) -- the
@@ -2748,7 +2813,27 @@ static int bridge_create(int w, int h, unsigned ivi_id){
     if (!dn){ logline("bridge","FAIL: dev->GetName"); goto fail; }
     logline("bridge/devname", dn);
     if (p_CinemoCreateWindow(dn, &g_br.window) != 0 || !g_br.window){ logline("bridge","FAIL: CinemoCreateWindow"); goto fail; }
-    /* Framework parity (CinemoMediaEngineUtils::setVideoParams): bind the window to the device. */
+    /* Framework parity (CinemoMediaEngineUtils::setVideoParams, corpus libCarPlayMediaFramework
+     * 0x120150): the framework does NOT call window->[0x58].  It calls
+     *     window->[0x60](window, buf)          -> the video.device_name
+     *     playback->[0x58](playback, devname)  -> ATTACH the video device to the playback
+     * The second call is the one our bridge was missing entirely: without the playback bound
+     * to the device the decoder decodes (WriteVideo returns OK) but has no render target, so
+     * it never attaches a buffer to the ivi surface (ILM: original size 0x0).  Single change;
+     * MIB3_SHIM_BRIDGE_BIND=0 ablates it. */
+    if (env_on("MIB3_SHIM_BRIDGE_BIND",1)){
+      char wdn[300];
+      { int i; for (i = 0; i < 300; i++) wdn[i] = 0; }
+      { fn_vc1 g = (fn_vc1)vslot(g_br.window, 0x60);
+        int r = g ? (int)g(g_br.window, wdn) : -1;
+        logkv("bridge","window->[0x60] devname rc",(u64)(unsigned)r,0);
+        if (r == 0) logline("bridge/win-devname", wdn); }
+      { const char *use = wdn[0] ? wdn : dn;
+        fn_vc1 h = (fn_vc1)vslot(g_br.playback, 0x58);
+        int r = h ? (int)h(g_br.playback, (void*)use) : -1;
+        logkv("bridge","playback->[0x58] bind-device rc",(u64)(unsigned)r,0); }
+    }
+    /* Legacy parity call (kept, harmless: rc=0): bind the window to the device. */
     { fn_vc1 g = (fn_vc1)vslot(g_br.window, 0x58);
       int brc = g ? g(g_br.window, (void*)dn) : -1;
       logkv("bridge","window->[0x58] bind-device rc",(u64)(unsigned)brc,0); } }
@@ -2770,6 +2855,26 @@ static int bridge_create(int w, int h, unsigned ivi_id){
    * reconstructed from CinemoMediaEngineUtils::writeVideoFormat — the descriptor field offsets were
    * derived by hand and it went onto live hardware in a batch with other changes; the next plug
    * rebooted the unit.  Removed.  Re-add ONLY as a single change, desk-verified, with stick logs. */
+
+  /* ---- PLAY (2026-10-17): THE MISSING START ------------------------------
+   * CinemoMediaEngineUtils::play() (corpus libCarPlayMediaFramework 0x121e94) ends with
+   *     uVar8 = playlist->[0x90](playlist, 1);
+   *     playback->[0x98](playback, uVar8);
+   * Our bridge built the whole pipeline (config, playlist, playback, device, window,
+   * projection, bind) and then NEVER CALLED PLAY.  Evidence from the live tracer: the
+   * device set up EGL (window surface + context + MakeCurrent) and then did NOTHING --
+   * it never opened a video decoder node and never made a single GL call, so the surface
+   * stayed empty.  The pipeline was constructed but never started.
+   * MIB3_SHIM_BRIDGE_PLAY=0 ablates this single change. */
+  if (env_on("MIB3_SHIM_BRIDGE_PLAY",1)){
+    unsigned long id = 0;
+    { fn_vc1 g = (fn_vc1)vslot(g_br.playlist, 0x90);
+      id = g ? (unsigned long)g(g_br.playlist, (void*)1UL) : 0;
+      logkv("bridge","playlist->[0x90] id",(u64)id,0); }
+    { fn_vc1 p = (fn_vc1)vslot(g_br.playback, 0x98);
+      int rc = p ? (int)p(g_br.playback, (void*)id) : -1;
+      logkv("bridge","playback->[0x98] PLAY rc",(u64)(unsigned)rc,0); }
+  }
 
   g_br.active = 1;
   logline("bridge","-- create done (active) --");

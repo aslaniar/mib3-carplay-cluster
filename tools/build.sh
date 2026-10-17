@@ -67,6 +67,26 @@ build_egl mib3egl.c     mib3egl
 [ -f mib3egl2.c ] && build_egl mib3egl2.c mib3egl2
 # rgba_feed: push a known RGBA frame into a presenter's --rgba-sock (libc only).
 [ -f rgba_feed.c ] && build_libc rgba_feed.c rgba_feed
+# v4l2_probe: what IS each /dev/video* node (decoder vs encoder)?
+[ -f v4l2_probe.c ] && build_libc v4l2_probe.c v4l2_probe
+# v4l2_dec: drive /dev/video32 (the H.264 decoder) directly, V4L2 M2M
+[ -f v4l2_dec.c ] && build_libc v4l2_dec.c v4l2_dec
+# omx_probe: is the HW decoder drivable via the OpenMAX component API?
+[ -f omx_probe.c ] && build_libc omx_probe.c omx_probe
+[ -f omx_ports.c ] && build_libc omx_ports.c omx_ports
+[ -f omx_dec.c ] && build_libc omx_dec.c omx_dec
+[ -f omx_idx.c ] && build_libc omx_idx.c omx_idx
+[ -f omx_vt.c ] && build_libc omx_vt.c omx_vt
+[ -f omx_run.c ] && build_libc omx_run.c omx_run
+[ -f omx_fix.c ] && build_libc omx_fix.c omx_fix
+# wl_trace.so: the DRAW-CALL TRACER -- a shared library (not an executable: no crt,
+# no _start).  Loaded into OUR OWN helper only (LD_PRELOAD, or first in
+# MIB3_HELPER_LIBS) to log the EGL/Wayland calls the vendor video device makes.
+if [ -f wl_trace.c ]; then
+  $CC --target=aarch64-linux-gnu -O2 -fPIC -fvisibility=default -nostdlib \
+      -Wall -Wextra -fuse-ld=$LLD -shared -o wl_trace.so wl_trace.c "$LIBC" "$LIBDL"
+  echo "  -> wl_trace.so ($(wc -c < wl_trace.so) bytes)"
+fi
 
 # Route-B RTP/MPEG-TS sender.  NOTE: mib3clusterstream.c is a normal HOSTED program
 # (it #includes <stdio.h>/<sys/socket.h>), so it needs an aarch64 *libc sysroot*
