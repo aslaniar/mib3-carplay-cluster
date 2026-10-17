@@ -173,14 +173,32 @@ int main(int argc, char **argv);
 void _start(void){
   static char cbuf[1024]; static char *av[48], *nav[48];
   int n = 0, argc = 0, i = 0, fd = open("/proc/self/cmdline", 0);
-  int skip = 1, k;
+  int skip = 0, k, skip0 = 0;   /* direct run: av[0] IS the program name (skip=0).
+                                 * The desk's `ld-2.23.so ... prog args` case sets skip
+                                 * in the loader block below.  skip=1 here was the bug:
+                                 * it ate the program name, so main()'s positional parse
+                                 * (id,w,h,...) shifted by one and the tool created ivi
+                                 * surface 1280 instead of 3000 (found live 2026-10-17). */
   if (fd >= 0){ long r = read(fd, cbuf, (unsigned long)sizeof(cbuf)-1); if (r > 0) n = (int)r; close(fd); }
   cbuf[n] = 0;
   while (i < n && argc < 47){ av[argc++] = &cbuf[i]; while (i < n && cbuf[i]) i++; i++; }
   av[argc] = 0;
+  /* busybox `nohup` (and any execvp(argv[1], argv+1)) DROPS argv[0].  This image has
+   * no setsid, so `nohup mib3egl <id> <w> <h>` arrives as cmdline "<id> <w> <h> ..."
+   * and EVERY positional shifts by one -- verified live 2026-10-17: it created ivi
+   * surface 1280 instead of 3000, which would silently break delivery.  A purely
+   * numeric first token means the program name is missing -> re-insert a placeholder. */
+  { const char *t = av[0];
+    if (t && t[0] >= '0' && t[0] <= '9'){
+      const char *p; int all = 1;
+      for (p = t; *p; p++) if (*p < '0' || *p > '9'){ all = 0; break; }
+      if (all && argc < 47){ int _j; for (_j = argc; _j > 0; _j--) av[_j] = av[_j - 1];
+                             av[0] = "x"; argc++; av[argc] = 0; skip0 = 1; } } }
   /* When launched as `ld-2.23.so [--opts] prog args...` (the DESK bench does this),
    * /proc/self/cmdline contains the LOADER's argv too.  Normalise so main() sees
    * argv = {prog, args...} exactly as it does when run directly on the unit. */
+  if (skip0) skip = 0;   /* nohup case: av[0] is the placeholder we just inserted */
+  else
   { const char *s = av[0]; for (const char *p = av[0]; *p; p++) if (*p == '/') s = p + 1;
     if (s[0] == 'l' && s[1] == 'd' && (s[2] == '-' || s[2] == '.')){
       int j = 1;

@@ -75,6 +75,17 @@ typedef int  (*fn_feed)(const void *, unsigned long, unsigned long);
 typedef int  (*fn_i0)(void);
 typedef int  (*fn_wf)(const void *, int, int);
 
+/* ---- optional frame CAPTURE ----------------------------------------------
+ * MIB3_HELPER_DUMP=<path>  append every received access unit (they already begin
+ *                          with 00 00 00 01, so the concatenation IS a valid
+ *                          Annex-B stream) up to MIB3_HELPER_DUMP_MAX AUs.
+ * WHY: we need REAL CarPlay cluster frames as a decode test vector -- and their
+ * SPS tells us the profile/level, which decides whether a software decoder is
+ * viable or the hardware path is required.  Without a real sample, that is a guess.
+ * -------------------------------------------------------------------------*/
+static int  dump_fd  = -1;
+static u64  dump_max = 0, dump_n = 0;
+
 static u64 slen_(const char *s){ u64 n=0; while (s && s[n]) n++; return n; }
 static void P(const char *s){ write(1, s, slen_(s)); }
 static void Pkv(const char *tag, u64 v){
@@ -167,6 +178,16 @@ void _start(void){
     helper_bc(rc == 0 ? "sink:surface:ok" : "sink:surface:fail");
   }
 
+  /* optional frame capture (MIB3_HELPER_DUMP=<path>) -- see the header note */
+  { const char *dp = getenv("MIB3_HELPER_DUMP");
+    if (dp && dp[0]){
+      dump_max = env_num("MIB3_HELPER_DUMP_MAX", 40);
+      dump_fd = open(dp, 1 /*O_WRONLY*/ | 0100 /*O_CREAT*/ | 01000 /*O_TRUNC*/, 0644);
+      P("[helper] dumping up to "); Pkv("max", dump_max);
+      if (dump_fd >= 0){ P("[helper] dumping AUs -> "); P(dp); P("\n"); }
+      else P("[helper] WARN: cannot open the dump path\n");
+    } }
+
   /* AF_UNIX server */
   { struct { unsigned short fam; char path[108]; } sa; int i;
     for (i = 0; i < 108; i++) sa.path[i] = 0;
@@ -230,8 +251,23 @@ void _start(void){
         /* NB (2026-10-16): a monotonic timestamp was passed here ((total+1)*100 ms) to give
          * WriteVideo a non-zero pts/flags.  It went live in the batched build that REBOOTED the unit
          * on the next phone plug, so it is REVERTED to 0 until it can be verified alone. */
-        if (use_bridge && bfeed) bfeed(buf, len, 0);
-        else if (swf && sready && sready() && (long)len >= (long)w*(long)hh*4) swf(buf, w, hh);
+        /* NB (2026-10-17): a MONOTONIC timestamp is now passed for real.  The wire
+         * format's third field is `seq`, which the shim increments per frame; using it
+         * gives WriteVideo a non-zero pts and flags (writeVideo derives both from the
+         * timestamp), instead of pts=0/flags=0 on every frame.  It was left at 0 in an
+         * earlier build only because that build shipped other changes at the same time
+         * and went onto live hardware batched; here the bridge runs ONLY in the
+         * out-of-process helper, so a fault cannot reach carplay or the centre screen.
+         * Evidence for trying it: with pts=0 the device decodes (it opens /dev/video32
+         * and allocates dmabufs) but performs NO per-frame work at all -- no draws, no
+         * swaps -- as if the frames were being discarded.  MIB3_HELPER_PTS0=1 restores
+         * the old zero-timestamp behaviour. */
+        { unsigned long ts = (unsigned long)(total + 1) * 100ul;   /* 100 ms per frame */
+          if (getenv("MIB3_HELPER_PTS0")) ts = 0;
+          if (use_bridge && bfeed) bfeed(buf, len, ts);
+          else if (swf && sready && sready() && (long)len >= (long)w*(long)hh*4) swf(buf, w, hh); }
+        /* capture a real CarPlay access unit stream for the decode route decision */
+        if (dump_fd >= 0 && dump_n < dump_max){ write(dump_fd, buf, len); dump_n++; }
         total++;
         if (total == 1 || (total % 100) == 0){ Pkv("frames", total); Pkv("len", len); }
       }

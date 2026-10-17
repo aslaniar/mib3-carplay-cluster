@@ -130,6 +130,14 @@ void _start(void){
   cbuf[n] = 0;
   while (i < n && argc < 31){ av[argc++] = &cbuf[i]; while (i < n && cbuf[i]) i++; i++; }
   av[argc] = 0;
+  /* busybox `nohup` drops argv[0] (execvp(argv[1], argv+1)); a numeric first token
+   * means the program name is missing -> shift so positionals stay aligned. */
+  { const char *t = av[0];
+    if (t && t[0] >= '0' && t[0] <= '9'){
+      const char *p; int all = 1;
+      for (p = t; *p; p++) if (*p < '0' || *p > '9'){ all = 0; break; }
+      if (all && argc < 31){ int _j; for (_j = argc; _j > 0; _j--) av[_j] = av[_j - 1];
+                             av[0] = "x"; argc++; av[argc] = 0; } } }
   _exit(main(argc, av));
 }
 
