@@ -27,6 +27,10 @@
 #   sh deliver_ctl.sh verify            # assert the post-conditions, PASS/FAIL
 #   sh deliver_ctl.sh restore           # put the car's nav back               (idempotent)
 #   sh deliver_ctl.sh watch [secs]      # live table while you start a route
+#   sh deliver_ctl.sh oracle start      # start the MS-S live-log capture (the ORACLE; idempotent, append)
+#   sh deliver_ctl.sh oracle stop       # stop the capture
+#   sh deliver_ctl.sh oracle tail       # show the last share/stream decisions
+# (start_mss_log.sh is a thin wrapper for the same thing, for the day-of card.)
 #
 # SAFETY: on every mutating step a one-line breadcrumb (write + sync) lands on the
 #   STICK at <stick>/PART1/deliver.bc -- a fault here can reset the unit and wipe
@@ -55,9 +59,9 @@ stick_path() {
 }
 if STICK="$(stick_path)"; then
   mkdir -p "$STICK" 2>/dev/null
-  BCF="$STICK/deliver.bc"; MSSLOG="$STICK/mss.log"; SAVE="$STICK/deliver_nav.json"; LOCK="$STICK/deliver.lock"
+  BCF="$STICK/deliver.bc"; MSSLOG="$STICK/mss.log"; SAVE="$STICK/deliver_nav.json"; LOCK="$STICK/deliver.lock"; OPID="$STICK/oracle.pid"
 else
-  BCF="${MIB3_DLV_RAM:-/dev/shm}/deliver.bc"; MSSLOG="${MIB3_DLV_RAM:-/dev/shm}/mss.log"; SAVE="${MIB3_DLV_RAM:-/dev/shm}/deliver_nav.json"; LOCK="${MIB3_DLV_RAM:-/dev/shm}/deliver.lock"
+  BCF="${MIB3_DLV_RAM:-/dev/shm}/deliver.bc"; MSSLOG="${MIB3_DLV_RAM:-/dev/shm}/mss.log"; SAVE="${MIB3_DLV_RAM:-/dev/shm}/deliver_nav.json"; LOCK="${MIB3_DLV_RAM:-/dev/shm}/deliver.lock"; OPID="${MIB3_DLV_RAM:-/dev/shm}/oracle.pid"
 fi
 
 bc() { printf '[%s] %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$*" >> "$BCF" 2>/dev/null; sync 2>/dev/null; \
@@ -94,12 +98,34 @@ disps(){ curl -sS --max-time 8 "http://$RSI:$DMP/displaymanagement/displays"; }
 sps()  { curl -sS --max-time 8 "http://$RSI:$DMP/displaymanagement/streamParameters"; }
 valid_uri() { case "$1" in /displaymanagement/renderingSurfaces/*|/displaymanagement/streamParameters/*|/displaymanagement/displays/*) return 0;; *) return 1;; esac; }
 
+# The oracle is MS-S's own live log (port 54321) -- the ONLY way to read the share
+# decision without eyes on the dash. It is started by apply/restore AND can be run
+# earlier via `oracle start` / start_mss_log.sh. It is IDEMPOTENT and APPEND-only:
+# pre-starting it is safe, and `apply` no longer truncates it (a pre-started capture
+# used to be wiped by apply -- fixed 2026-10-16).
+oracle_pid() {
+  [ -f "$OPID" ] || return 1
+  _p="$(cat "$OPID" 2>/dev/null)"
+  [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null && { printf '%s' "$_p"; return 0; }
+  return 1
+}
 oracle_on() {
-  for p in $(pids_of curl); do grep -qa "54321" /proc/$p/cmdline 2>/dev/null && kill "$p" 2>/dev/null; done
-  : > "$MSSLOG" 2>/dev/null
-  nohup sh -c "curl -sN --max-time 3600 http://$RSI:$LOGPORT/ > $MSSLOG 2>/dev/null" >/dev/null 2>&1 &
+  P="$(oracle_pid)"
+  if [ -n "$P" ]; then say "oracle already live (pid $P) -> $MSSLOG"; return 0; fi
+  mkdir -p "$(dirname "$MSSLOG")" 2>/dev/null
+  # curl writes the file itself, so $! is the curl pid (killable) and the harness'
+  # pkill pattern ("curl -sN --max-time 3600 http://127.0.0.1:$LOGPORT") still matches.
+  nohup curl -sN --max-time 3600 "http://$RSI:$LOGPORT/" >> "$MSSLOG" 2>/dev/null &
+  echo $! > "$OPID" 2>/dev/null
   sleep 2
-  [ -s "$MSSLOG" ] && say "oracle live -> $MSSLOG" || say "WARN: oracle produced nothing (port $LOGPORT closed?)"
+  if [ -s "$MSSLOG" ]; then say "oracle live (pid $(cat "$OPID" 2>/dev/null)) -> $MSSLOG"
+  else say "WARN: oracle produced nothing yet (port $LOGPORT closed?)"; fi
+  return 0
+}
+oracle_off() {
+  P="$(oracle_pid)"
+  if [ -n "$P" ]; then kill "$P" 2>/dev/null && say "oracle stopped (pid $P)"; else say "oracle not running"; fi
+  rm -f "$OPID" 2>/dev/null
   return 0
 }
 oracle_tail() {
@@ -247,5 +273,11 @@ case "${1:-}" in
   restore) acquire || exit 1; do_restore ;;
   verify)  do_verify ;;
   watch)   shift; watch_live "$@" ;;
-  *) echo "usage: $0 {status|apply|verify|restore|watch [secs]}"; exit 2 ;;
+  oracle)  shift; case "${1:-start}" in
+             start) oracle_on ;;
+             stop)  oracle_off ;;
+             tail)  oracle_tail ;;
+             *) echo "usage: $0 oracle {start|stop|tail}"; exit 2 ;;
+           esac ;;
+  *) echo "usage: $0 {status|apply|verify|restore|watch [secs]|oracle {start|stop|tail}}"; exit 2 ;;
 esac
