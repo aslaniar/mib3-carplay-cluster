@@ -32,15 +32,25 @@ HERE="$(dirname "$0")"
 CTL="$HERE/deliver_ctl.sh"
 [ -f "$CTL" ] || CTL=/tmp/kit/deliver_ctl.sh
 
-for d in /tmp/USB/PORT1 /tmp/USB/PORT2 /tmp/USB/PORT3 /tmp/USB/PORT4; do
-  [ -d "$d/PART1" ] && { STICK="$d/PART1"; break; }
-done
-STICK="${STICK:-/dev/shm}"
+# Overridable for the desk mock (harness/run_delivery.sh); defaults are the unit's.
+HELPERLOG="${MIB3_DLV_HELPERLOG:-/dev/shm/mib3helper.log}"
+HELPERSOCK="${MIB3_DLV_HELPERSOCK:-/dev/shm/mib3cluster.sock}"
+if [ -n "${MIB3_DLV_STICK:-}" ]; then
+  STICK="$MIB3_DLV_STICK"
+else
+  for d in /tmp/USB/PORT1 /tmp/USB/PORT2 /tmp/USB/PORT3 /tmp/USB/PORT4; do
+    [ -d "$d/PART1" ] && { STICK="$d/PART1"; break; }
+  done
+fi
+STICK="${STICK:-${MIB3_DLV_RAM:-/dev/shm}}"
+mkdir -p "$STICK" 2>/dev/null
 LOG="$STICK/patha_auto.log"
 LOCK="$STICK/patha_auto.lock"
 
+have() { command -v "$1" >/dev/null 2>&1; }
+pids_of() { if have pidof; then pidof "$1" 2>/dev/null; elif have pgrep; then pgrep -x "$1" 2>/dev/null; fi; }
 say() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >> "$LOG"; sync 2>/dev/null; }
-frames_now() { grep -ao 'frames=[0-9x]*\|frames total [0-9]*' /dev/shm/mib3helper.log 2>/dev/null | tail -n1; }
+frames_now() { grep -ao 'frames=[0-9x]*\|frames total [0-9]*' "$HELPERLOG" 2>/dev/null | tail -n1; }
 
 # --- single-instance lock (mkdir is atomic on busybox) --------------------------
 if ! mkdir "$LOCK" 2>/dev/null; then
@@ -57,7 +67,7 @@ release() { [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK" 2>/dev
 trap 'if [ "$FLIPPED" = "1" ]; then say "exit: restoring the car nav element"; sh "$CTL" restore >>"$LOG" 2>&1; fi; release' EXIT INT TERM
 
 say "start (stick=$STICK pid=$$); waiting for CarPlay frames"
-[ -S /dev/shm/mib3cluster.sock ] || say "WARN: helper socket absent -- is the helper running?"
+[ -S "$HELPERSOCK" ] || say "WARN: helper socket absent ($HELPERSOCK) -- is the helper running?"
 
 LAST=""
 N="${1:-40}"          # minutes
@@ -82,7 +92,7 @@ while [ "$i" -lt $((N*12)) ]; do
     fi
   else
     if [ "$F" != "$LAST" ]; then
-      S="$(ls -l /proc/"$(pidof multi-screen-server 2>/dev/null)"/fd 2>/dev/null | grep -cE 'video|ion|dri')"
+      S="$(ls -l /proc/"$(pids_of multi-screen-server)"/fd 2>/dev/null | grep -cE 'video|ion|dri')"
       say "frames=$F  msf_fds=$S"
       LAST="$F"
     fi

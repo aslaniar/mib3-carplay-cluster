@@ -105,7 +105,7 @@ static int read_full(int fd, void *buf, unsigned long n){
 
 void _start(void){
   const char *shim, *sock, *mode, *libs;
-  void *h; int use_bridge, dry = 0;
+  void *h; int use_bridge, dry = 0, oneshot = 0;
   int w, hh; unsigned ivi;
   fn_create bcreate, screate;
   fn_feed   bfeed; fn_wf swf; fn_i0 sready;
@@ -118,6 +118,10 @@ void _start(void){
   mode = getenv("MIB3_HELPER_SINK"); if (!mode || !mode[0]) mode = "bridge";
   use_bridge = (mode[0] == 'b');
   dry = (mode[0] == 'd');
+  /* ONESHOT=1 restores the pre-2026-10-16 single-client-exit behaviour.  It exists for
+   * the DESK BENCH (which waits for the helper to exit) and for one-shot debugging; the
+   * UNIT default is durable (re-accept, keep ivi 3000 alive across shim reconnects). */
+  oneshot = env_num("MIB3_HELPER_ONESHOT", 0) ? 1 : 0;
 
   /* bring the real media/graphics libs into the GLOBAL scope so the shim's lazy
    * dlsym(RTLD_DEFAULT) finds them (on the desk the stub is already preloaded). */
@@ -182,14 +186,31 @@ void _start(void){
     P("[helper] listening (frames from the shim)\n");
   }
 
-  /* serve frames; one client at a time (the shim reconnects on reconnect) */
+  /* Serve frames.  *** RE-ACCEPT on every client disconnect (2026-10-16 fix) ***
+   * The old loop `break`ed out of accept when a client left, so the FIRST
+   * shim disconnect (carplay re-inject / reconnect) exited the helper and
+   * destroyed ivi surface 3000 -- a prime cause of the field's
+   * "Specified surface (ID:3000) does not exist" / restartShare churn, because
+   * whoever owned 3000 vanished under multi-screen-server.  The helper is the
+   * DURABLE owner of the surface: the surface is created ONCE above and is kept
+   * across any number of client lifetimes; only a real listener failure exits. */
   {
     unsigned long total = 0, bad = 0;
     unsigned char hdr[MIB3_HELP_HDRLEN];
     unsigned char *buf = 0; unsigned long cap = 0;
+    int accept_fails = 0, clients = 0;
     for (;;){
       int c = accept(lfd, 0, 0);
-      if (c < 0) break;
+      if (c < 0){
+        /* a blocking accept() only fails on a transient signal or a broken
+         * listener.  Tolerate a few transients, then give up (never busy-spin). */
+        if (++accept_fails >= 8){ P("[helper] accept failed repeatedly -- exiting\n"); break; }
+        P("[helper] accept retry\n");
+        continue;
+      }
+      accept_fails = 0;
+      clients++;
+      Pkv("client #", (u64)(unsigned)clients);
       Pkv("client fd", (u64)(unsigned)c);
       P("[helper] client connected\n");
       for (;;){
@@ -216,8 +237,10 @@ void _start(void){
       }
       close(c);
       Pkv("frames total", total); Pkv("bad", bad);
-      P("[helper] client gone\n");
-      break;   /* single-shot on the desk; on the unit a reconnect re-launches accept */
+      if (oneshot){ P("[helper] client gone (ONESHOT -- exiting)\n"); helper_bc("client-gone:oneshot-exit"); break; }
+      P("[helper] client gone (surface retained -- re-accepting)\n");
+      helper_bc("client-gone:reaccept");
+      continue;   /* keep the surface + listener alive; wait for the next client */
     }
     helper_bc("exit");
     Pkv("final frames", total);
