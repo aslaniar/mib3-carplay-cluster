@@ -17,7 +17,14 @@
 # ============================================================================
 set -u
 STICK="$(cd "$(dirname "$0")" && pwd)"
-WANT_MD5=bfd129e89420e3a1cb5c9666b144ef5f
+# The shim that MUST be staged.  Reproduces byte-identical from mib3shim.c via
+# sh ../build.sh (verified 2026-10-16).  Its deltas vs the long-proven d2cb7cd7 are
+# HELPER-ONLY (fmt_2int 'x' separator, resolution/surface_width/height params, the
+# window-bind + writeVideoFormat parity calls) plus log lines -- none of which run in
+# carplay, because the Cinemo bridge executes only in the out-of-process helper
+# (MIB3_SHIM_SINK=helper).  NEVER pin d785b25c (the batched build that caused the two
+# 2026-10-16 resets).  See LANE_CLUSTER_DELIVERY_IMPLEMENT_2026-10-16.md S"pins".
+WANT_MD5=16d1025cef13e8059f4f9bc0ead65f41
 fail(){ echo "[!] $*"; echo "[!] ABORT -- nothing persisted; a reboot is the full undo"; exit 1; }
 
 CP="$(pidof carplay)"

@@ -5,9 +5,19 @@
 #   /usr/bin/python target_env.py <pid> "MIB3_SHIM_ADD=0"
 #
 # WHY: the injected shim reads its knobs with getenv(). We cannot change the
-# target's environment from outside -- but we can call putenv() inside it, and
+# target's environment from outside -- but we can call setenv() inside it, and
 # the shim's next getenv() will see the new value. That lets us flip behaviour
-# (advertise on/off, gate forced, skip-real) between phone plugs with NO rebuild.
+# (advertise on/off, gate forced, surface/bridge off/on) between phone plugs
+# with NO rebuild.
+#
+# 2026-10-16 FIX: putenv() -> setenv().
+#   glibc putenv() stores the POINTER to the caller's string (no copy), and the
+#   scratch we handed it lives on the target's STACK -- which gets reused before
+#   the next plug, so the value silently evaporated (every fresh RUN banner read
+#   SURFACE=0, and no bridge/surface log appeared, across RUN 4 + RUN 5 even
+#   though both putenv calls returned "0 = ok"). setenv() COPIES the value onto
+#   the heap, so it survives to the next getenv(). A read-back is printed so the
+#   knob can be confirmed BEFORE a plug.
 #
 # RAM only; a reboot erases it.
 # ============================================================================
@@ -54,6 +64,7 @@ def main():
     if "=" not in kv:
         print "[!] needs NAME=VALUE"
         return 1
+    name, _, value = kv.partition("=")
 
     import ctypes, signal
     class TO(Exception):
@@ -89,12 +100,20 @@ def main():
         finally:
             os.close(f)
 
-    # putenv lives in libc
+    def rd(a, n):
+        f = os.open("/proc/%d/mem" % pid, os.O_RDONLY)
+        try:
+            os.lseek(f, a, os.SEEK_SET); return os.read(f, n)
+        finally:
+            os.close(f)
+
+    # setenv/getenv live in libc (same libc file for the target and for this tool)
+    self_libc = ctypes.CDLL("libc.so.6")
     self_b = load_base(os.getpid(), "libc-2.23.so") or load_base(os.getpid(), "libc.so.6")
     tgt_b  = load_base(pid, "libc-2.23.so") or load_base(pid, "libc.so.6")
-    fn     = ctypes.cast(ctypes.CDLL("libc.so.6").putenv, ctypes.c_void_p).value
-    putenv = tgt_b + (fn - self_b)
-    print "[i] putenv in target = 0x%x" % putenv
+    setenv = tgt_b + (ctypes.cast(self_libc.setenv, ctypes.c_void_p).value - self_b)
+    getenv = tgt_b + (ctypes.cast(self_libc.getenv, ctypes.c_void_p).value - self_b)
+    print "[i] setenv in target = 0x%x" % setenv
 
     lo = stack_lo(pid) or 0
     tids = sorted(int(t) for t in os.listdir("/proc/%d/task" % pid))
@@ -111,27 +130,42 @@ def main():
             return 1
         print "[+] attached %d threads" % len(attached)
         orig = getregs(pid)
-        scratch = (lo + 0x400) if (lo and lo + 0x400 < orig[31] - 0x2000) else (orig[31] - 0x8000)
-        wr(scratch, kv + "\0")
-        print "[i] wrote %r at 0x%x" % (kv, scratch)
 
-        r = list(orig)
-        r[0], r[1], r[30], r[32] = scratch, 0, 0, putenv
-        setregs(pid, r)
-        signal.alarm(10)
-        try:
-            ptrace(PTRACE_CONT, pid, 0, 0)
-            while True:
-                w, st = os.waitpid(-1, WALL)
-                if w == pid:
-                    print "[+] putenv returned 0x%x (0 = ok)" % getregs(pid)[0]
-                    break
-                try:
-                    ptrace(PTRACE_CONT, w, 0, 0)
-                except OSError:
-                    pass
-        finally:
-            signal.alarm(0)
+        def call(fn, a0, a1=0, a2=0):
+            # run one libc call in the MAIN thread, based on the attach-time regs
+            r = list(orig)
+            r[0], r[1], r[2], r[30], r[32] = a0, a1, a2, 0, fn
+            setregs(pid, r)
+            signal.alarm(10)
+            try:
+                ptrace(PTRACE_CONT, pid, 0, 0)
+                while True:
+                    w, st = os.waitpid(-1, WALL)
+                    if w == pid:
+                        return getregs(pid)[0]
+                    try:
+                        ptrace(PTRACE_CONT, w, 0, 0)
+                    except OSError:
+                        pass
+            finally:
+                signal.alarm(0)
+            return 0
+
+        need = len(name) + len(value) + 2
+        scratch = (lo + 0x400) if (lo and lo + 0x400 + need < orig[31] - 0x2000) else (orig[31] - 0x8000)
+        wr(scratch, name + "\0")
+        wr(scratch + len(name) + 1, value + "\0")
+        print "[i] wrote %r / %r at 0x%x" % (name, value, scratch)
+
+        rc = call(setenv, scratch, scratch + len(name) + 1, 1)
+        print "[+] setenv returned 0x%x (0 = ok)" % rc
+
+        # read-back: getenv(name) in the target, then read the string it points at
+        p = call(getenv, scratch)
+        print "[i] getenv(%s) -> 0x%x" % (name, p)
+        if p:
+            s = rd(p, 256).split("\0")[0]
+            print "[i] readback: %s=%s" % (name, s)
     finally:
         if orig:
             try:

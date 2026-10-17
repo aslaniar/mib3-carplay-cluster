@@ -1,5 +1,14 @@
 # shim/ — the CarPlay cluster shim (MIB3 LG / R8830L)
 
+> **STATUS 2026-10-16 — PROVEN LIVE on the car.** The cluster stream **connected** on port 5000 and
+> the receiver **decrypted real H.264** — see `../LANE_CLUSTER_LIVE_2026-10-16.md`.
+
+> **STATUS 2026-10-16 (delivery-safety rev).** The delivery sink that BLACKED the screen / reset the
+> unit is now fail-safe: default OFF, created on the receiver thread (never the SETUP seam), dry-run,
+> per-half isolation, an explicit `MIB3_SHIM_LOCAL_ACK` gate, stick breadcrumbs, and the **SAFE
+> out-of-process helper** (`mib3clusterhelper`). Artifact md5 **`68ce7033…`** (93,280 B). See
+> `../LANE_DELIVERY_SAFETY_2026-10-16.md`.
+
 > **The deploy section below is SUPERSEDED and FATAL on this unit — do NOT use it.** The shim is
 > delivered by **INJECTION into the live `carplay` process** (`shim/inject/run_inject.sh`), **not**
 > `LD_PRELOAD` + `systemctl restart carplay`: the stock binary starts in secure-exec mode (the
@@ -13,9 +22,11 @@ iPhone, so iOS opens the **type-111** Apple Maps cluster stream. Injected into t
 process; no LG binary is modified.
 
 ## Files
-- `mib3shim.c` — the shim (interposes two seams).
-- `build.sh` — cross-builds `mib3shim.so` (needs `brew llvm` + `brew lld`).
-- `mib3shim.so` — the built artifact (aarch64, glibc-2.23-compatible).
+- `mib3shim.c` — the shim (interposes three seams + the Part-B receiver + the sink dispatcher).
+- `mib3clusterhelper.c` — the **out-of-process delivery helper** (the safe sink; see Route-B).
+- `mib3helper.h` — the shim↔helper frame protocol.
+- `build.sh` — cross-builds `mib3shim.so` **and** `mib3clusterhelper` (needs `brew llvm` + `brew lld`).
+- `mib3shim.so` / `mib3clusterhelper` — the built artifacts (aarch64, glibc-2.23-compatible).
 - `shim_deploy.sh` / `shim_revert.sh` — optional wrappers (the raw commands are below).
 
 ## What it hooks (verified against R8830L, `libAirPlay.so` 320.17.4)
@@ -67,29 +78,70 @@ type-111 entry is actually present in `displays`.
 
 ## Environment knobs
 `MIB3_SHIM_ADD=1` (default) advertise the cluster · `MIB3_SHIM_W/H/FPS` = geometry (default
-**1280×480@60**; the height default is 480 per the grounded cluster mode table — see
+**1280×480@30**; the height default is 480 per the grounded cluster mode table — see
 `LANE_SURFACE_BINDING_DESK_2026-10-09.md` §3a) · `MIB3_SHIM_TYPE` = cluster display `type` (default 111) ·
-`MIB3_SHIM_URL` = cluster `initialURL` (default `maps:/car/instrumentcluster/map`) · `MIB3_SHIM_CFEAT` /
+`MIB3_SHIM_URL` = cluster `initialURL` **and the showUI url** (default `maps:/car/instrumentcluster/map`;
+one knob, one source of truth) · `MIB3_SHIM_CFEAT` /
 `MIB3_SHIM_CINDEV` = cluster `features`/`primaryInputDevice` (default `0`/`0`; cluster is display-only) ·
-**`MIB3_SHIM_SURFACE=0/1`** (default 1) stand up the shim's own cluster surface (route B) ·
-**`MIB3_SHIM_IVIID`** = ivi surface id for that surface (default `0x4d4233`) ·
+**`MIB3_SHIM_PORT=<n>`** = preferred cluster data port; the chain is knob → **5000** (inside the
+unit's own firewall allowlist `ncm0 tcp 5000:5001`, observed free; see `REDTEAM_SHIM_2026-10-16.md`) →
+**6031** (MHI3-native alt; firewall-dropped without `live_kit/cluster_port_fw.sh`) → ephemeral ·
+**`MIB3_SHIM_CMDS=0/1`** (default 1) send `forceKeyFrame`/`showUI`/`setNightMode` to the phone once the
+111 stream connects (the refs' post-connect sequence — without them the phone connects but sends no
+video) · **`MIB3_SHIM_EF_IAPCHANNEL=1`** / **`MIB3_SHIM_EF_UICONTEXT=1`** = also claim that feature in
+`enabledFeatures` (default OFF — the rgi's rule: never claim a feature the stock does not implement) ·
+**`MIB3_SHIM_CONNID=1`** = echo the request's `streamConnectionID` in the 111 response descriptor
+(rgi paired-mode belt; stock 110 proves it is not required) ·
+**`MIB3_SHIM_SINK`** (default `off`) = the SINK DISPATCHER: `off` | `dry` | `helper` | `local` (see
+Route-B above) · **`MIB3_SHIM_LOCAL`** = `bridge`|`surface`|`both` (default `bridge`) ·
+**`MIB3_SHIM_LOCAL_ACK=1`** required to arm `local` (and to make the legacy knobs below do anything) ·
+**`MIB3_SHIM_LOCAL_FALLBACK=1`** allow bridge→surface fallback ·
+**`MIB3_SHIM_HELPER`** = helper socket path (default `/dev/shm/mib3cluster.sock`) ·
+**`MIB3_SHIM_BC`** = breadcrumb file (default `<stick>/PART1/mib3shim.bc`) ·
+**legacy: `MIB3_SHIM_SURFACE=0/1`** / **`MIB3_SHIM_BRIDGE=0/1`** (default 0) arm the in-process sink
+ONLY with `MIB3_SHIM_LOCAL_ACK=1` ·
+**`MIB3_SHIM_IVIID`** = ivi surface id (default `0x4d4233`) ·
 **`MIB3_SHIM_SURFNAME`** = its name/`internalIdentifier` (default `mib3-cluster-surface`) ·
 `MIB3_SHIM_SKIP_REAL=1` = test hook (skip the real SessionSetup; harness only) ·
-**`MIB3_SHIM_ENABLEDFEAT=0/1`** (default 1) inject `enabledFeatures` into the SETUP response ·
+**`MIB3_SHIM_ENABLEDFEAT=0/1`** (default 1) inject `enabledFeatures` into the **control SETUP**
+response only (request carries the `features` proposal key — rgi-faithful scoping) ·
 **`MIB3_SHIM_INFO=0/1`** (default 1) complete the modern `/info` schema (the `AirPlayCopyServerInfo`
 seam) · **`MIB3_SHIM_NIGHT=0/1`** force the cluster/main `nightMode` (default: copy the main entry) ·
 `MIB3_SHIM_FRAMEDBG=1` = log CarPlay output-surface changes · `MIB3_SHIM_DBG=1` verbose. Logs to
 **`/tmp/mib3shim.log`**.
 
 ## Route-B (the shim's own cluster surface)
+
+> **⛔ DO NOT ENABLE `MIB3_SHIM_SINK=local` LIVE** (nor the legacy `MIB3_SHIM_SURFACE=1`). On the car
+> 2026-10-16 the in-process sink **blacked the centre screen and reset the unit**. It is now OFF by
+> default, the legacy knobs are inert without `MIB3_SHIM_LOCAL_ACK=1`, and the sink is created on the
+> receiver thread (never in the SETUP seam). Use `MIB3_SHIM_SINK=dry` then `=helper`.
+> **`../LANE_DELIVERY_SAFETY_2026-10-16.md`**.
+
+**The sink dispatcher (2026-10-16).** `MIB3_SHIM_SINK` = `off` (default) | `dry` (plan only, create
+nothing) | `helper` (**out-of-process** — the safe path) | `local` (in-carplay, ACK-gated). The
+legacy `MIB3_SHIM_SURFACE`/`MIB3_SHIM_BRIDGE=1` only arm `local` **with `MIB3_SHIM_LOCAL_ACK=1`**.
+`MIB3_SHIM_LOCAL` = `bridge` | `surface` | `both` (one half at a time); bridge→surface fallback only
+with `MIB3_SHIM_LOCAL_FALLBACK=1`. Sink creation is **deferred to the receiver thread**
+(`cluster_thread`), never in the SETUP seam. **Breadcrumbs**: each risky step appends a
+`write()`+`fsync()` line to `<stick>/PART1/mib3shim.bc` (`MIB3_SHIM_BC` overrides) so a reset leaves
+the exact failing step.
+
 Because the CarPlay media engine is a one-window singleton (every stream lands in the *same* surface —
 `LANE_SURFACE_BINDING_DESK_2026-10-09.md`), the cluster stream cannot get its own surface from the
-framework. The shim therefore **creates its own** (Wayland/ivi + EGL/GLES) and paints the cluster frames
-into it; a dynamic RSI swap (`cluster_swap.sh`) then repoints the Kombi renderer at it. The shim's
-`cluster_setup` stands the surface up (env-gated `MIB3_SHIM_SURFACE`) and exposes it via
-`mib3shim_surface_name()`; it needs the unit's Wayland compositor (Weston/ivi-shell) + EGL/GLES, and
-degrades gracefully if they are absent. Desk-verified with a **stub** graphics stack:
-**`LANE_ROUTE_B_STUB_BENCH_2026-10-09.md`** (and `harness/run_routeb.sh`).
+framework. Two providers:
+
+- **`helper` (recommended, SAFE)** — `mib3clusterhelper` runs as a **separate process**, `dlopen`s this
+  shim .so, owns its own surface + Cinemo decode, and is fed frames over `/dev/shm/mib3cluster.sock`
+  (`mib3helper.h` protocol). The shim inside carplay only `connect()`+`write()`s — **no display call**,
+  so a helper fault cannot black the screen or reboot carplay. Start it with
+  `live_kit/start_cluster_helper.sh`. See `../LANE_DELIVERY_SAFETY_2026-10-16.md`.
+- **`local` (hazardous)** — the shim's own Wayland/EGL surface (`surface`) or its own Cinemo pipeline
+  (`bridge`) created IN carplay. Desk-verified wiring only
+  (`LANE_ROUTE_B_STUB_BENCH_2026-10-09.md`, `harness/run_routeb.sh`); **ACK-gated; not for the car**.
+
+The dynamic RSI swap (`cluster_swap.sh`) then repoints the Kombi renderer at the surface; the surface's
+owning **process is irrelevant** to `multi-screen-server` (it resolves by `internalIdentifier`).
 
 > **Limit:** the stub bench proves the shim's *wiring* (right calls, right order, no crash), **not**
 > pixels — real EGL/Wayland/OMX acceptance and the real RSI service are live-only.

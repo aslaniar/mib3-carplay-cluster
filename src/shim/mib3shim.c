@@ -26,9 +26,23 @@
  * Logs to /tmp/mib3shim.log (world-writable tmpfs; SMACK `_`).
  * Env knobs:
  *   MIB3_SHIM_ADD=0/1         advertise the cluster display (default 1)
- *   MIB3_SHIM_W/H/FPS         cluster geometry (default 1280x480@60)
+ *   MIB3_SHIM_W/H/FPS         cluster geometry (default 1280x480@30)
  *   MIB3_SHIM_INFO=0/1        complete the modern /info schema (default 1)
- *   MIB3_SHIM_ENABLEDFEAT=0/1 inject enabledFeatures into SETUP (default 1)
+ *   MIB3_SHIM_ENABLEDFEAT=0/1 inject enabledFeatures into the CONTROL SETUP (default 1)
+ *   MIB3_SHIM_PORT=<n>        cluster data port (default: 5000, then 6031, then
+ *                             ephemeral).  5000 is INSIDE the unit's own
+ *                             firewall allowlist (GENERIC_PORT_IN_FILTER
+ *                             "-i ncm0 -p tcp --dport 5000:5001"); 6031 and any
+ *                             ephemeral port are FIREWALL-DROPPED on ncm0/wlap
+ *                             (the phone's SYN never reaches us) and need
+ *                             live_kit/cluster_port_fw.sh first.
+ *   MIB3_SHIM_CMDS=0/1        send forceKeyFrame/showUI/setNightMode to the
+ *                             phone once the 111 stream connects (default 1)
+ *   MIB3_SHIM_EF_IAPCHANNEL=1 also claim "iAPChannel" in enabledFeatures
+ *                             (default 0 -- the rgi reference, the only
+ *                             stock-HU-proven one, claims only altScreen +
+ *                             viewAreas; every string flips a phone-side
+ *                             endpoint flag, so claim nothing extra)
  *   MIB3_SHIM_DBG=0/1         verbose (default 1)
  * ==========================================================================*/
 
@@ -143,6 +157,131 @@ static void logkv(const char *tag, const char *key, u64 v, int hex){
   logline(tag, mem);
 }
 
+#include "mib3helper.h"
+
+/* ==========================================================================
+ * BREADCRUMBS (2026-10-16) -- evidence that SURVIVES A RESET.
+ *
+ * The 2026-10-16 live sink attempt blacked the centre screen and the unit
+ * reset; the reset wipes /tmp and /dev/shm, so /tmp/mib3shim.log and the old
+ * /dev/shm/mib3shim_hit entry marker both died -- the failing step was
+ * UNDIAGNOSABLE.  The only storage that survives is the USB stick.
+ *
+ * So: before every risky display-touching call (and between sub-steps) append a
+ * one-line marker to a file on the STICK with an explicit write()+fsync().
+ * After a reset, the stick holds the exact last step reached.
+ *
+ * The file MUST be created BY THE SHIM: a root-created file carries the wrong
+ * SMACK label and carplay's writes vanish silently (THE LABEL TRAP).
+ *
+ *   MIB3_SHIM_BC=<path>   explicit breadcrumb file
+ *   else auto: <stick>/PART1/mib3shim.bc where <stick> is the same /tmp/USB/
+ *         PORT<n> scan the activation gate uses; fallback /dev/shm/mib3shim.bc
+ *         (RAM: best-effort only -- it does NOT survive a reset).
+ * -------------------------------------------------------------------------*/
+extern int  fsync(int fd);
+extern int  access(const char *path, int mode);
+static int  bc_fd = -2;                 /* -2 = untried, -1 = unavailable */
+static char bc_path[256];
+
+static int bc_pick_path(void){
+  char *e = getenv("MIB3_SHIM_BC");
+  unsigned long n = 0, i;
+  if (e && e[0]){ while (e[n] && n < sizeof(bc_path)-1){ bc_path[n]=e[n]; n++; } bc_path[n]=0; return 1; }
+  /* scan /tmp/USB/PORT<n>/PART1/mib3shim.enable (the gate marker) -> put the
+   * breadcrumb beside it; the marker's presence means the stick is mounted and
+   * carplay can write the FAT/tmpfs there. */
+  for (i = 1; i <= 8; i++){
+    char dir[64], mk[80], bcf[128]; unsigned long d = 0, k = 0;
+    const char *pfx = "/tmp/USB/PORT"; while (pfx[k] && d < sizeof(dir)-8) dir[d++]=pfx[k++];
+    if (i >= 10) dir[d++]=(char)('0'+i/10);
+    dir[d++]=(char)('0'+i%10); dir[d]=0;
+    { const char *s="/PART1/mib3shim.enable"; unsigned long j=0; k=0;
+      while (dir[k] && k < sizeof(mk)-24) mk[k]=dir[k], k++;
+      while (s[j] && k < sizeof(mk)-1) mk[k++]=s[j++]; mk[k]=0; }
+    if (!access(mk, 0 /*F_OK*/)){
+      /* build <dir>/PART1/mib3shim.bc */
+      unsigned long j=0;
+      { const char *s="/PART1/mib3shim.bc"; while (dir[j] && j < sizeof(bcf)-24) bcf[j]=dir[j], j++;
+        { unsigned long m=0; while (s[m] && j < sizeof(bcf)-1) bcf[j++]=s[m++]; } bcf[j]=0; }
+      { unsigned long m=0; while (bcf[m] && m < sizeof(bc_path)-1){ bc_path[m]=bcf[m]; m++; } bc_path[m]=0; }
+      return 1;
+    }
+  }
+  { const char *fb = "/dev/shm/mib3shim.bc"; unsigned long m=0;
+    while (fb[m] && m < sizeof(bc_path)-1){ bc_path[m]=fb[m]; m++; } bc_path[m]=0; }
+  return 1;
+}
+static void bc(const char *step){
+  if (bc_fd == -2){ bc_pick_path(); bc_fd = open(bc_path, O_WRONLY|O_CREAT|O_APPEND, 0644); }
+  if (bc_fd >= 0){
+    char mem[220]; buf b = { mem, sizeof(mem)-2, 0 };
+    extern long time(long *); extern int getpid(void);
+    bs(&b,"[bc "); bu64(&b,(u64)time(0),10,0); bs(&b," pid="); bu64(&b,(u64)getpid(),10,0);
+    bs(&b,"] "); bs(&b,step); bch(&b,'\n'); mem[b.n]=0;
+    write(bc_fd, mem, b.n);
+    fsync(bc_fd);                       /* force it to the stick NOW */
+  }
+  logline("bc", step);                  /* mirror into the (volatile) /tmp log */
+}
+
+/* ==========================================================================
+ * OUT-OF-PROCESS DELIVERY (the SAFE sink) -- shim side (2026-10-16).
+ *
+ * Forward each decrypted access unit, length-prefixed (mib3helper.h), to a
+ * SEPARATE helper process over an AF_UNIX socket.  carplay performs NO
+ * display-touching call at all, so a helper fault cannot black the centre
+ * screen or trip carplay.service's FailureAction=reboot-immediate.
+ *
+ * Best-effort: if the helper is absent the connect fails once and we drop
+ * frames (counted).  A bounded send timeout stops a wedged helper from
+ * blocking the receiver thread.
+ *
+ *   MIB3_SHIM_HELPER=<path>   default /dev/shm/mib3cluster.sock
+ * -------------------------------------------------------------------------*/
+extern int socket(int, int, int);
+extern int connect(int, const void*, unsigned int);
+extern int setsockopt(int, int, int, const void*, unsigned int);
+#define O_NONBLOCK_ 04000
+#define SOL_SOCKET_ 1
+#define SO_SNDTIMEO_ 21
+static int hlp_fd = -1;
+static unsigned long hlp_seq = 0, hlp_sent = 0, hlp_drop = 0, hlp_conns = 0;
+static void helper_close(void){ if (hlp_fd >= 0){ close(hlp_fd); hlp_fd = -1; } }
+static const char *helper_path(void){
+  char *v = getenv("MIB3_SHIM_HELPER"); return (v && v[0]) ? v : MIB3_HELP_SOCK_DEFAULT;
+}
+static int helper_connect(void){
+  struct { unsigned short fam; char path[108]; } sa;
+  int fd, i;
+  if (hlp_fd >= 0) return 0;
+  { const char *p = helper_path();
+    for (i = 0; i < 108; i++) sa.path[i] = 0;
+    for (i = 0; i < 107 && p[i]; i++) sa.path[i] = p[i]; }
+  sa.fam = 1 /*AF_UNIX*/;
+  fd = socket(1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
+  if (fd < 0) return -1;
+  if (connect(fd, &sa, sizeof(sa)) != 0){ close(fd); return -1; }
+  { struct { long s; long us; } tv; tv.s = 0; tv.us = 200000;
+    setsockopt(fd, SOL_SOCKET_, SO_SNDTIMEO_, &tv, sizeof(tv)); }
+  hlp_fd = fd; hlp_conns++;
+  return 0;
+}
+static int helper_feed(const void *data, unsigned long len, unsigned long ts){
+  unsigned char hdr[MIB3_HELP_HDRLEN];
+  u32 m32; u64 m64; int i;
+  (void)ts;
+  if (!data || !len || len > MIB3_HELP_MAXLEN) return -1;
+  if (hlp_fd < 0){ if (helper_connect() != 0){ hlp_drop++; return -1; } }
+  m32 = MIB3_HELP_MAGIC; for (i=0;i<4;i++) hdr[i]   = (unsigned char)((m32 >> (i*8)) & 0xff);
+  m32 = (u32)len;        for (i=0;i<4;i++) hdr[4+i] = (unsigned char)((m32 >> (i*8)) & 0xff);
+  m64 = ++hlp_seq;       for (i=0;i<8;i++) hdr[8+i] = (unsigned char)((m64 >> (i*8)) & 0xff);
+  if (write(hlp_fd, hdr, MIB3_HELP_HDRLEN) != (long)MIB3_HELP_HDRLEN){ hlp_drop++; helper_close(); return -1; }
+  if (write(hlp_fd, data, len) != (long)len){ hlp_drop++; helper_close(); return -1; }
+  hlp_sent++;
+  return 0;
+}
+
 /* ---- CF/libAirPlay symbols, lazily resolved ------------------------------ */
 typedef CFStringRef (*fn_CFStringCreateWithCString)(CFAllocatorRef,const char*,CFStringEncoding);
 typedef Boolean     (*fn_CFStringGetCString)(CFStringRef,char*,CFIndex,CFStringEncoding);
@@ -183,11 +322,18 @@ typedef int  (*fn_DeriveAES)(void*, int, s64, void*, void*);
 typedef int  (*fn_pthreadCreate)(void**, const void*, void*(*)(void*), void*);
 typedef int  (*fn_close)(int);
 typedef int  (*fn_chachaDerive)(void*, s64, int, int, void*); /* returns int status (0=ok) */
-/* wire crypto (unit's own CFLite/ChaCha primitives) -- see stock FUN_00115800 */
-typedef void (*fn_cx_init)(void*, const void*, const void*);      /* ctx,key,nonce */
-typedef void (*fn_cx_aad)(void*, const void*, unsigned long);     /* ctx,aad,len  */
-typedef long (*fn_cx_dec)(void*, const void*, long, void*);       /* ctx,src,len,dst -> plainlen */
-typedef long (*fn_cx_ver)(void*, const void*, long, int*);        /* ctx,tag,len,&ok */
+/* wire crypto (unit's own CFLite/ChaCha primitives) -- see stock FUN_00115800 +
+ * AirPlayReceiverSessionScreen_ProcessFrames (corpus 0x11fbf0): the per-frame
+ * screen path is init(ctx, key32, nonce8) -> add_aad(ctx, header, 128) ->
+ * decrypt(ctx, body, bodySize-16, body) -> verify(ctx, dst+n, body+bodySize-16,
+ * &ok); the last 16 body bytes are the Poly1305 tag, NOT ciphertext, and n+m
+ * must equal bodySize-16.  (The old typedef passed verify's 3rd arg as `long`
+ * -- Ghidra renders the pointer as long; it was never called so it went
+ * unnoticed until now.) */
+typedef void (*fn_cx_init)(void*, const void*, const void*);      /* ctx,key,nonce8 */
+typedef void (*fn_cx_aad)(void*, const void*, unsigned long);       /* ctx,aad,len  */
+typedef long (*fn_cx_dec)(void*, const void*, long, void*);        /* ctx,src,len,dst -> plainlen */
+typedef long (*fn_cx_ver)(void*, const void*, const void*, int*);   /* ctx,tag_computed,tag_wire,&ok -> taglen */
 typedef int  (*fn_ctr_init)(void*, const void*, const void*);     /* AES_CTR_Init(ctx,key,iv) */
 typedef int  (*fn_ctr_upd)(void*, const void*, long, void*);      /* AES_CTR_Update(ctx,src,len,dst) */
 /* half-2 diagnostic: the CarPlay output-surface selector (C++ mangled). */
@@ -257,6 +403,14 @@ typedef void  (*fn_gl_draw)(unsigned,int,int);
 typedef int (*fn_AddScreenDisplay)(CFMutableArrayRef*, CFStringRef,
                                    int, int, int, int, int, int, int);
 typedef int  (*fn_SessionSetup)(void*, void*, void**, int);   /* real ABI (rgi reference): returns the setup status, 4 args */
+/* AirPlayReceiverSessionSendCommand(session, cmdDict{type,params}, completion, ctx)
+ * -> status.  Verified on the unit's own libAirPlay (exported @ 0x17f3c): it
+ * dispatch_sync_f's onto the session's own control queue (session+0x448) --
+ * safe to call from our receiver thread; the CALLER CFReleases the cmd dict
+ * after it returns (the stock AirPlayReceiverSessionForceKeyFrame pattern,
+ * corpus 0x1e31c: create mutable dict, SetValue("type","forceKeyFrame"),
+ * SendCommand(session,cmd,completion,ctx), CFRelease(cmd)). */
+typedef int  (*fn_SendCommand)(void*, void*, void*, void*);
 /* AirPlayCopyServerInfo(server, arg1, errOut) -> the mutable /info dict.
  * Verified call site: libAirPlay.so 0xeed4 sets only x0/x1/x2 (3 args) and the
  * callee prologue reads x0 (server), x1, x2 (err out).  RELOCATION:
@@ -368,6 +522,7 @@ static void                  *p_ivi_surface_interface;
 static fn_AddScreenDisplay real_AddScreenDisplay;
 static fn_SessionSetup     real_SessionSetup;
 static fn_CopyServerInfo   real_CopyServerInfo;
+static fn_SendCommand      p_SendCommand;    /* the stock command shipper (showUI/forceKeyFrame/setNightMode) */
 
 /* ==========================================================================
  * RUNTIME GATE (the physical cure) -- see LANE_PERSISTENCE_INSTALL_2026-10-14.md
@@ -415,6 +570,69 @@ static volatile int saw_main_display = 0;
  * cluster -> no altScreen claim -> the response is byte-identical to stock. */
 static volatile int g_cluster_advertised = 0;
 static volatile int g_info_completed = 0;   /* set when the /info seam completed a cluster advert */
+
+/* ---- the 2026-10-16 redteam findings this build carries -------------------
+ * 1) THE WALL IS OUR OWN KERNEL FIREWALL, not the phone. The unit's `network`
+ *    daemon applies iptables/ip6tables-restore from an embedded template with
+ *    base policy INPUT=DROP and a per-interface allowlist (recovered by strings
+ *    from lge/app_ro/network/network, section literally commented
+ *    "## carplay for ncm0 (usb interface)"):
+ *        -A GENERIC_PORT_IN_FILTER -i ncm0 -p tcp --dport 5000:5001 -j ACCEPT
+ *        -A GENERIC_PORT_IN_FILTER -i ncm0 -p tcp --dport 6030    -j ACCEPT
+ *        -A GENERIC_PORT_IN_FILTER -i ncm0 -p tcp --dport 7000    -j ACCEPT
+ *    (plus UDP 5001/5020/5353/6000/6003/6011; the same set for wlap/wlap2/wlap5;
+ *    both IPv4 and IPv6 tables; 80/443/49200:49499 are all-interface globals).
+ *    NO rule allows 6031 or any ephemeral port on the phone-facing interface,
+ *    so the phone's SYN to our advertised dataPort was silently DROPPED --
+ *    which is exactly the observed live behaviour: the phone offers 111, we
+ *    answer {type:111,dataPort}, and the phone never connects (its SYN never
+ *    reaches our listener; no RST is ever sent either, so the phone just
+ *    times out and the session stays up).  The phone's complete observed
+ *    socket set to the car {7000, 5001, 6030} is EXACTLY the ncm0 TCP
+ *    allowlist -- and the one historical case where the phone DID connect to
+ *    an advertised 111 port was the 6030-collision era (6030 IS allowlisted).
+ *    CONSEQUENCE: "port number" was never actually tested -- every port the
+ *    knobs offered (6031, ephemeral) is equally firewall-dropped, which made
+ *    the port ablation look like "no effect".  Fix = bind 5000 (inside the
+ *    5000:5001 allowlist; observed free while a phone is plugged: the stock
+ *    event listener is 5001 and nothing else listens on 5000) with 6031 and
+ *    ephemeral as fallbacks, and live_kit/cluster_port_fw.sh to insert the
+ *    RAM-only iptables/ip6tables rule when the fallbacks are used.
+ * 2) enabledFeatures is scoped to the CONTROL SETUP (the request carries the
+ *    "features" proposal key; media/stream SETUPs carry "streams" only), and
+ *    we claim ONLY altScreen+viewAreas -- the rgi reference's proven set.
+ *    iAPChannel is opt-in (MIB3_SHIM_EF_IAPCHANNEL=1): each string in the
+ *    array flips a phone-side endpoint flag, so claim nothing the stock unit
+ *    does not implement.
+ * 3) Part B fixes vs the stock wire format (corpus ProcessFrames 0x11fbf0):
+ *    chacha20 body length is bodySize-16 (last 16 bytes are the Poly1305 tag)
+ *    and MUST be followed by chacha20_poly1305_verify(ctx, dst+n, src+bs-16,
+ *    &ok) with n+m == bs-16; AES-CTR is a PERSISTENT keystream (AES_CTR_Init
+ *    once at SetSecurityInfo; Update per frame -- re-init per frame garbles
+ *    every frame after the first); the chacha nonce is the 8-byte LE counter
+ *    (init_64x64 reads 8 bytes, not 12); AVCC must be rewritten to Annex-B
+ *    (4-byte length -> 00 00 00 01) and the config parsed for SPS/PPS.
+ * 4) The old receiver read bodies into a static 64 KiB buffer while
+ *    bounds-checking only 8 MiB -- any IDR > 64 KiB overran static memory
+ *    (a crash-the-unit bug waiting for the first successful connect).
+ *    Bodies now go to a heap buffer that grows to the frame size.
+ * 5) Once the phone connects it sends opcode-1 (avcC) + opcode-5 telemetry
+ *    but NO video until the CAR drives the scene: forceKeyFrame{params:{uuid}}
+ *    at stream start, then showUI{params:{uuid,url}} (+ setNightMode) -- the
+ *    rgi/LIVI command set, shipped via the stock AirPlayReceiverSessionSendCommand
+ *    (dispatch_sync onto the session's own control queue; caller CFReleases the
+ *    cmd dict after it returns -- stock ForceKeyFrame pattern, corpus 0x1e31c).
+ * ------------------------------------------------------------------------ */
+
+/* the cluster uuid we advertised (same string goes into /info and into the
+ * showUI/forceKeyFrame/setNightMode command params -- CarKit matches it) */
+static char g_cluster_uuid_str[64];
+static volatile long g_night_mode = 0;     /* the advertised nightMode (for setNightMode) */
+/* session that owns the live cluster stream (command target for showUI etc.) */
+static void *volatile g_cmd_session = 0;
+
+#define CLUSTER_URL_DEFAULT "maps:/car/instrumentcluster/map"
+static char g_cluster_url[160];            /* showUI url (== the advertised initialURL) */
 
 #define K128 (0x08000100)   /* kCFStringEncodingUTF8 */
 
@@ -484,6 +702,7 @@ static void resolve(void){
   real_AddScreenDisplay       = (fn_AddScreenDisplay)          R("AirPlayInfoArrayAddScreenDisplay");
   real_SessionSetup           = (fn_SessionSetup)              R("AirPlayReceiverSessionSetup");
   real_CopyServerInfo         = (fn_CopyServerInfo)            R("AirPlayCopyServerInfo");
+  p_SendCommand               = (fn_SendCommand)               R("AirPlayReceiverSessionSendCommand");
 
   /* runtime gate: stick-marker scan (opendir/readdir/access from libc) */
   p_opendir  = (fn_opendir)  R("opendir");
@@ -639,13 +858,14 @@ static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
   { int dtype = (int)env_num("MIB3_SHIM_TYPE", 111);
     dseti(d, "type", (s64)dtype);
     logkv("cluster","type",(u64)(u32)dtype,0); }
-  /* initialURL -- the cluster scene Apple Maps should render.
+  /* initialURL -- the cluster scene Apple Maps should render.  THE SAME string
+   * is later sent as the showUI url (g_cluster_url) -- one knob, consistent.
    * MIB3_SHIM_NOURL=1 omits it (the rgi reference's cluster dict has NO initialURL). */
   if (!env_on("MIB3_SHIM_NOURL",0)){
   { char *url = getenv("MIB3_SHIM_URL");
-    if (!url || !url[0]) url = "maps:/car/instrumentcluster/map";
-    dsetv(d, "initialURL", url);
-    logline("cluster/initialURL", url); }
+    const char *us = (url && url[0]) ? url : (g_cluster_url[0] ? g_cluster_url : CLUSTER_URL_DEFAULT);
+    dsetv(d, "initialURL", us);
+    logline("cluster/initialURL", us); }
   }
   /* viewAreas = [ { view rect + safeArea (full panel, drawUIOutsideSafeArea) } ] */
   if (p_CFDictionaryCreateMutable && p_CFDictionarySetInt64 && p_CFArrayAppendValue &&
@@ -1062,6 +1282,7 @@ static int info_complete(CFMutableDictionaryRef info){
 
   s64 night = main ? dict_i64(main, g_k_night) : 0;
   if (getenv("MIB3_SHIM_NIGHT")) night = (s64)env_on("MIB3_SHIM_NIGHT",0);
+  g_night_mode = night;   /* the value we later send as setNightMode{uuid,nightMode} */
   if (main && env_on("MIB3_SHIM_MAINMOD",1)) info_complete_entry(main, 0, night);
   info_complete_entry(cluster, 1, night);
 
@@ -1142,6 +1363,20 @@ static int bridge_create(int w, int h, unsigned ivi_id);
 static int bridge_feed(const void *data, unsigned long len, unsigned long ts);
 static void bridge_destroy(void);
 static int bridge_active(void);
+/* SINK DISPATCHER (2026-10-16): the one place that decides WHERE decoded frames
+ * go, and the only place that may touch a display.  Modes (MIB3_SHIM_SINK):
+ *   off (default) | dry | helper (out-of-process) | local (in-carplay, ACK-gated)
+ * See the big comment at the definition (after the bridge module). */
+#define SINK_OFF 0
+#define SINK_DRY 1
+#define SINK_HELPER 2
+#define SINK_LOCAL 3
+static int g_sink = -1;          /* -1 = unresolved */
+static int g_sink_local = 0;     /* 0=bridge, 1=surface, 2=both */
+static int g_sink_lf = 0;        /* local bridge->surface fallback allowed */
+static void sink_resolve(void);
+static int  sink_start(int w, int h, unsigned ivi_id);   /* deferred to cluster_thread */
+static int  sink_feed(const void *data, unsigned long len, unsigned long ts);
 /* FRAME INTERCEPTION state (route B).  The cluster stream's ScreenStreamRef
  * (per-stream identity) is held in a small REGISTRY (not a single slot): the
  * interposer diverts any stream present in it, and every cluster thread removes
@@ -1175,11 +1410,157 @@ static int cl_stream_has(void *s){
   return 0;
 }
 
+/* ==========================================================================
+ * COMMANDS TO THE PHONE (the refs' post-connect sequence).
+ *
+ * The verified iOS sequence (rgi ALTSCREEN_CLUSTER_VIDEO.md, iOS 26.6
+ * AirPlaySender/CarKit decompile): once the phone connects the 111 stream it
+ * sends opcode-1 (avcC) + opcode-5 (telemetry) but ZERO video until the CAR
+ * drives the scene: forceKeyFrame{params:{uuid}} at stream start, then
+ * showUI{params:{uuid,url}} (+ setNightMode{params:{uuid,nightMode}}) -- the
+ * phone then renders the cluster scene (Apple Maps) and the video flows.
+ * Command shapes verified against BOTH working receivers:
+ *   rgi  altscreen_hook.c:2644-2665  showUI   {uuid, url}
+ *   rgi  altscreen_hook.c:2565-2588  forceKeyFrame {uuid}
+ *   rgi  altscreen_hook.c:2470-2485  setNightMode {uuid, nightMode}
+ *   LIVI stack.rs:1826-1843         same three, same keys
+ * Shipped via the stock AirPlayReceiverSessionSendCommand (the rgi's exact
+ * route).  The uuid MUST be the CLUSTER DISPLAY uuid we advertised.
+ * ======================================================================== */
+/* build {type:.., params:..}; params is consumed (retained by the cmd dict,
+ * our +1 released here after SendCommand returns, per the stock pattern). */
+static int ship_cmd(void *session, const char *type, CFMutableDictionaryRef params)
+{
+  if (!session || !p_SendCommand || !p_CFDictionaryCreateMutable ||
+      !p_CFDictionarySetValue || !p_kCFLDictKeyCB || !p_kCFLDictValCB || !p_CFRelease)
+    return -1;
+  CFMutableDictionaryRef cmd = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
+  if (!cmd) return -1;
+  int rc = -1;
+  {
+    CFStringRef kt = sstr(type), kp = sstr("params"), vt = sstr(type);
+    if (kt && kp && vt && params){
+      p_CFDictionarySetValue(cmd, kt, vt);
+      p_CFDictionarySetValue(cmd, kp, params);
+      rc = p_SendCommand(session, cmd, 0, 0);  /* serialized onto the session's own control queue */
+    }
+    if (p_CFRelease){ if (vt) p_CFRelease(vt); if (kp) p_CFRelease(kp); if (kt) p_CFRelease(kt); }
+  }
+  p_CFRelease(cmd);                            /* caller releases after SendCommand returns (stock pattern) */
+  return rc;
+}
+/* params dict with the cluster display uuid preset */
+static CFMutableDictionaryRef cmd_params_uuid(void)
+{
+  if (!p_CFDictionaryCreateMutable || !p_kCFLDictKeyCB || !p_kCFLDictValCB) return 0;
+  CFMutableDictionaryRef p = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
+  if (!p) return 0;
+  if (!g_cluster_uuid_str[0]) return p;        /* no uuid yet -- caller checks */
+  { CFStringRef k = sstr("uuid"), v = sstr(g_cluster_uuid_str);
+    if (k && v) p_CFDictionarySetValue(p, k, v);
+    if (p_CFRelease){ if (v) p_CFRelease(v); if (k) p_CFRelease(k); } }
+  return p;
+}
+static void cluster_send_showui(void *session, const char *why)
+{
+  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!g_cluster_uuid_str[0]){ logline("cluster/cmd","showUI skipped (no cluster uuid)"); return; }
+  CFMutableDictionaryRef p = cmd_params_uuid();
+  if (!p) return;
+  { const char *url = g_cluster_url[0] ? g_cluster_url : CLUSTER_URL_DEFAULT;
+    CFStringRef k = sstr("url"), v = sstr(url);
+    if (k && v) p_CFDictionarySetValue(p, k, v);
+    if (p_CFRelease){ if (v) p_CFRelease(v); if (k) p_CFRelease(k); } }
+  int rc = ship_cmd(session, "showUI", p);
+  logkv("cluster/cmd","showUI rc",(u64)(u32)rc,0);
+  logline("cluster/cmd/showui-why", why);
+  if (p_CFRelease) p_CFRelease(p);
+}
+static void cluster_send_forcekeyframe(void *session, const char *why)
+{
+  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!g_cluster_uuid_str[0]){ logline("cluster/cmd","forceKeyFrame skipped (no cluster uuid)"); return; }
+  CFMutableDictionaryRef p = cmd_params_uuid();
+  if (!p) return;
+  int rc = ship_cmd(session, "forceKeyFrame", p);
+  logkv("cluster/cmd","forceKeyFrame rc",(u64)(u32)rc,0);
+  logline("cluster/cmd/idr-why", why);
+  if (p_CFRelease) p_CFRelease(p);
+}
+static void cluster_send_nightmode(void *session)
+{
+  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!g_cluster_uuid_str[0]) return;
+  CFMutableDictionaryRef p = cmd_params_uuid();
+  if (!p) return;
+  dseti(p, "nightMode", (s64)(g_night_mode ? 1 : 0));
+  int rc = ship_cmd(session, "setNightMode", p);
+  logkv("cluster/cmd","setNightMode rc",(u64)(u32)rc,0);
+  if (p_CFRelease) p_CFRelease(p);
+}
+
+/* ---- AVCC <-> Annex-B (the refs' proven helpers) ---------------------------
+ * opcode-1 bodies are unencrypted avcC record configs; opcode-0 bodies are
+ * AVCC access units (u32-be length-prefixed NALs at lengthSize ls).  The
+ * decoder side (Cinemo/OMX) wants Annex-B start codes.  Mirrors rgi
+ * avcc_config.h / avcc_frame.h (themselves live-proven on a stock HU). */
+static unsigned char g_cl_cfg_annexb[4096];  /* SPS/PPS as Annex-B (from opcode-1) */
+static unsigned long  g_cl_cfg_len;
+static unsigned char  g_cl_ls = 4;           /* NAL lengthSize (from avcC) */
+
+/* avcC -> Annex-B SPS/PPS.  Returns the lengthSize (1..4), 0 = unusable. */
+static unsigned avcc_config_to_annexb(const unsigned char *a, unsigned len,
+                                      unsigned char *out, unsigned cap, unsigned *outlen)
+{
+  unsigned i = 6, o = 0, group, n, count; unsigned char ls;
+  *outlen = 0;
+  if (!a || !out || len < 7 || a[0] != 1) return 0;
+  ls = (unsigned char)((a[4] & 3) + 1);
+  count = a[5] & 31;
+  for (group = 0; group < 2; group++){
+    if (!count) return 0;
+    for (n = 0; n < count; n++){
+      unsigned size;
+      if (len - i < 2) return 0;
+      size = ((unsigned)a[i] << 8) | a[i+1]; i += 2;
+      if (!size || size > len - i || cap - o < 4 || size > cap - o - 4) return 0;
+      out[o] = out[o+1] = out[o+2] = 0; out[o+3] = 1;
+      { unsigned k; for (k = 0; k < size; k++) out[o+4+k] = a[i+k]; }
+      o += 4 + size; i += size;
+    }
+    if (group == 0){ if (i == len) return 0; count = a[i++]; }
+  }
+  *outlen = o;
+  return ls;
+}
+/* whole AVCC access unit -> classify; when ls==4 rewrite the length prefixes
+ * into Annex-B start codes IN PLACE (no copy).  Returns 0 ok, -1 malformed.
+ * *is_idr set when any NAL is type 5 (IDR). */
+static int avcc_prepare(unsigned char *p, unsigned long len, unsigned char ls, int *is_idr)
+{
+  unsigned long i = 0, total = 0; int key = 0;
+  *is_idr = 0;
+  if (!p || !len || len > (8u<<20) || ls < 1 || ls > 4) return -1;
+  while (len - i >= ls){
+    unsigned long n = 0, k, prefix = i;
+    for (k = 0; k < ls; k++) n = (n << 8) | p[i+k];
+    i += ls;
+    if (!n || n > len - i || n > (8u<<20) - 4 || total > (8u<<20) - 4 - n) return -1;
+    if ((p[i] & 31u) == 5u) key = 1;
+    if (ls == 4){ p[prefix]=0; p[prefix+1]=0; p[prefix+2]=0; p[prefix+3]=1; }
+    total += 4 + n; i += n;
+  }
+  if (i != len) return -1;
+  *is_idr = key;
+  return 0;
+}
+
 /* per-setup context: the servicing thread reads ONLY this, never a shared
  * global that a later setup could overwrite (that was the UAF/corruption path). */
 typedef struct {
   void *screen; int lsock; void *session; int flags; void *stream;
   unsigned char key[32]; int keylen; int cipher; long counter;   /* B: stream crypto */
+  long night; int aes_inited;
 } cl_ctx;
 
 static void *cluster_thread(void *arg){
@@ -1196,17 +1577,30 @@ static void *cluster_thread(void *arg){
   if (connfd >= 0){
     if (p_close){ p_close(c->lsock); }
     c->lsock = -1;
-    logline("cluster/thread","stream connected -- draining");
-    /* STAGE 1 (no stock screen): own the socket so the phone keeps sending and
-     * the session holds, and the MAIN screen is never bound.  Decrypt
-     * (AES-CTR / chacha20-poly1305 per the stream's security) + decode into the
-     * cluster surface plugs in HERE -- that is Part B. */
-    if (p_close){
-      static char rbuf[65536];
-      static unsigned char hdr[128];
-      static unsigned char cxbuf[512];
-      long frames = 0, configs = 0, others = 0;
-      int stop = 0;
+    logline("cluster/thread","stream connected");
+    /* THE SINK STANDS UP HERE -- on this thread, NOT in the SETUP seam.  A
+     * failing/blocking sink can no longer stall CarPlay session setup.  In the
+     * default (off) and dry modes this touches no display. */
+    { int cw  = (int)env_num("MIB3_SHIM_W",1280);
+      int chp = (int)env_num("MIB3_SHIM_H",480);
+      unsigned iviid = (unsigned)env_num("MIB3_SHIM_IVIID",0x4d4233); /* 'MB3' */
+      sink_start(cw, chp, iviid); }
+    /* THE PHONE IS ON THE WIRE. Per the refs, the phone now sends opcode-1
+     * (avcC) + opcode-5 (telemetry) but NO video until we drive the scene:
+     * forceKeyFrame at stream start (rgi alt_recv_loop: "A decoder cannot
+     * start mid-GOP. Ask for a cluster-targeted IDR"), and showUI so Maps
+     * renders the cluster scene (the paired/chacha rgi build sends showUI at
+     * stream-connected; the AES build at first IDR -- we do both, cheap). */
+    cluster_send_forcekeyframe(c->session, "stream-start");
+    cluster_send_showui(c->session, "stream-connected");
+    cluster_send_nightmode(c->session);
+    {
+      unsigned char hdr[128];
+      unsigned char *rbuf = 0; unsigned long rcap = 0;
+      unsigned char cxbuf[512];
+      long frames = 0, configs = 0, others = 0, idrs = 0;
+      int stop = 0, have_cfg = 0, first_idr_sent = 0;
+      unsigned char ls = g_cl_ls;
       logkv("cluster/thread","cipher",(u64)(u32)c->cipher,0);
       while (!stop){
         long got = 0, n;
@@ -1218,24 +1612,96 @@ static void *cluster_thread(void *arg){
                         ((unsigned)(unsigned char)hdr[2] << 16) | ((unsigned)(unsigned char)hdr[3] << 24);
           unsigned op = (unsigned char)hdr[4];
           if (bs > (8u << 20)){ logkv("cluster/thread","bad bodySize",(u64)bs,0); break; }
+          /* grow the body buffer to the frame size (the OLD code read into a
+           * static 64 KiB array -> any IDR > 64 KiB overran static memory) */
+          if (bs > rcap){
+            if (p_malloc){
+              unsigned long newsz = rcap ? rcap : 65536;
+              while (newsz < bs) newsz <<= 1;
+              unsigned char *nb2 = (unsigned char*)p_malloc(newsz);
+              if (!nb2){ logline("cluster/thread","body alloc failed"); break; }
+              { unsigned long k; for (k = 0; k < rcap; k++) nb2[k] = rbuf[k]; }
+              if (p_free && rbuf) p_free(rbuf);
+              rbuf = nb2; rcap = newsz;
+            } else { logline("cluster/thread","no malloc"); break; }
+          }
           got = 0;
           while (got < (long)bs){ n = read(connfd, rbuf + got, (long)bs - got); if (n <= 0){ stop = 1; break; } got += n; }
           if (stop) break;
-          if (op == 1){ configs++; logkv("cluster/thread","codec-config body",(u64)bs,0); }
+          if (op == 1){
+            /* codec config: UNENCRYPTED avcC (rgi avcc_config.h; the phone also
+             * attaches screen-state flags -- hdr[6] -- which we log) */
+            configs++;
+            logkv("cluster/thread","codec-config body",(u64)bs,0);
+            logkv("cluster/thread","config flags",(u64)(unsigned)hdr[6],0);
+            { float w = 0, h = 0;   /* sender's encoded size @ hdr+16/+20 (rgi) */
+              unsigned char *pw = (unsigned char*)&w, *ph = (unsigned char*)&h;
+              int k;
+              for (k = 0; k < 4; k++){ pw[k] = hdr[16+k]; ph[k] = hdr[20+k]; }
+              logkv("cluster/thread","encoded size w",(u64)(u32)(w>0?((unsigned)(w+0.5f)):0),0);
+              logkv("cluster/thread","encoded size h",(u64)(u32)(h>0?((unsigned)(h+0.5f)):0),0); }
+            { unsigned char cfgout[4096]; unsigned cfglen = 0;
+              unsigned nls = avcc_config_to_annexb(rbuf, bs, cfgout, sizeof(cfgout), &cfglen);
+              if (nls){
+                ls = (unsigned char)nls; g_cl_ls = ls; have_cfg = 1;
+                { unsigned long k; for (k = 0; k < cfglen && k < sizeof(g_cl_cfg_annexb); k++)
+                    g_cl_cfg_annexb[k] = cfgout[k]; }
+                g_cl_cfg_len = cfglen < sizeof(g_cl_cfg_annexb) ? cfglen : sizeof(g_cl_cfg_annexb);
+                logkv("cluster/thread","avcC -> Annex-B SPS/PPS bytes",(u64)g_cl_cfg_len,0);
+                logkv("cluster/thread","NAL lengthSize",(u64)(unsigned)ls,0);
+              } else logline("cluster/thread","opcode-1: not an avcC record (kept, no SPS/PPS)"); }
+          }
           else if (op == 0){
-            long pl = 0;
+            /* video AU -- decrypt per the stream's security.  THE WIRE FORMAT
+             * (corpus ProcessFrames 0x11fbf0, verified): chacha bodies are
+             * ciphertext||16-byte Poly1305 tag, AAD = the 128-byte header,
+             * nonce = the 8-byte LE frame counter (init_64x64 reads 8 bytes);
+             * verify() MUST be called and n+m must equal bodySize-16.  AES-CTR
+             * is a PERSISTENT keystream (Init ONCE, Update per frame). */
+            long pl = 0; int dec_ok = 0;
             if (c->cipher == 2 && p_cx_init && p_cx_aad && p_cx_dec){
-              unsigned char nonce[12]; int k; unsigned long long ctr = (unsigned long long)c->counter;
-              for (k = 0; k < 8; k++) nonce[k] = (unsigned char)(ctr >> (k * 8));
-              for (k = 8; k < 12; k++) nonce[k] = 0;
-              p_cx_init(cxbuf, c->key, nonce);
-              p_cx_aad(cxbuf, hdr, 128);
-              pl = p_cx_dec(cxbuf, rbuf, (long)bs, rbuf);   /* in place */
+              if (bs >= 16){
+                unsigned char nonce8[8]; int k; unsigned long long ctr = (unsigned long long)c->counter;
+                for (k = 0; k < 8; k++) nonce8[k] = (unsigned char)(ctr >> (k * 8));
+                p_cx_init(cxbuf, c->key, nonce8);
+                p_cx_aad(cxbuf, hdr, 128);
+                { long dn = p_cx_dec(cxbuf, rbuf, (long)bs - 16, rbuf);   /* in place, tag excluded */
+                  int okflag = -1; long vm = 0;
+                  if (p_cx_ver) vm = p_cx_ver(cxbuf, rbuf + dn, rbuf + (long)bs - 16, &okflag);
+                  if (okflag == 0 && dn + vm == (long)bs - 16){ pl = (long)bs - 16; dec_ok = 1; }
+                  else { logkv("cluster/thread","chacha verify FAILED ok",(u64)(u32)okflag,0);
+                         logkv("cluster/thread","  dn",(u64)(u64)dn,0); logkv("cluster/thread","  vm",(u64)(u64)vm,0); }
+                }
+              } else logline("cluster/thread","chacha: body < 16 (no tag) -- dropped");
             } else if (c->cipher == 1 && p_ctr_init && p_ctr_upd){
-              p_ctr_init(cxbuf, c->key, c->key + 16);
-              p_ctr_upd(cxbuf, rbuf, (long)bs, rbuf); pl = (long)bs;
-            }
+              if (!c->aes_inited){        /* ONE init: the keystream persists across frames */
+                p_ctr_init(cxbuf, c->key, c->key + 16);
+                c->aes_inited = 1;
+              }
+              p_ctr_upd(cxbuf, rbuf, (long)bs, rbuf); pl = (long)bs; dec_ok = 1;
+            } else { pl = (long)bs; dec_ok = (c->cipher == 0); }  /* no key: pass-through (diagnosis only) */
             c->counter++; frames++;
+            if (dec_ok && pl > 0){
+              int is_idr = 0;
+              if (avcc_prepare(rbuf, (unsigned long)pl, ls, &is_idr) == 0){
+                if (is_idr){
+                  idrs++;
+                  if (!first_idr_sent){
+                    first_idr_sent = 1;
+                    logkv("cluster/thread","FIRST IDR at frame",(u64)frames,0);
+                    /* rgi production timing: showUI + night + IDR refresh at the
+                     * first decodable frame (the stream is now a real canvas) */
+                    cluster_send_showui(c->session, "first-IDR");
+                    cluster_send_nightmode(c->session);
+                    cluster_send_forcekeyframe(c->session, "first-IDR");
+                  }
+                }
+                /* the decoded payload is now Annex-B; hand it to the sink
+                 * (helper = out-of-process [safe]; local = in-carplay [hazardous,
+                 * ACK-gated]; off/dry = dropped). */
+                sink_feed(rbuf, (unsigned long)pl, 0);
+              } else logline("cluster/thread","malformed AU (avcc_prepare) -- dropped");
+            }
             if ((frames & 0x3f) == 1){
               char hs[40]; int k; const char *H = "0123456789abcdef";
               unsigned lim = (bs < 16) ? (unsigned)bs : 16u;
@@ -1244,14 +1710,16 @@ static void *cluster_thread(void *arg){
               logkv("cluster/thread","frame",(u64)frames,0);
               logkv("cluster/thread","body",(u64)bs,0);
               logkv("cluster/thread","plain",(u64)pl,0);
-              logline("cluster/thread/plain-head", hs);   /* want 00000001 (H.264 NAL) */
+              logline("cluster/thread/plain-head", hs);   /* want 00000001 (Annex-B NAL) */
             }
-          } else others++;
+          } else others++;   /* opcodes 2/4/5: keepalive/misc -- ignore (rgi) */
         }
       }
       logkv("cluster/thread","frames total",(u64)frames,0);
+      logkv("cluster/thread","idrs total",(u64)idrs,0);
       logkv("cluster/thread","configs",(u64)configs,0);
       logkv("cluster/thread","other-opcodes",(u64)others,0);
+      if (p_free && rbuf) p_free(rbuf);
       logline("cluster/thread","stream closed");
     }
     if (p_close) p_close(connfd);
@@ -1263,11 +1731,18 @@ static void *cluster_thread(void *arg){
   return 0;
 }
 
-/* ---- our own listener (exactly what LIVI and PlayPort do) -----------------
- * Both working receivers bind a WILDCARD, EPHEMERAL TCP listener and advertise
- * whatever port the OS assigns.  The unit's ServerSocketOpen binds via an
- * internal family value and the phone never reached it (live: accept rc -6722 =
- * kTimeoutErr). */
+/* ---- our own listener (exactly what LIVI and PlayPort do, plus the port
+ * chain the unit's own FIREWALL forces -- see the redteam block above).
+ * Both working receivers bind a WILDCARD TCP listener and advertise whatever
+ * port it got.  On THIS unit the phone-facing interfaces (ncm0 for wired USB,
+ * wlap* for wireless) have an iptables/ip6tables default-DENY allowlist whose
+ * only carplay TCP ports are 5000:5001 / 6030 / 7000 (lge/app_ro/network's
+ * embedded template, section "## carplay for ncm0 (usb interface)").  The
+ * stock event listener owns 5001 and the stock screen owns 6030, so the only
+ * firewall-legal free port is 5000.  6031 (the MHI3-native alt port) and any
+ * ephemeral port are DROPPED by the firewall -- the phone's SYN never arrives
+ * -- so they are fallbacks that require live_kit/cluster_port_fw.sh to insert
+ * the RAM-only allow rule first. */
 static int own_listen(int *out_port){
   extern int socket(int, int, int);
   extern int setsockopt(int, int, int, const void*, unsigned int);
@@ -1280,6 +1755,18 @@ static int own_listen(int *out_port){
   int fd, one = 1;
   struct sa6 sa, got; unsigned int glen = sizeof(got), i;
   unsigned char *p;
+  /* port chain: explicit knob -> 5000 (fw-allowlisted, stock-observed free) ->
+   * 6031 (MHI3-native alt; fw-DROPPED, needs cluster_port_fw.sh) -> ephemeral
+   * (fw-DROPPED, needs cluster_port_fw.sh).  Log every attempt so the log
+   * shows exactly which link of the chain won. */
+  unsigned long chain[4]; int nc = 0;
+  { char *pe = getenv("MIB3_SHIM_PORT");
+    unsigned long pv = 0;
+    if (pe && pe[0] >= '0' && pe[0] <= '9'){ while (*pe >= '0' && *pe <= '9'){ pv = pv*10 + (*pe - '0'); pe++; } }
+    if (pv) chain[nc++] = pv; }
+  chain[nc++] = 5000;
+  chain[nc++] = 6031;
+  chain[nc++] = 0;   /* ephemeral */
   fd = socket(10 /*AF_INET6*/, 1 /*SOCK_STREAM*/, 0);
   if (fd < 0) return -1;
   setsockopt(fd, 1 /*SOL_SOCKET*/, 2 /*SO_REUSEADDR*/, &one, sizeof(one));
@@ -1288,13 +1775,15 @@ static int own_listen(int *out_port){
     logkv("cluster/listen","IPV6_V6ONLY=0 rc",(u64)(u32)r,0); }
   p = (unsigned char*)&sa; for (i = 0; i < sizeof(sa); i++) p[i] = 0;
   sa.family = 10;
-  /* Prefer the NATIVE alt port 6031 (0x178F): MHI3 selects -6030 for type 110
-   * and -6031 for type 111, and the wired phone connects the cluster stream to
-   * 6031 (rgi altscreen_hook.c:1758).  Fall back to ephemeral only if busy. */
-  sa.port = (unsigned short)((6031 << 8) | (6031 >> 8));   /* network byte order 0x8F17 */
-  if (bind(fd, &sa, sizeof(sa)) != 0){
-    sa.port = 0;
-    if (bind(fd, &sa, sizeof(sa)) != 0){ close(fd); return -1; }
+  { int ci; int bound = 0;
+    for (ci = 0; ci < nc && !bound; ci++){
+      unsigned long pt = chain[ci];
+      sa.port = (unsigned short)((pt << 8) | (pt >> 8));   /* network byte order */
+      if (bind(fd, &sa, sizeof(sa)) == 0) bound = 1;
+      logkv("cluster/listen","try port",(u64)pt,0);
+      if (!bound) logkv("cluster/listen","bind failed port",(u64)pt,0);
+    }
+    if (!bound){ close(fd); return -1; }
   }
   if (listen(fd, 8) != 0){ close(fd); return -1; }
   *out_port = 0;
@@ -1302,6 +1791,10 @@ static int own_listen(int *out_port){
     *out_port = (int)(((got.port & 0xff) << 8) | (got.port >> 8));   /* ntohs */
     logkv("cluster/listen","bound family",(u64)(u32)got.family,0);
     logkv("cluster/listen","bound port",(u64)(u32)(*out_port),0);
+    { const char *fw = (*out_port == 5000 || *out_port == 5001) ? "FW-ALLOWED (ncm0 5000:5001)"
+                      : (*out_port == 6030 || *out_port == 7000) ? "FW-ALLOWED but stock-owned"
+                      : "FW-DROPPED (needs live_kit/cluster_port_fw.sh)";
+      logline("cluster/listen/fw", fw); }
   }
   return fd;
 }
@@ -1347,6 +1840,13 @@ static int cluster_setup(void *session, void *streamDict, void *response){
     if (desc){
       dseti(desc, "type", MIB3_CLUSTER_TYPE);
       dseti(desc, "dataPort", (s64)port);
+      /* rgi's paired/authenticated build also echoes the request's
+       * streamConnectionID in the response descriptor (altscreen_hook.c:1780).
+       * Our stock 110 descriptor proves it is not REQUIRED on this unit
+       * (stock sends only {type,dataPort} and the phone connects), so this is
+       * a belt knob: MIB3_SHIM_CONNID=1. */
+      if (env_on("MIB3_SHIM_CONNID",0) && connID)
+        dseti(desc, "streamConnectionID", connID);
       CFMutableArrayRef streams = 0;
       { CFStringRef ks = sstr("streams");
         if (ks){ streams = (CFMutableArrayRef)p_CFDictionaryGetValue((CFDictionaryRef)response, ks);
@@ -1380,26 +1880,22 @@ static int cluster_setup(void *session, void *streamDict, void *response){
     }
   }
 
-  /* ROUTE-B: stand up the cluster's frame sink (env-gated).  Additive: the stock
-   * stream handling above is unchanged; if neither sink is available we log and
-   * continue (the stream is still serviced).  Preference order:
-   *   1. the shim's own Cinemo pipeline (decode bridge) -- Cinemo owns the ivi
-   *      surface and decodes+renders the cluster frames into it;
-   *   2. the shim's own Wayland/EGL surface (fallback, no decode). */
-  if (env_on("MIB3_SHIM_SURFACE",0)){
-    int cw  = (int)env_num("MIB3_SHIM_W",1280);
-    int chp = (int)env_num("MIB3_SHIM_H",480);
-    unsigned iviid = (unsigned)env_num("MIB3_SHIM_IVIID",0x4d4233); /* 'MB3' */
-    if (env_on("MIB3_SHIM_BRIDGE",0) && bridge_create(cw, chp, iviid) == 0){
-      logline("cluster","route-B Cinemo bridge ready (Cinemo decodes+renders)");
-      logline("cluster/surfname", surf_name());
-    } else if (surface_create(cw, chp, iviid) == 0){
-      logline("cluster","route-B surface ready (fallback, no decode)");
-      logline("cluster/surfname", surf_name());
-    } else {
-      logline("cluster","route-B sink unavailable (continuing, stream still serviced)");
-    }
-  }
+  /* ROUTE-B sink.* THE SINK IS **DEFERRED** TO THE RECEIVER THREAD (see
+   * cluster_thread -> sink_start) and is NOT created here.
+   *
+   * Doing display-pipeline work inside THIS seam (the CarPlay SETUP path) is
+   * exactly what blacked the centre screen and reset the unit on 2026-10-16:
+   * a blocking/rupturing Cinemo or EGL call here stalls CarPlay session setup,
+   * and carplay.service is FailureAction=reboot-immediate.  The setup seam must
+   * return the response immediately and touch nothing.  So we only RESOLVE the
+   * mode here (and log it); the actual sink stands up on our own thread after
+   * the phone connects.  See the SINK DISPATCHER comment for the modes. */
+  sink_resolve();
+  { char m[96]; buf b = { m, sizeof(m)-2, 0 };
+    bs(&b,"mode="); bu64(&b,(u64)(u32)g_sink,10,0);
+    bs(&b," local="); bu64(&b,(u64)(u32)g_sink_local,10,0);
+    bs(&b," (deferred to cluster/thread)"); m[b.n]=0;
+    logline("cluster/sink", m); }
 
   /* spawn the servicing thread with its OWN heap context (no shared mutable
    * state a later setup could clobber -> no cross-thread UAF/corruption). */
@@ -1412,6 +1908,8 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   c->screen = 0; c->lsock = lsock; c->session = session; c->stream = 0;
   { int j; for (j = 0; j < 32; j++) c->key[j] = skey[j]; }
   c->keylen = keylen; c->cipher = cipher; c->counter = 0;
+  c->night = g_night_mode; c->aes_inited = 0;
+  g_cmd_session = session;   /* the command target once the stream connects */
   {
     char *cfg = (char*)(*(void**)((char*)session + 0x10));
     c->flags = cfg ? *(int*)(cfg + 0xac) : 0;
@@ -1655,7 +2153,15 @@ static void run_banner(void){
   bs(&b,"  INFO="); bu64(&b,(u64)env_on("MIB3_SHIM_INFO",1),10,0);
   bs(&b,"  ENABLEDFEAT="); bu64(&b,(u64)env_on("MIB3_SHIM_ENABLEDFEAT",1),10,0);
   bs(&b,"  GATE="); bu64(&b,(u64)gate_active(),10,0);
+  /* Re-read the sink knobs on EVERY plug.  target_env.py sets them LIVE, between
+   * plugs, so a resolution cached from a previous plug would silently ignore the
+   * change (the 2026-10-16 "banner still reads SURFACE=0" class of bug).  Reset
+   * the breadcrumb fd too so the stick path is re-discovered if it just mounted. */
+  g_sink = -1; bc_fd = -2;
   bs(&b,"  SURFACE="); bu64(&b,(u64)env_on("MIB3_SHIM_SURFACE",0),10,0);
+  bs(&b,"  SINK="); sink_resolve(); bu64(&b,(u64)(u32)g_sink,10,0);
+  bs(&b,"  LOCAL="); bu64(&b,(u64)(u32)g_sink_local,10,0);
+  bs(&b,"  ACK="); bu64(&b,(u64)env_on("MIB3_SHIM_LOCAL_ACK",0),10,0);
   bs(&b," ======\n");
   bs(&b,"[mib3shim] ================================================================\n");
   mem[b.n]=0;
@@ -1715,6 +2221,15 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
     saw_main_display = 1;
     char *cu_env = getenv("MIB3_SHIM_CUUID");
     const char *cu_s = (cu_env && cu_env[0]) ? cu_env : "4d494233-0000-4000-8000-000000000001";
+    /* remember the EXACT cluster uuid string: the /info advert and the
+     * showUI/forceKeyFrame/setNightMode command params must name the SAME display */
+    { unsigned long n = 0; while (cu_s[n] && n < sizeof(g_cluster_uuid_str)-1){ g_cluster_uuid_str[n] = cu_s[n]; n++; }
+      g_cluster_uuid_str[n] = 0; }
+    /* the cluster scene url: used for BOTH the /info initialURL and showUI */
+    { char *u = getenv("MIB3_SHIM_URL");
+      const char *us = (u && u[0]) ? u : CLUSTER_URL_DEFAULT;
+      unsigned long n = 0; while (us[n] && n < sizeof(g_cluster_url)-1){ g_cluster_url[n] = us[n]; n++; }
+      g_cluster_url[n] = 0; }
     CFStringRef cu = p_CFStringCreateWithCString ? p_CFStringCreateWithCString(0,cu_s,K128) : 0;
     int cw   = (int)env_num("MIB3_SHIM_W", 1280);
     int chp  = (int)env_num("MIB3_SHIM_H", 480);   /* grounded cluster default: 1280x480 (LANE_SURFACE_BINDING_DESK §3a) */
@@ -1796,54 +2311,101 @@ int AirPlayReceiverSessionSetup(void *session, void *request, void **responseOut
     }
   }
 
-  /* Inject enabledFeatures = [altScreen, viewAreas] if missing.
+  /* Inject enabledFeatures = [...existing, viewAreas, altScreen] -- but ONLY
+   * into the CONTROL SETUP response.
    *
-   * FIX (2026-10-15): this is gated on g_cluster_advertised -- i.e. the cluster
-   * display was actually appended by the AddScreenDisplay seam in THIS process.
-   * Claiming "altScreen" without advertising the cluster violates the iOS gate
-   * (altScreen flag => the /info displays array must have >=2 entries), and iOS
-   * then refuses/tears down the session.  Coupling the two makes the advert and
-   * the negotiation a single decision: no cluster -> no claim -> the response is
-   * byte-identical to stock (the known-good path).
+   * THE SCOPE FIX (2026-10-16 redteam, rgi-faithful): the phone proposes in
+   * the control-SETUP REQUEST under "features" (media/stream SETUPs carry
+   * "streams" only -- PlayPort handleSetup splits them exactly this way),
+   * and reads the negotiated set from the control-SETUP RESPONSE under
+   * "enabledFeatures" (iOS _apsession_ensureControlStreamSetup, verified in
+   * the rgi's iOS 26.6 AirPlaySender decompile).  The previous build injected
+   * enabledFeatures into EVERY SETUP response -- including the 111 stream
+   * SETUP itself, which NO reference does (PlayPort's stream-SETUP response
+   * carries ONLY the "streams" key).
    *
-   * The feature STRINGS were also corrected to match the reference receiver's
-   * working set: it appends exactly "altScreen" and "viewAreas".  The previous
-   * third string, "uiContext", makes iOS read UI-context URLs from the receiver
-   * (endpoint +0x3F / CopyUIContextURLs) -- a capability this unit does not have
-   * -- so it is off by default and only added if MIB3_SHIM_EF_UICONTEXT=1.
+   * CONTENT FIX (rgi warning, altscreen_hook.c:1975-1979): "each string in
+   * that array flips a sibling endpoint flag (viewAreas+0x3D, altScreen+0x3E,
+   * uiContext+0x3F, enhancedSiri+0x39), so NEVER echo the phone's proposal".
+   * Seed from the receiver's EXISTING response enabledFeatures (usually
+   * absent on this unit) and add ONLY the two contracts we implement:
+   * viewAreas and altScreen.  "iAPChannel" (the old default, taken from
+   * PlayPort's full-receiver set) is now OPT-IN (MIB3_SHIM_EF_IAPCHANNEL=1):
+   * the stock MIB3 has never negotiated it, and the rgi -- the only
+   * stock-HU-proven reference -- does not claim it.
    *
-   * MIB3_SHIM_ENABLEDFEAT=0 ablates the whole injection at runtime (target_env.py). */
+   * Coupling unchanged (2026-10-15): only when the cluster was actually
+   * advertised (g_cluster_advertised) -- altScreen flag <=> >=2 displays.
+   * MIB3_SHIM_ENABLEDFEAT=0 ablates the whole injection at runtime. */
   if (env_on("MIB3_SHIM_ENABLEDFEAT",1) && gate_active() && g_cluster_advertised &&
       responseOut && *responseOut && p_CFDictionarySetValue &&
-      p_CFStringCreateWithCString && p_kCFTypeArrayCallBacks) {
-    CFStringRef k = p_CFStringCreateWithCString(0,"enabledFeatures",K128);
-    if (k && (!p_CFDictionaryGetValue || !p_CFDictionaryGetValue(*responseOut,k))) {
-      /* build a mutable array of the feature strings */
-      fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
-      CFMutableArrayRef arr = mka ? mka(0,0,p_kCFTypeArrayCallBacks) : 0;
-      const char *feats[4]; int nf = 0;
-      feats[nf++] = "iAPChannel";     /* PlayPort sends this; rgi inherits it from stock */
-      feats[nf++] = "viewAreas";
-      feats[nf++] = "altScreen";
-      if (env_on("MIB3_SHIM_EF_UICONTEXT",0)) feats[nf++] = "uiContext";
-      int i;
-      if (arr){
-        for (i=0;i<nf;i++){
-          CFStringRef f = p_CFStringCreateWithCString(0,feats[i],K128);
-          if (f){ p_CFArrayAppendValue(arr, f); if (p_CFRelease) p_CFRelease(f); } /* array retains */
+      p_CFStringCreateWithCString && p_kCFTypeArrayCallBacks &&
+      p_CFDictionaryGetValue && session && request) {
+    /* control SETUP iff the request carries the "features" proposal key */
+    void *kfeat = dgetk((CFDictionaryRef)request, "features");
+    int is_control_setup = (kfeat != 0);
+    if (is_control_setup){
+      /* log the phone's proposal (rgi alt_log_phone_features): the exact set
+       * this phone would negotiate -- the diagnostic the old builds never had */
+      if (p_CFArrayGetCount && p_CFArrayGetValueAtIndex && p_CFGetTypeID &&
+          p_CFArrayGetTypeID && p_CFStringGetTypeID && p_CFStringGetCString &&
+          kfeat && p_CFGetTypeID(kfeat) == p_CFArrayGetTypeID()){
+        CFIndex j, m = p_CFArrayGetCount((CFArrayRef)kfeat);
+        char list[320]; unsigned long lw = 0;
+        for (j = 0; j < m && j < 24; j++){
+          void *e = (void*)p_CFArrayGetValueAtIndex((CFArrayRef)kfeat, j);
+          char tmp[48]; tmp[0] = 0;
+          if (e && p_CFGetTypeID(e) == p_CFStringGetTypeID() &&
+              p_CFStringGetCString((CFStringRef)e, tmp, sizeof(tmp), K128)){
+            const char *sp = " "; const char *pp = sp;
+            unsigned long tl = 0; while (tmp[tl]) tl++;
+            unsigned long pl = 0; while (pp[pl]) pl++;
+            unsigned long k;
+            for (k = 0; k < pl && lw + k + tl + 2 < sizeof(list); k++) list[lw+k] = pp[k];
+            lw += pl;
+            for (k = 0; k < tl && lw + k + 1 < sizeof(list); k++) list[lw+k] = tmp[k];
+            lw += tl;
+            list[lw] = 0;
+          }
         }
-        p_CFDictionarySetValue(*responseOut, k, arr);
-        if (p_CFRelease) p_CFRelease(arr);      /* dict retained it */
-        logline("SessionSetup","injected enabledFeatures");
-        logkv("SessionSetup","enabledFeatures n",(u64)nf,0);
-        if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow) p_CFShow(*responseOut);
-      } else {
-        logline("SessionSetup","enabledFeatures array alloc failed");
+        logkv("SessionSetup","phone proposes n",(u64)(u32)m,0);
+        logline("SessionSetup/phone-proposes", list);
       }
-      if (p_CFRelease) p_CFRelease(k);        /* dict retained it */
+      CFStringRef k = p_CFStringCreateWithCString(0,"enabledFeatures",K128);
+      if (k && (!p_CFDictionaryGetValue(*responseOut,k))) {
+        /* build a mutable array seeded with any existing accepted strings
+         * (usually none on this unit: stock writes no response enabledFeatures),
+         * then add ONLY the two contracts this shim implements */
+        fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
+        CFMutableArrayRef arr = mka ? mka(0,0,p_kCFTypeArrayCallBacks) : 0;
+        const char *feats[4]; int nf = 0;
+        if (env_on("MIB3_SHIM_EF_IAPCHANNEL",0)) feats[nf++] = "iAPChannel";
+        feats[nf++] = "viewAreas";
+        feats[nf++] = "altScreen";
+        if (env_on("MIB3_SHIM_EF_UICONTEXT",0)) feats[nf++] = "uiContext";
+        int i;
+        if (arr){
+          CFTypeRef cur = p_CFDictionaryGetValue(*responseOut, k);
+          (void)cur;   /* absent by the check above; kept for clarity */
+          for (i=0;i<nf;i++){
+            CFStringRef f = p_CFStringCreateWithCString(0,feats[i],K128);
+            if (f){ p_CFArrayAppendValue(arr, f); if (p_CFRelease) p_CFRelease(f); } /* array retains */
+          }
+          p_CFDictionarySetValue(*responseOut, k, arr);
+          if (p_CFRelease) p_CFRelease(arr);      /* dict retained it */
+          logline("SessionSetup","injected enabledFeatures (control SETUP only)");
+          logkv("SessionSetup","enabledFeatures n",(u64)nf,0);
+          if (env_on("MIB3_SHIM_CFSHOW",0) && p_CFShow) p_CFShow(*responseOut);
+        } else {
+          logline("SessionSetup","enabledFeatures array alloc failed");
+        }
+        if (p_CFRelease) p_CFRelease(k);        /* dict retained it */
+      } else {
+        logline("SessionSetup","enabledFeatures already present");
+        if (p_CFRelease && k) p_CFRelease(k);   /* not stored -> release our +1 */
+      }
     } else {
-      logline("SessionSetup","enabledFeatures already present");
-      if (p_CFRelease && k) p_CFRelease(k);   /* not stored -> release our +1 */
+      logline("SessionSetup","stream/media SETUP -- enabledFeatures NOT injected (scoped)");
     }
   } else if (env_on("MIB3_SHIM_ENABLEDFEAT",1) && gate_active() && !g_cluster_advertised) {
     /* the cluster was NOT advertised this process: claim nothing (consistency). */
@@ -1985,19 +2547,9 @@ static int cluster_on_frame(const void *data, unsigned long len, unsigned long t
   unsigned long n = ++g_cluster_frames;
   /* rate-limited: the first frame + every 300th (a 60fps log would flood tmpfs). */
   if (n == 1 || (n % 300) == 0){ logkv("frame/cluster","n",n,0); logkv("frame/cluster","len",len,0); }
-  /* PRIMARY: the shim's own Cinemo projection -> Cinemo decodes + renders the
-   * compressed access unit into the shim's surface (the decode bridge). */
-  if (bridge_active()) return bridge_feed(data, len, ts);
-  /* FALLBACK: the shim's own RGBA surface path (no decode).  The payload here is
-   * COMPRESSED (H.264), so an RGBA upload is only meaningful when the caller
-   * supplies at least w*h*4 bytes -- otherwise glTexSubImage2D would read past
-   * the (much smaller) compressed buffer.  Guard it. */
-  if (env_on("MIB3_SHIM_SURFACE",1) && g_gfx.ready && g_gfx.w > 0 && g_gfx.h > 0){
-    unsigned long need = (unsigned long)g_gfx.w * (unsigned long)g_gfx.h * 4UL;
-    if (len >= need) return surface_write_frame(data, g_gfx.w, g_gfx.h);
-    if (n == 1) logline("frame/cluster","compressed payload < w*h*4: RGBA fallback skipped");
-  }
-  return 0;
+  /* Route through the ONE sink dispatcher (off/dry/helper/local).  The helper
+   * (out-of-process) mode touches no display here; the local mode is ACK-gated. */
+  return sink_feed(data, len, ts);
 }
 
 int ScreenStreamProcessData(void *stream, const void *data, unsigned long len,
@@ -2080,7 +2632,14 @@ static void fmt_u(char *out, unsigned v){
   { int j=0; while (k) out[j++]=t[--k]; out[j]=0; }
 }
 static void fmt_2int(char *out, int a, int b){
-  int n=0; fmt_u(out,(unsigned)a); while(out[n]) n++; out[n++]=','; fmt_u(out+n,(unsigned)b);
+  /* 2026-10-16 ROOT CAUSE FIX: the separator MUST be 'x', not ','.  libNmeVideoDevice parses
+   * windowpos/windowsize with sscanf("%dx%d") (corpus libNmeVideoDevice/decompiled.c:15358,21579)
+   * and rejects anything else ("invalid resolution").  With a comma the device never got a drawable
+   * size, so the ivi surface was created but never allocated a buffer (ILM scene: original size 0x0),
+   * ivi_share had nothing to hand multi-screen-server, MS-S never received `configure`, and the
+   * encoder never emitted video.  The working framework passes the literal "x" (string table byte
+   * immediately before "windowpos" in libCarPlayMediaFramework). */
+  int n=0; fmt_u(out,(unsigned)a); while(out[n]) n++; out[n++]='x'; fmt_u(out+n,(unsigned)b);
 }
 static void resolve_bridge(void){
   if (g_br.resolved) return;
@@ -2127,13 +2686,44 @@ static int bridge_create(int w, int h, unsigned ivi_id){
   logline("bridge","-- create begin --");
 
   if (p_CinemoCreateConfig(&g_br.cfg) != 0 || !g_br.cfg){ logline("bridge","FAIL: CinemoCreateConfig"); return -1; }
+  /* CONFIG INIT -- this is the step that was missing (found live 2026-10-16).
+   * CinemoMediaEngineUtils::init() (corpus libCarPlayMediaFramework.so
+   * decompiled.c 15269-15336) runs, on the config, +0x90 (GetVersion) then
+   * +0xb0 (SetPluginDirectory) BEFORE screenSetup ever calls
+   * config->[0x30] GetVideoDevice.  WITHOUT the plugin directory the device
+   * plugins never load, so GetVideoDevice returns non-zero -- exactly the wall
+   * the out-of-process helper hit on the car.  The framework's own fallback dir
+   * is /usr/lib64/cinemo; the configured dir is /lge/app_rw/lib64/cinemo.
+   * MIB3_SHIM_CINEMO_DIR overrides. */
+  { fn_vc1 f = (fn_vc1)vslot(g_br.cfg, 0x90);
+    if (f){ unsigned char ver[32]; unsigned i; for (i=0;i<sizeof(ver);i++) ver[i]=0; f(g_br.cfg, ver); } }
+  { char *pd = getenv("MIB3_SHIM_CINEMO_DIR"); int rc;
+    fn_vc1 f = (fn_vc1)vslot(g_br.cfg, 0xb0);
+    if (!f){ logline("bridge","FAIL: config->SetPluginDirectory missing"); goto fail; }
+    if (!pd || !pd[0]) pd = "/lge/app_rw/lib64/cinemo";
+    logline("bridge/cinemo-dir", pd);
+    rc = f(g_br.cfg, pd);
+    logkv("bridge","cfg->[0xb0] rc",(u64)(unsigned)rc,0);
+    if (rc != 0){
+      logline("bridge/cinemo-dir","fallback /usr/lib64/cinemo");
+      rc = f(g_br.cfg, "/usr/lib64/cinemo");
+      logkv("bridge","cfg->[0xb0] rc2",(u64)(unsigned)rc,0);
+      if (rc != 0){ logline("bridge","FAIL: config->SetPluginDirectory"); goto fail; }
+    } }
   if (p_CinemoCreatePlaylist(&g_br.playlist) != 0 || !g_br.playlist){ logline("bridge","FAIL: CinemoCreatePlaylist"); goto fail; }
   { fn_vc1 f = (fn_vc1)vslot(g_br.playlist, 0x128);
     if (!f || f(g_br.playlist, &g_br.playback) != 0 || !g_br.playback){ logline("bridge","FAIL: playlist->CreatePlayback"); goto fail; } }
   { fn_vc2 f = (fn_vc2)vslot(g_br.playback, 0x28);
     if (f) f(g_br.playback, 0, 0); }                 /* set event handler (none needed) */
   { fn_vc2 f = (fn_vc2)vslot(g_br.cfg, 0x30);
-    if (!f || f(g_br.cfg, p_opt_video_device_id, &g_br.dev) != 0 || !g_br.dev){ logline("bridge","FAIL: config->GetVideoDevice"); goto fail; } }
+    /* the framework LOADS the option id from the symbol (it dereferences the GOT
+     * entry: `uVar3 = *(undefined8 *)PTR_CINEMO_OPTION_VIDEO_DEVICE_ID`) -- the
+     * symbol is an 8-byte OBJECT holding a pointer.  Passing the symbol's
+     * ADDRESS (dlsym's return) is wrong: GetVideoDevice then gets a garbage id
+     * and fails.  Dereference, exactly like the framework. */
+    void *optid = p_opt_video_device_id ? *(void**)p_opt_video_device_id : 0;
+    logkv("bridge","GetVideoDevice optid",(u64)optid,1);
+    if (!f || f(g_br.cfg, optid, &g_br.dev) != 0 || !g_br.dev){ logline("bridge","FAIL: config->GetVideoDevice"); goto fail; } }
   { fn_vc2 f = (fn_vc2)vslot(g_br.dev, 0xa0);
     char pos[24], size[24], idbuf[16];
     fmt_2int(pos,0,0); fmt_2int(size,w,h); fmt_u(idbuf,ivi_id);
@@ -2141,16 +2731,45 @@ static int bridge_create(int w, int h, unsigned ivi_id){
     if (f(g_br.dev,"windowpos",pos)  != 0){ logline("bridge","FAIL: windowpos");  goto fail; }
     if (f(g_br.dev,"windowsize",size)!= 0){ logline("bridge","FAIL: windowsize"); goto fail; }
     if (f(g_br.dev,"ivi-app-id",idbuf)!=0){ logline("bridge","FAIL: ivi-app-id"); goto fail; }
+    /* The device takes the SIZE from its own `resolution` / `surface_width`/`surface_height` url
+     * params (see ParseCommonParameters: "invalid resolution: %ux%u"), separately from the drawable
+     * `windowsize`.  ParseCommonParameters runs at device creation and rejects bad values, so pass
+     * them explicitly in the same "WxH"/plain-int form the parser expects. */
+    { char res[24]; fmt_2int(res,w,h);
+      if (f(g_br.dev,"resolution",res) != 0) logline("bridge","WARN: resolution rejected");
+      { char sw[16]; fmt_u(sw,(unsigned)w);
+        if (f(g_br.dev,"surface_width",sw) != 0) logline("bridge","WARN: surface_width rejected"); }
+      { char sh[16]; fmt_u(sh,(unsigned)h);
+        if (f(g_br.dev,"surface_height",sh) != 0) logline("bridge","WARN: surface_height rejected"); }
+    }
     logkv("bridge","ivi_id",(u64)ivi_id,0); }
   { fn_vc0 f = (fn_vc0)vslot(g_br.dev, 0x58);
     const char *dn = f ? (const char*)f(g_br.dev) : 0;
     if (!dn){ logline("bridge","FAIL: dev->GetName"); goto fail; }
     logline("bridge/devname", dn);
-    if (p_CinemoCreateWindow(dn, &g_br.window) != 0 || !g_br.window){ logline("bridge","FAIL: CinemoCreateWindow"); goto fail; } }
+    if (p_CinemoCreateWindow(dn, &g_br.window) != 0 || !g_br.window){ logline("bridge","FAIL: CinemoCreateWindow"); goto fail; }
+    /* Framework parity (CinemoMediaEngineUtils::setVideoParams): bind the window to the device. */
+    { fn_vc1 g = (fn_vc1)vslot(g_br.window, 0x58);
+      int brc = g ? g(g_br.window, (void*)dn) : -1;
+      logkv("bridge","window->[0x58] bind-device rc",(u64)(unsigned)brc,0); } }
   if (p_CinemoCreateProjection("?disable_scaling=1", &g_br.projection) != 0 || !g_br.projection){
     logline("bridge","FAIL: CinemoCreateProjection"); goto fail; }
   { fn_vc2 f = (fn_vc2)vslot(g_br.playlist, 0xd8);
     if (!f || f(g_br.playlist, g_br.projection, 0) != 0){ logline("bridge","FAIL: playlist->SetProjection"); goto fail; } }
+  /* Framework parity (CinemoMediaEngineUtils::writeVideoFormat): tell the decoder the output format
+   * BEFORE feeding.  0xa0-byte descriptor; fields per corpus decompiled.c:14590. */
+  { fn_vc1 f = (fn_vc1)vslot(g_br.projection, 0x28);
+    unsigned char d[0xa0]; unsigned i; int rc;
+    for (i=0;i<(unsigned)sizeof(d);i++) d[i]=0;
+    *(unsigned*)(d+0x00)=1u; *(unsigned*)(d+0x04)=0x2002u; *(unsigned*)(d+0x08)=1u;
+    *(unsigned*)(d+0x0c)=(unsigned)w; *(unsigned*)(d+0x10)=(unsigned)h;
+    d[0x2c]=0x10; d[0x39]=1;
+    rc = f ? f(g_br.projection, (void*)d) : -1;
+    logkv("bridge","writeVideoFormat rc",(u64)(unsigned)rc,0); }
+  /* NB (2026-10-16): a `projection->[0x28](proj, &writeVideoFormatDesc)` call was added here,
+   * reconstructed from CinemoMediaEngineUtils::writeVideoFormat — the descriptor field offsets were
+   * derived by hand and it went onto live hardware in a batch with other changes; the next plug
+   * rebooted the unit.  Removed.  Re-add ONLY as a single change, desk-verified, with stick logs. */
 
   g_br.active = 1;
   logline("bridge","-- create done (active) --");
@@ -2172,9 +2791,13 @@ static int bridge_feed(const void *data, unsigned long len, unsigned long ts){
     /* pts70mhz, exactly as CinemoMediaEngineUtils::writeVideo computes it */
     pts = (ts % 1000000000UL) * 0x1b9 / 0x186a + (ts / 1000000000UL) * 0x434a900UL;
     if (f(g_br.projection, (void*)data, (void*)len, (void*)pts, (void*)(u64)(ts != 0)) != 0){
-      g_br.fail_count++; return -1;
+      g_br.fail_count++;
+      if ((g_br.fail_count % 100ul) == 1ul) logkv("bridge","feed FAIL count",(u64)g_br.fail_count,0);
+      return -1;
     }
     g_br.feed_count++;
+    if (g_br.feed_count == 1ul) logline("bridge","feed: first WriteVideo OK (decoder took the AU)");
+    else if ((g_br.feed_count % 100ul) == 0ul) logkv("bridge","feed ok count",(u64)g_br.feed_count,0);
   }
   return 0;
 }
@@ -2186,6 +2809,156 @@ int  mib3shim_bridge_active(void){ return g_br.active; }
 void mib3shim_bridge_destroy(void){ bridge_destroy(); }
 unsigned long mib3shim_bridge_feeds(void){ return g_br.feed_count; }
 unsigned long mib3shim_bridge_fails(void){ return g_br.fail_count; }
+
+/* ==========================================================================
+ * THE SINK DISPATCHER (2026-10-16) -- the ONE place cluster frames may reach a
+ * display, and the reason the 2026-10-16 black-screen/reset cannot repeat.
+ *
+ * BACKGROUND.  On 2026-10-16 the sink was enabled live (MIB3_SHIM_SURFACE=1 +
+ * MIB3_SHIM_BRIDGE=1) and the centre screen went black as CarPlay started and
+ * the unit reset (LANE_CLUSTER_LIVE_2026-10-16.md S5b).  Two things were wrong:
+ *   (1) the sink was CREATED INSIDE the CarPlay SETUP seam, so a
+ *       blocking/rupturing Cinemo or EGL call there stalls session setup -- and
+ *       carplay.service is FailureAction=reboot-immediate; and
+ *   (2) BOTH display paths ran IN-PROCESS, sharing the process's
+ *       Adreno/OMX/ILM/EGL state with CarPlay's own rendering.  carplay links
+ *       libNmeSDK.so directly, so the bridge's Cinemo factories resolve and a
+ *       real second Adreno/OMX/ILM window is made -- the same class of failure
+ *       the shim's own note records for the stock alt-screen path: "black main
+ *       screen + decoder crash".
+ *
+ * WHAT CHANGED.
+ *   * Default mode is OFF -- no display-touching call at all.
+ *   * The sink is created on the RECEIVER THREAD, never in the SETUP seam.
+ *   * A DRY-RUN mode logs the exact planned sequence and creates NOTHING.
+ *   * The SAFE mode forwards frames OUT OF PROCESS (helper): carplay makes no
+ *       display call, so a helper fault cannot touch the centre screen or the
+ *       CarPlay process.  See mib3clusterhelper.c.
+ *   * The legacy IN-PROCESS mode is retained but must be EXPLICITLY armed with
+ *       MIB3_SHIM_LOCAL_ACK=1, and its two halves (bridge/surface) are separately
+ *       selectable so each can be tested ALONE.
+ *
+ * MODES (MIB3_SHIM_SINK): off (default) | dry | helper | local.
+ * Back-compat: MIB3_SHIM_SINK unset + legacy SURFACE/BRIDGE set -> `local` ONLY
+ * when MIB3_SHIM_LOCAL_ACK=1, else OFF with a loud warning -- the guard that
+ * makes the 2026-10-16 accident impossible to re-arm by a stale knob.
+ *
+ * LOCAL SELECTION (MIB3_SHIM_LOCAL): `bridge` (default) | `surface` | `both`.
+ * Bridge->surface fallback happens ONLY with MIB3_SHIM_LOCAL_FALLBACK=1 (else
+ * the halves would not be independently testable).
+ * ========================================================================*/
+static void sink_resolve(void){
+  char *v;
+  if (g_sink >= 0) return;
+  g_sink = SINK_OFF;
+  v = getenv("MIB3_SHIM_LOCAL");
+  if (v && v[0]=='s') g_sink_local = 1;
+  else if (v && v[0]=='b' && v[1]=='o') g_sink_local = 2;
+  else g_sink_local = 0;
+  g_sink_lf = env_on("MIB3_SHIM_LOCAL_FALLBACK",0);
+
+  v = getenv("MIB3_SHIM_SINK");
+  if (v && v[0]){
+    if      (v[0]=='d') g_sink = SINK_DRY;
+    else if (v[0]=='h') g_sink = SINK_HELPER;
+    else if (v[0]=='l') g_sink = SINK_LOCAL;
+    else                g_sink = SINK_OFF;
+  } else if (env_on("MIB3_SHIM_SURFACE",0) || env_on("MIB3_SHIM_BRIDGE",0)){
+    if (env_on("MIB3_SHIM_LOCAL_ACK",0)) g_sink = SINK_LOCAL;
+    else {
+      g_sink = SINK_OFF;
+      logline("sink","LEGACY SURFACE/BRIDGE KNOBS SET BUT NOT ARMED: needs MIB3_SHIM_LOCAL_ACK=1 (the 2026-10-16 black-screen guard). Staying OFF.");
+    }
+  }
+  if (g_sink == SINK_LOCAL && !env_on("MIB3_SHIM_LOCAL_ACK",0)){
+    logline("sink","MIB3_SHIM_SINK=local REFUSED: set MIB3_SHIM_LOCAL_ACK=1 to accept the in-process black-screen risk (or use =helper).");
+    g_sink = SINK_OFF;
+  }
+  { char m[110]; buf b={m,sizeof(m)-2,0};
+    bs(&b,"mode="); bu64(&b,(u64)(u32)g_sink,10,0);
+    bs(&b," local="); bu64(&b,(u64)(u32)g_sink_local,10,0);
+    bs(&b," fallback="); bu64(&b,(u64)(u32)g_sink_lf,10,0);
+    m[b.n]=0; logline("sink/resolve", m); }
+}
+
+static int sink_local_up = 0;    /* the local sink was successfully created */
+
+static int sink_start(int w, int h, unsigned ivi_id){
+  sink_resolve();
+  bc("sink:start");
+  if (g_sink == SINK_OFF){ logline("sink","off: no display-touching call"); bc("sink:off"); return 0; }
+  if (g_sink == SINK_DRY){
+    char m[170]; buf b={m,sizeof(m)-2,0};
+    bs(&b,"DRY-RUN plan: local="); bu64(&b,(u64)(u32)g_sink_local,10,0);
+    bs(&b," w="); bu64(&b,(u64)(u32)w,10,0); bs(&b," h="); bu64(&b,(u64)(u32)h,10,0);
+    bs(&b," ivi="); bhex(&b,(u64)ivi_id); bs(&b," -- CREATING NOTHING");
+    m[b.n]=0; logline("sink", m); bc("sink:dry:plan-logged");
+    return 0;
+  }
+  if (g_sink == SINK_HELPER){
+    bc("sink:helper:connect");
+    if (helper_connect() == 0){
+      logline("sink","helper connected -- frames forwarded OUT OF PROCESS (no display call in carplay)");
+      bc("sink:helper:connected");
+    } else {
+      logline("sink","helper absent -- frames will be dropped (safe); retried per frame");
+      bc("sink:helper:absent");
+    }
+    return 0;
+  }
+  /* SINK_LOCAL -- the ACK was already verified in sink_resolve() */
+  if (g_sink_local == 0 || g_sink_local == 2){
+    bc("sink:local:bridge:create");
+    if (bridge_create(w, h, ivi_id) == 0){
+      logline("sink","LOCAL bridge active (Cinemo decodes+renders in-carplay)");
+      logline("cluster/surfname", surf_name());
+      bc("sink:local:bridge:ok"); sink_local_up = 1; return 0;
+    }
+    bc("sink:local:bridge:fail");
+    if (!(g_sink_lf || g_sink_local == 2)){
+      logline("sink","bridge failed; surface fallback disabled (MIB3_SHIM_LOCAL_FALLBACK=0) -- no sink");
+      return -1;
+    }
+  }
+  if (g_sink_local == 1 || g_sink_local == 2 || g_sink_lf){
+    bc("sink:local:surface:create");
+    if (surface_create(w, h, ivi_id) == 0){
+      logline("sink","LOCAL surface active (fallback, no decode)");
+      logline("cluster/surfname", surf_name());
+      bc("sink:local:surface:ok"); sink_local_up = 1; return 0;
+    }
+    bc("sink:local:surface:fail");
+  }
+  logline("sink","LOCAL sink unavailable (stream still serviced)");
+  return -1;
+}
+
+static int sink_feed(const void *data, unsigned long len, unsigned long ts){
+  sink_resolve();
+  if (g_sink == SINK_HELPER) return helper_feed(data, len, ts);
+  if (g_sink == SINK_LOCAL){
+    if ((g_sink_local == 0 || g_sink_local == 2) && bridge_active()) return bridge_feed(data, len, ts);
+    if ((g_sink_local == 1 || g_sink_local == 2 || g_sink_lf) && g_gfx.ready && g_gfx.w > 0 && g_gfx.h > 0){
+      unsigned long need = (unsigned long)g_gfx.w * (unsigned long)g_gfx.h * 4UL;
+      if (len >= need) return surface_write_frame(data, g_gfx.w, g_gfx.h);
+    }
+    return 0;
+  }
+  return 0;   /* off / dry: dropped */
+}
+
+/* ---- harness hooks (sink dispatcher + out-of-process helper) ------------ */
+int  mib3shim_sink_mode(void){ sink_resolve(); return g_sink; }
+int  mib3shim_sink_local(void){ sink_resolve(); return g_sink_local; }
+int  mib3shim_sink_start(int w,int h,unsigned ivi){ sink_resolve(); return sink_start(w,h,ivi); }
+int  mib3shim_sink_feed(const void *d,unsigned long n,unsigned long ts){ return sink_feed(d,n,ts); }
+int  mib3shim_sink_local_up(void){ return sink_local_up; }
+int  mib3shim_helper_connect(void){ return helper_connect(); }
+int  mib3shim_helper_feed(const void *d,unsigned long n,unsigned long ts){ return helper_feed(d,n,ts); }
+int  mib3shim_helper_connected(void){ return hlp_fd >= 0; }
+unsigned long mib3shim_helper_sent(void){ return hlp_sent; }
+unsigned long mib3shim_helper_dropped(void){ return hlp_drop; }
+const char *mib3shim_bc_path(void){ if (bc_fd == -2){ bc_pick_path(); } return bc_path; }
 
 /* ==========================================================================
  * THE CRASH-GUARD SEAM (2026-10-15/16)
