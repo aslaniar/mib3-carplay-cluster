@@ -99,16 +99,42 @@ def make_idr(w, h, luma):
     bw.rbsp_trailing()
     return nal(0x65, bw.bytes())
 
+def make_idr_i16(w, h):
+    """IDR I-slice using I_16x16 intra prediction with DC mode and NO residual.
+
+    I_PCM (above) is legal H.264 but many hardware decoders do not implement it.
+    I_16x16 is universal.  mb_type 1..24 = 1 + intra16x16PredMode(0..3)
+    + 4*CodedBlockPatternChroma(0..2) + 12*CodedBlockPatternLuma(0..1);
+    with no residual the coded-block-pattern is 0 for both -> mb_type = 1+predMode.
+    DC prediction with no available neighbours reconstructs to 128 (mid grey),
+    so the decoded frame is a clean uniform grey -- unmistakable against 'no data'.
+    """
+    bw = BW()
+    bw.ue(0)          # first_mb_in_slice
+    bw.ue(2)          # slice_type = I
+    bw.ue(0)          # pps_id
+    bw.u(4, 0)        # frame_num
+    bw.ue(0)          # idr_pic_id
+    bw.se(0)          # slice_qp_delta
+    bw.ue(1)          # disable_deblocking_filter_idc
+    mbw, mbh = w // 16, h // 16
+    for _ in range(mbh * mbw):
+        bw.ue(1 + 2)  # mb_type: I_16x16, intra16x16PredMode=2 (DC), CBP 0/0
+        bw.ue(0)      # intra_chroma_pred_mode = DC
+    bw.rbsp_trailing()
+    return nal(0x65, bw.bytes())
+
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 8
     w = int(sys.argv[2]) if len(sys.argv) > 2 else 320
     h = int(sys.argv[3]) if len(sys.argv) > 3 else 240
+    mode = sys.argv[4] if len(sys.argv) > 4 else "pcm"
     out = sys.stdout.buffer
     sps, pps = make_sps(w, h), make_pps()
     for i in range(n):
         out.write(sps)
         out.write(pps)
-        out.write(make_idr(w, h, i))
+        out.write(make_idr_i16(w, h) if mode == "i16" else make_idr(w, h, i))
     out.flush()
 
 if __name__ == "__main__":

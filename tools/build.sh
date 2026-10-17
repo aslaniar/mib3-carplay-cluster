@@ -79,6 +79,7 @@ build_egl mib3egl.c     mib3egl
 [ -f omx_vt.c ] && build_libc omx_vt.c omx_vt
 [ -f omx_run.c ] && build_libc omx_run.c omx_run
 [ -f omx_fix.c ] && build_libc omx_fix.c omx_fix
+[ -f omx_full.c ] && build_libc omx_full.c omx_full
 # wl_trace.so: the DRAW-CALL TRACER -- a shared library (not an executable: no crt,
 # no _start).  Loaded into OUR OWN helper only (LD_PRELOAD, or first in
 # MIB3_HELPER_LIBS) to log the EGL/Wayland calls the vendor video device makes.
