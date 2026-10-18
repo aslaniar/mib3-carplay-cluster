@@ -482,6 +482,10 @@ static fn_CinemoCreate     p_CinemoCreateConfig;
 static fn_CinemoCreate     p_CinemoCreatePlaylist;
 static fn_CinemoCreateStr  p_CinemoCreateWindow;
 static fn_CinemoCreateStr  p_CinemoCreateProjection;
+/* Cinemo logging (libNmeBaseClasses): turn it on from inside the helper so the
+ * device's own decisions ("using %s swap-chain") become visible. */
+static int (*p_NmeLogSetLevel)(int);
+static int (*p_NmeLogSetTarget)(int,const char*,void*,void*);
 static void               *p_opt_video_device_id;   /* &CINEMO_OPTION_VIDEO_DEVICE_ID */
 static void               *p_iid_cinemo_option;     /* &ICinemoOption::iid */
 /* The playback ICinemoOption keys the framework sets in screenSetup() (2026-10-17). */
@@ -2622,18 +2626,50 @@ typedef struct {
   void *cfg, *playlist, *playback, *dev, *window, *projection;
   int w, h; unsigned ivi_id;
   unsigned long feed_count, fail_count;
+  volatile int ready;   /* playback cue received (CinemoEvent type 4) */
 } bridge_t;
 static bridge_t g_br;
+extern int usleep(unsigned);
 /* Stub playback event handler.  The framework passes a real one
  * (CinemoMediaEngineUtils::handlePlaybackEvents); our bridge passed 0.  If the
  * device delivers its "decoded/please render" notification to that handler and
  * nobody is listening, it has nowhere to go -- which would explain a fully set-up
  * EGL context (trace: eglCreateWindowSurface + eglMakeCurrent) and ZERO swaps. */
 static unsigned long g_br_events;
-static long bridge_event_handler(void *self, void *ev){
-  (void)self; (void)ev;
-  g_br_events++;
-  if (g_br_events == 1 || (g_br_events % 100) == 0) logkv("bridge","playback event",g_br_events,0);
+/* A2: the Painter swap-chain calls a CLIENT callback with each frame.  The device
+ * reads `painter-callback` / `painter-cookie` from its own name via
+ * NmeString::get_url_parameter_ptr (a real pointer, carried as text).  We pass
+ * our own function so the decoded frames come to us instead of nowhere. */
+static volatile unsigned long g_painter_calls;
+static long painter_cb(void *a, void *b, void *c, void *d, void *e, void *f){
+  (void)b;(void)c;(void)d;(void)e;(void)f;
+  g_painter_calls++;
+  if (g_painter_calls <= 4){
+    logline("bridge","PAINTER CB");
+    logkv("bridge","pcb arg0",(u64)(unsigned long)a,1);
+    logkv("bridge","pcb arg1",(u64)(unsigned long)b,1);
+    logkv("bridge","pcb arg2",(u64)(unsigned long)c,1);
+  }
+  return 0;
+}
+static void fmt_hexp(char *out, unsigned long v){
+  const char *h = "0123456789abcdef"; char t[18]; int k=0, i=0;
+  out[i++]='0'; out[i++]='x';
+  if (!v){ out[i++]='0'; out[i]=0; return; }
+  while (v){ t[k++] = h[v & 0xf]; v >>= 4; }
+  while (k) out[i++] = t[--k];
+  out[i]=0;
+}static long bridge_event_handler(void *self, void *ev){
+  (void)self;
+  /* The framework's handler (CinemoMediaEngineUtils::handlePlaybackEvents) reads
+   * the event's first int and, on type 4 (CINEMO_EC_CUE), marks the playback
+   * ready -- waitForReady() blocks on exactly that before any video is written.
+   * Our old handler ignored it, so the device's "ready/please render" cue went
+   * nowhere.  Read the type, log it (rate-limited), and set ready on the cue. */
+  { int t = ev ? *(int*)ev : -1;
+    g_br_events++;
+    if (g_br_events <= 8 || (g_br_events % 100) == 0) logkv("bridge","event type",(u64)(unsigned)t,0);
+    if (t == 4 && !g_br.ready){ g_br.ready = 1; logline("bridge","READY cue (event type 4)"); } }
   return 0;
 }
 
@@ -2655,6 +2691,15 @@ static void fmt_2int(char *out, int a, int b){
    * encoder never emitted video.  The working framework passes the literal "x" (string table byte
    * immediately before "windowpos" in libCarPlayMediaFramework). */
   int n=0; fmt_u(out,(unsigned)a); while(out[n]) n++; out[n++]='x'; fmt_u(out+n,(unsigned)b);
+}
+/* A REAL (non-null) log callback.  NmeLogSetTarget(target=FILE,path,cb,user)
+ * with cb==0 segfaulted when the Cinemo logging was first enabled on the desk
+ * bench (2026-10-17); pass a valid sink so the engine can call it safely and we
+ * can see the graph/swap-chain decisions it otherwise keeps to itself. */
+static unsigned long g_nme_logs = 0;
+static void bridge_log_sink(void *user, const void *item){
+  (void)user; (void)item;      /* item is a CinemoLogItem&; layout unknown -- do not deref */
+  g_nme_logs++;
 }
 static void resolve_bridge(void){
   if (g_br.resolved) return;
@@ -2678,6 +2723,18 @@ static void resolve_bridge(void){
   logkv("bridge","CinemoCreateWindow",(u64)p_CinemoCreateWindow,1);
   logkv("bridge","CinemoCreateProjection",(u64)p_CinemoCreateProjection,1);
   logkv("bridge","CINEMO_OPTION_VIDEO_DEVICE_ID",(u64)p_opt_video_device_id,1);
+  /* Cinemo log on (device/swap-chain decisions are otherwise silent).  FILE target
+   * (1) + Debug level (1: Verbose=-1, Trace=0, Debug=1).  MIB3_SHIM_BRIDGE_LOG=0 off. */
+  p_NmeLogSetLevel  = (int (*)(int)) R("_Z14NmeLogSetLevel15CINEMO_LOGLEVEL");
+  p_NmeLogSetTarget = (int (*)(int,const char*,void*,void*)) R("_Z15NmeLogSetTarget16CINEMO_LOGTARGETPKcPFvPvRK13CinemoLogItemES2_");
+  if (env_on("MIB3_SHIM_BRIDGE_LOG",0) && p_NmeLogSetLevel){
+    const char *lg = getenv("MIB3_SHIM_BRIDGE_LOGPATH");
+    if (!lg || !lg[0]) lg = "/tmp/nme_bridge.log";
+    if (p_NmeLogSetTarget){ int rt = p_NmeLogSetTarget(1, lg, (void*)&bridge_log_sink, 0);
+      logkv("bridge","NmeLogSetTarget rc",(u64)(unsigned)rt,0); }
+    { int rl = p_NmeLogSetLevel(1);
+      logkv("bridge","NmeLogSetLevel rc",(u64)(unsigned)rl,0); }
+    logline("bridge","cinemo log enabled"); }
 }
 static void bridge_release(void *obj){
   if (!obj) return;
@@ -2769,11 +2826,25 @@ static int bridge_create(int w, int h, unsigned ivi_id){
         o[3].sym = p_opt_max_fps;    o[3].val = "60000";
         o[4].sym = p_opt_dist_en;    o[4].val = "FALSE";
         o[5].sym = p_opt_dist_delay; o[5].val = "0";
-        o[6].sym = p_opt_hw_decode;  o[6].val = "TRUE";
+        /* 2026-10-17: the vendor framework passes "TRUE" here, and the HW
+         * decoder is the fast path -- but on the DESK BENCH (and as a live
+         * probe) we need the SOFTWARE codec plugin (libNmeVideoSW.so,
+         * Cinemo/NmeVideo/Codec/NvdecSW): the HW plugin (libNmeVideoOMX.so)
+         * never even loads without the SoC's vidc node, so no frames exist and
+         * the render stage is never reached.  MIB3_SHIM_BRIDGE_HWDEC=FALSE
+         * selects the SW codec.  Default stays "TRUE" (vendor parity). */
+        o[6].sym = p_opt_hw_decode;
+        { const char *hw = getenv("MIB3_SHIM_BRIDGE_HWDEC");
+          o[6].val = (hw && hw[0]) ? hw : "TRUE"; }
         for (k = 0; k < 7; k++){
           if (!o[k].sym) continue;
           lastrc = (int)setopt(opts, *(void**)o[k].sym, (void*)o[k].val);
           if (lastrc == 0) okc++;
+          /* per-option result: with 7 options the vendor sets, one of them has
+           * been returning non-zero since the bridge was written and it was
+           * never identified -- it may be the codec SELECTION (hw vs sw). */
+          else { logkv("bridge","optfail idx",(u64)k,0);
+                 logline("bridge/optfail-name", *(char**)o[k].sym); }
         }
         logkv("bridge","options set ok",(u64)okc,0);
         logkv("bridge","options lastrc",(u64)(unsigned)lastrc,0);
@@ -2808,6 +2879,24 @@ static int bridge_create(int w, int h, unsigned ivi_id){
         if (f(g_br.dev,"surface_height",sh) != 0) logline("bridge","WARN: surface_height rejected"); }
     }
     logkv("bridge","ivi_id",(u64)ivi_id,0); }
+  /* A2 probe: force a client-visible swap-chain backend.  The device reads the
+   * `swap-chain` URL parameter from its own name (NmeSwapChain::Create). */
+  { const char *sc = getenv("MIB3_SHIM_BRIDGE_SC");
+    if (sc && sc[0]){ fn_vc2 sf = (fn_vc2)vslot(g_br.dev, 0xa0);
+      int r = sf ? (int)sf(g_br.dev, (void*)"swap-chain", (void*)sc) : -1;
+      logkv("bridge","swap-chain set rc",(u64)(unsigned)r,0); } }
+  { const char *pp = getenv("MIB3_SHIM_BRIDGE_PAINTER");
+    if (pp && pp[0] && pp[0] != '0'){
+      fn_vc2 sf = (fn_vc2)vslot(g_br.dev, 0xa0);
+      char cb[24], ck[24];
+      fmt_hexp(cb, (unsigned long)(unsigned long)&painter_cb);
+      fmt_hexp(ck, (unsigned long)(unsigned long)&g_br);
+      logline("bridge","painter-callback set"); logline("bridge/pcb", cb);
+      if (sf){
+        logkv("bridge","pcb rc sc",(u64)(unsigned)(sf(g_br.dev,(void*)"swap-chain",(void*)"painter")),0);
+        logkv("bridge","pcb rc cb",(u64)(unsigned)(sf(g_br.dev,(void*)"painter-callback",(void*)cb)),0);
+        logkv("bridge","pcb rc ck",(u64)(unsigned)(sf(g_br.dev,(void*)"painter-cookie",(void*)ck)),0);
+      } } }
   { fn_vc0 f = (fn_vc0)vslot(g_br.dev, 0x58);
     const char *dn = f ? (const char*)f(g_br.dev) : 0;
     if (!dn){ logline("bridge","FAIL: dev->GetName"); goto fail; }
@@ -2833,8 +2922,19 @@ static int bridge_create(int w, int h, unsigned ivi_id){
         int r = h ? (int)h(g_br.playback, (void*)use) : -1;
         logkv("bridge","playback->[0x58] bind-device rc",(u64)(unsigned)r,0); }
     }
-    /* Legacy parity call (kept, harmless: rc=0): bind the window to the device. */
-    { fn_vc1 g = (fn_vc1)vslot(g_br.window, 0x58);
+    /* Legacy call: bind the window to the device by NAME.  It has always
+     * returned rc=0, but the vendor framework NEVER makes this call --
+     * setVideoParams only does window->[0x60] + playback->[0x58].  If slot
+     * [0x58] on the WINDOW is not "set device name" (e.g. it is a
+     * Show/Hide/SetOutput), this call could be what stops the device from ever
+     * painting.
+     * DEFAULT = ON: this is the configuration that reached `bridge_create rc=0`
+     * on the car (2026-10-17), so the shipped behaviour is unchanged.
+     * MIB3_SHIM_BRIDGE_LEGACYBIND=0 skips it -- the vendor framework never makes
+     * this call, and the desk bench shows no difference either way, so it is the
+     * first thing to ablate if the device still refuses to paint. */
+    if (env_on("MIB3_SHIM_BRIDGE_LEGACYBIND",1)){
+      fn_vc1 g = (fn_vc1)vslot(g_br.window, 0x58);
       int brc = g ? g(g_br.window, (void*)dn) : -1;
       logkv("bridge","window->[0x58] bind-device rc",(u64)(unsigned)brc,0); } }
   if (p_CinemoCreateProjection("?disable_scaling=1", &g_br.projection) != 0 || !g_br.projection){
@@ -2877,6 +2977,12 @@ static int bridge_create(int w, int h, unsigned ivi_id){
   }
 
   g_br.active = 1;
+  /* Wait (bounded) for the playback READY cue before any frame is written.  The
+   * vendor framework does exactly this (waitForReady, gated on event type 4);
+   * feeding before ready is the leading candidate for "decodes but never
+   * renders".  Feeding still proceeds after the timeout so decode is not lost. */
+  { int t; for (t = 0; t < 3000 && !g_br.ready; t += 20) usleep(20000); }
+  logkv("bridge","ready",(u64)(unsigned)g_br.ready,0);
   logline("bridge","-- create done (active) --");
   return 0;
 fail:
