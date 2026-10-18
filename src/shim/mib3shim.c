@@ -1633,14 +1633,19 @@ static int avcc_prepare(unsigned char *p, unsigned long len, unsigned char ls, i
 /* per-setup context: the servicing thread reads ONLY this, never a shared
  * global that a later setup could overwrite (that was the UAF/corruption path). */
 typedef struct {
-  void *screen; int lsock; void *session; int flags; void *stream;
+  void *screen; int lsock; int lsockgen; void *session; int flags; void *stream;
   unsigned char key[32]; int keylen; int cipher; long counter;   /* B: stream crypto */
   long night; int aes_inited;
 } cl_ctx;
 
-/* the type-111 listener we currently own (or -1).  A newer SETUP supersedes it;
- * see the listener-ownership note in cluster_thread and own_listen. */
+/* The type-111 listener we currently own, plus a GENERATION token.  A newer
+ * SETUP supersedes both; see the listener-ownership note in cluster_thread.
+ * The token, not the fd number, is the ownership test: own_listen closes the old
+ * fd and immediately socket()s a new one, which the kernel hands back with the
+ * SAME number -- so an fd comparison would let a stale receiver thread accept on
+ * the NEW listener and service the new phone stream with an OLD key/session. */
 static volatile int g_lsock = -1;
+static volatile int g_lsock_gen = 0;
 
 static void *cluster_thread(void *arg){
   extern long read(int, void*, unsigned long);
@@ -1672,7 +1677,7 @@ static void *cluster_thread(void *arg){
     extern int poll(void*, unsigned long, int);
     pfd.fd = c->lsock; pfd.events = 1 /*POLLIN*/; pfd.revents = 0;
     { int pr = poll(&pfd, 1, 250);
-      if (g_lsock != c->lsock){ logline("cluster/thread","listener superseded -- abandoning it"); break; }
+      if (g_lsock_gen != c->lsockgen){ logline("cluster/thread","listener superseded -- abandoning it"); break; }
       if (pr < 0) continue;
       if (pr > 0 && (pfd.revents & 1)) connfd = accept(c->lsock, 0, 0);
       /* POLLNVAL/HUP means the listener went away under us. */
@@ -1682,7 +1687,7 @@ static void *cluster_thread(void *arg){
   logkv("cluster/thread","conn fd",(u64)(u32)connfd,0);
   if (connfd >= 0){
     if (p_close){ p_close(c->lsock); }
-    if (g_lsock == c->lsock) g_lsock = -1;
+    if (g_lsock_gen == c->lsockgen){ g_lsock = -1; g_lsock_gen++; }
     c->lsock = -1;
     logline("cluster/thread","stream connected");
     /* THE SINK STANDS UP HERE -- on this thread, NOT in the SETUP seam.  A
@@ -1874,7 +1879,7 @@ static void *cluster_thread(void *arg){
  * ephemeral port are DROPPED by the firewall -- the phone's SYN never arrives
  * -- so they are fallbacks that require live_kit/cluster_port_fw.sh to insert
  * the RAM-only allow rule first. */
-static int own_listen(int *out_port){
+static int own_listen(int *out_port, int *out_gen){
   extern int socket(int, int, int);
   extern int setsockopt(int, int, int, const void*, unsigned int);
   extern int bind(int, const void*, unsigned int);
@@ -1905,8 +1910,9 @@ static int own_listen(int *out_port){
    * port the phone cannot reach (see the listener-ownership note in
    * cluster_thread).  Closing it here also unsticks the old thread's poll. */
   if (g_lsock >= 0){
-    int old = g_lsock; g_lsock = -1; close(old);
+    int old = g_lsock; g_lsock = -1; g_lsock_gen++; close(old);
     logkv("cluster/listen","superseded old listener fd",(u64)(u32)old,0);
+    logkv("cluster/listen","new listener generation",(u64)(u32)g_lsock_gen,0);
   }
   fd = socket(10 /*AF_INET6*/, 1 /*SOCK_STREAM*/, 0);
   if (fd < 0) return -1;
@@ -1928,6 +1934,8 @@ static int own_listen(int *out_port){
   }
   if (listen(fd, 8) != 0){ close(fd); return -1; }
   g_lsock = fd;                 /* we own it until a newer SETUP supersedes it */
+  g_lsock_gen++;
+  if (out_gen) *out_gen = g_lsock_gen;
   *out_port = 0;
   if (getsockname(fd, &got, &glen) == 0){
     *out_port = (int)(((got.port & 0xff) << 8) | (got.port >> 8));   /* ntohs */
@@ -1970,7 +1978,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
     else logline("cluster","chacha derive failed");
   }
 
-  int port = 0, lsock = own_listen(&port);
+  int port = 0, lgen = 0, lsock = own_listen(&port, &lgen);
   if (lsock < 0){ logline("cluster","own listener failed"); goto fail_sock; }
   logkv("cluster","dataPort",(u64)(u32)port,0);
 
@@ -2047,7 +2055,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   }
   cl_ctx *c = (cl_ctx*)p_malloc(sizeof(cl_ctx));
   if (!c){ logline("cluster","ctx alloc failed"); goto fail_sock; }
-  c->screen = 0; c->lsock = lsock; c->session = session; c->stream = 0;
+  c->screen = 0; c->lsock = lsock; c->lsockgen = lgen; c->session = session; c->stream = 0;
   { int j; for (j = 0; j < 32; j++) c->key[j] = skey[j]; }
   c->keylen = keylen; c->cipher = cipher; c->counter = 0;
   c->night = g_night_mode; c->aes_inited = 0;
@@ -2065,7 +2073,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   return 0;
 
 fail_sock:
-  if (g_lsock >= 0 && g_lsock == lsock) g_lsock = -1;
+  if (g_lsock >= 0 && g_lsock == lsock){ g_lsock = -1; g_lsock_gen++; }
   if (p_close && lsock >= 0) p_close(lsock);
   return -1;
 }
