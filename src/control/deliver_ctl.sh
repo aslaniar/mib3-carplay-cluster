@@ -85,9 +85,9 @@ release() { [ -n "${LOCK:-}" ] && [ -f "$LOCK/pid" ] && [ "$(cat "$LOCK/pid" 2>/
 # --- tiny RSI helpers ----------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 pids_of() { if have pidof; then pidof "$1" 2>/dev/null; elif have pgrep; then pgrep -x "$1" 2>/dev/null; fi; }
-h() { _m="$1"; _u="$2"; _b="${3:-}"
-  if [ -n "$_b" ]; then curl -sS --max-time 8 -X "$_m" -H 'Content-Type: application/json' --data "$_b" "$_u"
-  else curl -sS --max-time 8 -X "$_m" "$_u"; fi; }
+h() { _hm="$1"; _hu="$2"; _hb="${3:-}"
+  if [ -n "$_hb" ]; then curl -sS --max-time 8 -X "$_hm" -H 'Content-Type: application/json' --data "$_hb" "$_hu"
+  else curl -sS --max-time 8 -X "$_hm" "$_hu"; fi; }
 de() { tr -d '\\'; }
 line_of() { printf '%s' "$1" | sed 's/},{/}\
 {/g' | grep "\"name\":\"$2\"" | head -n1; }
@@ -150,9 +150,10 @@ presenter_ok() {
   return 1
 }
 surface_has_buffer() {   # read-only check: does ivi 3000 carry a buffer?
-  if command -v LayerManagerControl >/dev/null 2>&1; then
+  _lc="${MIB3_DLV_LC:-LayerManagerControl}"     # overridable for the desk harness
+  if command -v "$_lc" >/dev/null 2>&1; then
     XDG_RUNTIME_DIR=/run/platform/weston WAYLAND_DISPLAY=wayland-0 \
-      LayerManagerControl get surface "$OURID" 2>/dev/null | grep -E "original size|source region"
+      "$_lc" get surface "$OURID" 2>/dev/null | grep -E "original size|source region"
   fi
 }
 
@@ -254,6 +255,175 @@ do_verify() {
   [ "$_ok" = "1" ]
 }
 
+# ============================================================================
+# HANDOVER -- the event-driven replacement for `apply` (2026-10-18).
+#
+# WHY IT EXISTS: `apply` (park -> sleep 2 -> register -> resync) assumes MS-S has
+# observed the park by the time we register ours.  It never verifies that, so a
+# park MS-S did not process (the nav engine re-created its element; a missed 1 Hz
+# check) leaves the nav's TransportStream holding (ip,port) and our start dies
+# SILENTLY with `Failed to create transportStream` (startShareInternal @0x1175d0).
+# See LANE_MS_S_HANDOVER_2026-10-18.md S1.
+#
+# HANDOVER gates on MS-S's OWN decisions (the oracle), one at a time:
+#   check   our presenter owns ivi $OURID with a committed buffer
+#   park    delete the nav element, then WAIT for `STOP STREAMING` (the nav's
+#           TransportStream died -> (ip,port) is free)
+#   attach  register our element, then WAIT for `startShare [id = $OURID]` + `add_listener = 0`
+#   arm     resync (STOP->START), then WAIT for `share_surface_id = $OURID` (encoder built)
+# Stages are idempotent and separately runnable (one step at a time, safety).
+# ============================================================================
+
+oracle_lines() { if [ -f "$MSSLOG" ]; then wc -l < "$MSSLOG" 2>/dev/null | tr -d ' '; else echo 0; fi; }
+# wait_oracle <ERE> <secs> [from_line]  -> 0 if a NEW line (after from_line) matched
+wait_oracle() {
+  _re="$1"; _n="${2:-20}"; _from="${3:-0}"; _i=0
+  while [ "$_i" -lt "$_n" ]; do
+    if [ -f "$MSSLOG" ]; then
+      sed -n "$((_from + 1)),\$p" "$MSSLOG" 2>/dev/null | grep -aqE "$_re" && return 0
+    fi
+    _i=$((_i + 1)); sleep 1
+  done
+  return 1
+}
+oracle_since() { sed -n "$1,\$p" "$MSSLOG" 2>/dev/null; }
+oracle_live() { [ -s "$MSSLOG" ] 2>/dev/null; }
+
+# read-only preconditions; echoes the reason on failure
+handover_check() {
+  presenter_ok || { say "HANDOVER NO-GO: no presenter (start mib3egl $OURID first)"; return 1; }
+  _buf="$(surface_has_buffer)"
+  echo "$_buf" | grep -qE "original size:[^0-9]*x=[1-9][0-9]*" \
+    || { say "HANDOVER NO-GO: ivi $OURID has NO committed buffer (${_buf:-no LayerManagerControl})"; return 1; }
+  [ "$(id_of "$(uris)" "$OURNAME")" = "$OURID" ] && say "HANDOVER: our element already attached" || true
+  say "HANDOVER CHECK OK: presenter owns ivi $OURID with a committed buffer"
+  return 0
+}
+
+handover_park() {
+  R="$(uris)"; NAVU="$(uri_of "$R" $NAVNAME)"
+  _mk="$(oracle_lines)"
+  if [ -n "$NAVU" ]; then
+    bc "handover:park $NAVU"; h DELETE "http://$RSI:$DMP$NAVU" >/dev/null; echo
+  else
+    say "nav element already absent (parked)"
+  fi
+  if [ "${NOOR:-0}" = "1" ]; then
+    sleep 3; say "HANDOVER PARK: DEGRADED (no oracle) -- slept 3s instead of waiting for STOP STREAMING"
+    return 0
+  fi
+  # WAIT for MS-S to say it stopped -- this is the (ip,port) being freed
+  if wait_oracle "STOP STREAMING|stopShare \[" 20 "$_mk"; then
+    say "HANDOVER PARK OK: MS-S logged STOP STREAMING (nav TransportStream destroyed)"
+    return 0
+  fi
+  # if the nav was already gone before we started, there is nothing to stop
+  if [ -z "$NAVU" ]; then
+    say "HANDOVER PARK: nav was already absent; no stop expected"
+    return 0
+  fi
+  say "HANDOVER PARK WARN: no STOP STREAMING within 20s -- MS-S may not have observed the park"
+  say "  (this is exactly the state that makes our start fail silently with"
+  say "   'Failed to create transportStream'; do NOT attach yet)"
+  return 1
+}
+
+handover_attach() {
+  R="$(uris)"; D="$(disps)"; S="$(sps)"
+  DISP="$(uri_of "$D" navi-kombi-display)"; SP="$(uri_of "$S" $SPNAME)"
+  valid_uri "$DISP" || { say "HANDOVER NO-GO: bad display uri '$DISP'"; return 1; }
+  valid_uri "$SP"   || { say "HANDOVER NO-GO: bad sp uri '$SP'"; return 1; }
+  _mk="$(oracle_lines)"           # marked BEFORE any POST (h() clobbers _m, not _mk)
+  EXIST="$(id_of "$R" $OURNAME)"
+  if [ "$EXIST" = "$OURID" ]; then
+    say "our element already registered (internalIdentifier=$OURID)"
+    if grep -aq "startShare \[id = $OURID\]" "$MSSLOG" 2>/dev/null; then
+      say "HANDOVER ATTACH OK: already shared (startShare [id = $OURID] in the oracle)"
+      return 0
+    fi
+    # not yet shared (or the oracle restarted): fall through and let resync re-arm it
+    say "HANDOVER ATTACH: element present but no startShare yet -> run: $0 handover arm"
+    return 0
+  fi
+  bc "handover:attach"
+  h POST "http://$RSI:$DMP/displaymanagement/renderingSurfaces" \
+    "{\"name\":\"$OURNAME\",\"display\":\"$DISP\",\"streamParameters\":\"$SP\",\"topLeftX\":0,\"topLeftY\":0,\"width\":1280,\"height\":480}" >/dev/null; echo
+  sleep 1
+  GOT="$(id_of "$(uris)" "$OURNAME")"
+  [ "$GOT" = "$OURID" ] || { say "HANDOVER NO-GO: element id='$GOT' (want $OURID)"; oracle_tail; return 1; }
+  if [ "${NOOR:-0}" = "1" ]; then
+    sleep 2; say "HANDOVER ATTACH: DEGRADED (no oracle) -- element created; cannot verify startShare"
+    return 0
+  fi
+  if wait_oracle "Failed to create transportStream" 3 "$_mk"; then
+    say "HANDOVER FAIL: 'Failed to create transportStream' -- an (ip,port) stream still exists"
+    oracle_tail; return 2
+  fi
+  if wait_oracle "startShareInternal status = " 3 "$_mk"; then
+    say "HANDOVER FAIL: holder status wedged ('startShareInternal status = N') -- run: $0 handover arm (resync clears it)"
+    oracle_tail; return 2
+  fi
+  wait_oracle "startShare \[id = $OURID\]" 20 "$_mk" \
+    || { say "HANDOVER FAIL: no 'startShare [id = $OURID]' in the oracle"; oracle_tail; return 1; }
+  say "HANDOVER ATTACH OK: MS-S startShare [id = $OURID]"
+  wait_oracle "add_listener = 0" 8 "$_mk" || say "HANDOVER WARN: no 'add_listener = 0' yet"
+  return 0
+}
+
+handover_arm() {
+  S="$(sps)"; SP="$(uri_of "$S" $SPNAME)"
+  valid_uri "$SP" || { say "HANDOVER NO-GO: bad sp uri '$SP'"; return 1; }
+  _mk="$(oracle_lines)"
+  bc "handover:arm (resync 0->1)"
+  # resync is TIMESTAMP-GATED in updateStreamParametersElement @0x131a30: it fires only
+  # on resync==true AND a changed timestamp.  Re-POSTing true after it was latched true
+  # is a NO-OP (session 6 hit exactly this), so drive a real 0 -> 1 transition.
+  if [ "${MIB3_DLV_RESYNC_FLIP:-1}" = "1" ]; then
+    h POST "http://$RSI:$DMP$SP" '{"resync":false}' >/dev/null 2>&1; echo
+    sleep 1
+  fi
+  h POST "http://$RSI:$DMP$SP" '{"resync":true}' >/dev/null; echo
+  if [ "${NOOR:-0}" = "1" ]; then
+    sleep 4; say "HANDOVER ARM: DEGRADED (no oracle) -- resync sent; cannot verify share_surface_id"
+    return 0
+  fi
+  _i=0
+  while [ "$_i" -lt 15 ]; do
+    wait_oracle "share_surface_id = $OURID" 1 "$_mk" \
+      && { say "HANDOVER ARM OK: encoder built for $OURID (share_surface_id = $OURID)"; return 0; }
+    wait_oracle "Specified surface \(ID:$OURID\) does not exist" 1 "$_mk" \
+      && { say "HANDOVER ARM FAIL: Weston says ivi $OURID does not exist -- the presenter is not committing"; return 1; }
+    _i=$((_i + 1))
+  done
+  say "HANDOVER ARM FAIL: no 'share_surface_id = $OURID' within 30s"; oracle_tail; return 1
+}
+
+do_handover() {
+  _st="${1:-full}"
+  bc "handover:start stage=$_st"
+  oracle_on
+  if oracle_live; then NOOR=0; else
+    NOOR=1
+    say "HANDOVER WARN: the MS-S oracle is silent (port $LOGPORT closed?) -- gates DEGRADE to"
+    say "  fixed waits and the pass/fail verdicts become unverifiable. Read the dash + MS-S fds."
+  fi
+  export NOOR
+  case "$_st" in
+    check)  handover_check; return $? ;;
+    park)   handover_park; return $? ;;
+    attach) handover_attach; return $? ;;
+    arm)    handover_arm; return $? ;;
+  esac
+  handover_check || return 1
+  handover_park  || { say "STOP: park not observed -- not attaching (run again when MS-S logs STOP STREAMING)"; return 1; }
+  handover_attach || return $?
+  handover_arm    || return $?
+  do_verify
+  bc "handover:done stage=$_st"
+  say "HANDOVER COMPLETE: look at the cluster. If blank: sh patha_deliver.sh toggle (ECU lever)"
+}
+
+
 watch_live() {
   _n="${1:-60}"; _i=0
   echo "[i] watch ${_n}s -- plug the iPhone and START A ROUTE IN APPLE MAPS (CarPlay nav)"
@@ -270,6 +440,7 @@ watch_live() {
 case "${1:-}" in
   status)  status ;;
   apply)   acquire || exit 1; do_apply ;;
+  handover) shift; acquire || exit 1; do_handover "${1:-full}"; exit $? ;;
   restore) acquire || exit 1; do_restore ;;
   verify)  do_verify ;;
   watch)   shift; watch_live "$@" ;;
@@ -279,5 +450,5 @@ case "${1:-}" in
              tail)  oracle_tail ;;
              *) echo "usage: $0 oracle {start|stop|tail}"; exit 2 ;;
            esac ;;
-  *) echo "usage: $0 {status|apply|verify|restore|watch [secs]|oracle {start|stop|tail}}"; exit 2 ;;
+  *) echo "usage: $0 {status|apply|handover [check|park|attach|arm|full]|verify|restore|watch [secs]|oracle {start|stop|tail}}"; exit 2 ;;
 esac
