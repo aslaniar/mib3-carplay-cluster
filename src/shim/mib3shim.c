@@ -242,6 +242,7 @@ static void bc(const char *step){
 extern int socket(int, int, int);
 extern int connect(int, const void*, unsigned int);
 extern int setsockopt(int, int, int, const void*, unsigned int);
+extern long send(int, const void*, unsigned long, int);
 extern int *__errno_location(void);
 #define SHIM_ERRNO (*__errno_location())
 #define O_NONBLOCK_ 04000
@@ -273,6 +274,17 @@ static int helper_connect(void){
   hlp_fd = fd; hlp_conns++;
   return 0;
 }
+/* MSG_NOSIGNAL: a write to a socket whose peer is gone raises SIGPIPE as well as
+ * returning EPIPE, and SIGPIPE's default action is to KILL THE PROCESS.  This shim
+ * runs INSIDE carplay, whose failure action on this unit is reboot-immediate -- so
+ * a helper (decoder) dying while we are mid-write must not be able to take the
+ * process, and the car, down with it.  This became a routine path on 2026-10-18:
+ * the lifecycle controller stops our decoder at the end of every session
+ * (lanes/closeouts: LANE_CLUSTER_TRANSITION_2026-10-18.md S9).  send(MSG_NOSIGNAL)
+ * keeps the fix local to these two writes; it does not touch the process's
+ * signal disposition, so nothing else in carplay changes. */
+#define MIB3_MSG_NOSIGNAL 0x4000
+
 static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   unsigned char hdr[MIB3_HELP_HDRLEN];
   u32 m32; u64 m64; int i;
@@ -282,8 +294,8 @@ static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   m32 = MIB3_HELP_MAGIC; for (i=0;i<4;i++) hdr[i]   = (unsigned char)((m32 >> (i*8)) & 0xff);
   m32 = (u32)len;        for (i=0;i<4;i++) hdr[4+i] = (unsigned char)((m32 >> (i*8)) & 0xff);
   m64 = ++hlp_seq;       for (i=0;i<8;i++) hdr[8+i] = (unsigned char)((m64 >> (i*8)) & 0xff);
-  if (write(hlp_fd, hdr, MIB3_HELP_HDRLEN) != (long)MIB3_HELP_HDRLEN){ hlp_drop++; helper_close(); return -1; }
-  if (write(hlp_fd, data, len) != (long)len){ hlp_drop++; helper_close(); return -1; }
+  if (send(hlp_fd, hdr, MIB3_HELP_HDRLEN, MIB3_MSG_NOSIGNAL) != (long)MIB3_HELP_HDRLEN){ hlp_drop++; helper_close(); return -1; }
+  if (send(hlp_fd, data, len, MIB3_MSG_NOSIGNAL) != (long)len){ hlp_drop++; helper_close(); return -1; }
   hlp_sent++;
   return 0;
 }
