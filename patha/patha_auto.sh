@@ -75,9 +75,13 @@ i=0
 while [ "$i" -lt $((N*12)) ]; do
   F="$(frames_now)"
   if [ "$FLIPPED" = "0" ]; then
-    # TRIGGER: the helper has started receiving frames = CarPlay is feeding the cluster stream.
+    # TRIGGER: frames are being received = CarPlay is feeding the cluster stream.
+    # Accept BOTH formats: the Cinemo helper logs hex ("frames=0x5"), our
+    # v4l2_seq decoder logs DECIMAL to /tmp/dec.log ("frames=7" in its STATUS
+    # lines; that counter only advances on REAL decoded frames).  Point
+    # MIB3_DLV_HELPERLOG at whichever log your architecture writes.
     case "$F" in
-      frames=0x1|frames=0x[1-9a-f]*|"frames total "*) ;;
+      frames=0x1|frames=0x[1-9a-f]*|frames=[1-9]*|"frames total "*) ;;
       *) sleep 5; i=$((i+1)); continue ;;
     esac
     say "TRIGGER: frames arriving ($F) -- performing the switch via deliver_ctl.sh"
