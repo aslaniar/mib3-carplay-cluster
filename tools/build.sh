@@ -93,11 +93,6 @@ build_egl mib3egl.c     mib3egl
 [ -f omx_fix.c ] && build_libc omx_fix.c omx_fix
 [ -f omx_full.c ] && build_libc omx_full.c omx_full
 [ -f omx_decode.c ] && build_libc omx_decode.c omx_decode   # REDTEAM_DECODE_2026-10-17: the corrected driver (supersedes omx_full on the unit)
-# mib3wheel: the STEERING-WHEEL zoom watcher (2026-10-18).  A read-only RSI
-# client: it subscribes to the unit's own maprenderer (port 49500) and forwards
-# wheel zoom steps to the shim's inbox (/dev/shm/mib3zoom.sock), where the shim
-# turns them into changeMapZoomLevel for the CarPlay cluster map.  libc only.
-[ -f mib3wheel.c ] && build_libc mib3wheel.c mib3wheel
 # wl_trace.so: the DRAW-CALL TRACER -- a shared library (not an executable: no crt,
 # no _start).  Loaded into OUR OWN helper only (LD_PRELOAD, or first in
 # MIB3_HELPER_LIBS) to log the EGL/Wayland calls the vendor video device makes.
@@ -138,7 +133,7 @@ echo "  their sources changed since.  The truth is the list this script just"
 echo "  measured; verified 2026-10-18: mib3egl 7612f74a (the upright fix),"
 echo "  v4l2_seq f6abd36c, mib3surface aaff6555, mib3egl2 beabf11a,"
 echo "  rgba_feed a056eabc.  (actual, this build:)"
-for b in mib3surface mib3egl mib3egl2 rgba_feed v4l2_seq ausock socktest omx_decode mib3wheel mib3clusterstream; do
+for b in mib3surface mib3egl mib3egl2 rgba_feed v4l2_seq ausock socktest omx_decode mib3clusterstream; do
   [ -f "$b" ] && printf '  %-20s %s\n' "$b" "$(MD5SUM "$b")"
 done
 exit 0

@@ -736,7 +736,6 @@ static void resolve(void){
   logkv("init","real_SessionSetup",(u64)real_SessionSetup,1);
   logkv("init","real_CopyServerInfo",(u64)real_CopyServerInfo,1);
   logkv("init","p_realSSPD",(u64)p_realSSPD,1);
-  logkv("init","p_SendCommand",(u64)p_SendCommand,1);
 }
 
 static int env_on(const char *name, int dflt){
@@ -1453,15 +1452,7 @@ static int ship_cmd(void *session, const char *type, CFMutableDictionaryRef para
   if (!cmd) return -1;
   int rc = -1;
   {
-    /* KEY BUG FOUND 2026-10-18 by the new command-capture bench (harness/
-     * libstubcmd.c): this used to pass `sstr(type)` as the dictionary KEY, so
-     * every command went out as {"<name>": "<name>", "params": {...}} -- with
-     * NO "type" key at all.  Both reference receivers build
-     * {"type": "<name>", "params": {...}} (playport AirPlaySession.kt:139,
-     * rgi altscreen_hook.c alt_ship) and iOS dispatches on that key.
-     * `showUI`/`forceKeyFrame`/`setNightMode`/`changeMapZoomLevel` were all
-     * therefore shipped in a shape the phone does not recognise. */
-    CFStringRef kt = sstr("type"), kp = sstr("params"), vt = sstr(type);
+    CFStringRef kt = sstr(type), kp = sstr("params"), vt = sstr(type);
     if (kt && kp && vt && params){
       p_CFDictionarySetValue(cmd, kt, vt);
       p_CFDictionarySetValue(cmd, kp, params);
@@ -1520,206 +1511,6 @@ static void cluster_send_nightmode(void *session)
   int rc = ship_cmd(session, "setNightMode", p);
   logkv("cluster/cmd","setNightMode rc",(u64)(u32)rc,0);
   if (p_CFRelease) p_CFRelease(p);
-}
-
-/* ==========================================================================
- * ZOOM: the STEERING-WHEEL up/down mirror (2026-10-18).
- *
- * WHY THIS EXISTS (see LANE_CLUSTER_ZOOM_2026-10-18.md):
- * The wheel roller does NOT reach CarPlay.  On this unit it goes
- *   cluster (CAN MFL) -> BAP NavigationSd MapScale SetGet -> navsd_app
- *   -> POST {relativeSteps} to /maprenderer/discreteInputs/<renderer>
- *   -> the CAR'S OWN nav zooms -> navsd reports BAP MapScale Status -> the
- *   cluster paints its own scale OSD.
- * Our video replaces the nav's map, so the wheel moved a map nobody sees.
- *
- * The fix is the CarPlay cluster API for exactly this: send
- *   changeMapZoomLevel {uuid: <cluster display uuid>, zoomDirection: 0|1}
- * (0 = zoom IN, non-zero = zoom OUT -- rgi command revert + DashBoard's
- * CRSUIClusterZoomAction).  The phone routes it to the cluster scene, Apple
- * Maps zooms.
- *
- * WHERE THE STEPS COME FROM: the external tool `mib3wheel` (shim/tools/
- * mib3wheel.c) watches the unit's own maprenderer RSI and writes "+1"/"-1"
- * lines into an AF_UNIX socket we own.  This module is the receiving end.
- *
- * WHY A MAILBOX INSTEAD OF SENDING FROM THE LISTENER THREAD: the listener
- * would have to hold the session pointer, i.e. it could send into a torn-down
- * session (a use-after-free inside carplay => reboot).  Instead the listener
- * only QUEUES the step and the CLUSTER THREAD -- which already owns a valid
- * session for the length of that stream -- drains the queue and ships.  No new
- * lifetime contract, no lock.
- * ========================================================================*/
-#define ZOOM_Q 16
-static volatile int g_zoom_q[ZOOM_Q];
-static volatile int g_zoom_qw, g_zoom_qr, g_zoom_qdrop;
-static volatile int g_zoom_started;
-
-/* returns 1 queued, 0 dropped (full) */
-static int zoom_push(int dir)
-{
-  int w = g_zoom_qw, n = (w + 1) % ZOOM_Q;
-  if (n == g_zoom_qr){ g_zoom_qdrop++; return 0; }     /* full: drop the OLDEST */
-  g_zoom_q[w] = dir; g_zoom_qw = n;
-  return 1;
-}
-/* +1 = zoom in, -1 = zoom out, 0 = empty */
-static int zoom_pop(void)
-{
-  int r = g_zoom_qr;
-  if (r == g_zoom_qw) return 0;
-  { int v = g_zoom_q[r]; g_zoom_qr = (r + 1) % ZOOM_Q; return v; }
-}
-
-/* Ship ONE changeMapZoomLevel for the cluster display.  zoomDirection is the
- * rgi/DashBoard wire form: 0 = in, anything else = out. */
-static void cluster_send_zoom(void *session, int dir_in)
-{
-  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
-  if (!g_cluster_uuid_str[0]){ logline("cluster/zoom","skipped (no cluster uuid)"); return; }
-  CFMutableDictionaryRef p = cmd_params_uuid();
-  if (!p) return;
-  dseti(p, "zoomDirection", (s64)(dir_in ? 0 : 1));
-  { int rc = ship_cmd(session, "changeMapZoomLevel", p);
-    logkv("cluster/zoom","dir (0=in 1=out)",(u64)(u32)(dir_in ? 0 : 1),0);
-    logkv("cluster/zoom","changeMapZoomLevel rc",(u64)(u32)rc,0); }
-  if (p_CFRelease) p_CFRelease(p);
-}
-
-/* The listener thread: accept wheel steps from mib3wheel, queue them.
- * Never sends anything itself (see the mailbox note above).  It runs for the
- * life of the process; a reboot is the undo. */
-static void *zoom_listen_thread(void *arg)
-{
-  extern int socket(int,int,int);
-  extern int bind(int,const void*,unsigned int);
-  extern int listen(int,int);
-  extern int accept(int,void*,unsigned int*);
-  extern int unlink(const char*);
-  extern long read(int,void*,unsigned long);
-  extern int close(int);
-  const char *path = (const char*)arg;
-  struct sun { unsigned short family; char p[108]; };
-  struct sun sa;
-  int fd, conn, i;
-  logline("cluster/zoom","listener starting");
-  unlink(path);
-  fd = socket(1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
-  if (fd < 0){ logline("cluster/zoom","socket() failed"); return 0; }
-  { unsigned char *q = (unsigned char*)&sa;
-    for (i = 0; i < (int)sizeof(sa); i++) q[i] = 0;
-    sa.family = 1;
-    { unsigned long n = 0; while (path[n] && n < sizeof(sa.p)-1){ sa.p[n] = path[n]; n++; } }
-  }
-  if (bind(fd, &sa, (unsigned int)sizeof(sa)) != 0){
-    logline("cluster/zoom","bind failed"); close(fd); return 0;
-  }
-  if (listen(fd, 4) != 0){ logline("cluster/zoom","listen failed"); close(fd); return 0; }
-  logline("cluster/zoom/listen", path);
-  for (;;){
-    conn = accept(fd, 0, 0);
-    if (conn < 0) continue;
-    logkv("cluster/zoom","peer fd",(u64)(u32)conn,0);
-    for (;;){
-      char buf[64]; long n = read(conn, buf, sizeof(buf));
-      if (n <= 0) break;
-      /* line protocol: "+1", "1", "-1", "in", "out" (one per line or streamed).
-       * Parse sign words; ignore digits that follow a sign so "+1" is one step,
-       * not two. */
-      { long k; int dir = 0, sign = 0;
-        for (k = 0; k < n; k++){
-          char c = buf[k];
-          if (c == '+'){ sign = 1; dir = 1; }
-          else if (c == '-'){ sign = 1; dir = -1; }
-          else if (c == 'i' || c == 'I'){ sign = 1; dir = 1; }
-          else if (c == 'o' || c == 'O'){ sign = 1; dir = -1; }
-          else if (c == '\n' || c == '\r'){
-            if (sign && dir){
-              int d = dir;
-              if (env_on("MIB3_SHIM_ZOOM_INVERT",0)) d = -d;
-              if (zoom_push(d)) logkv("cluster/zoom","queued dir",(u64)(u32)(d > 0 ? 1 : 0),0);
-              else logline("cluster/zoom","queue full -- step dropped");
-            }
-            sign = 0; dir = 0;
-          }
-          else if (c >= '0' && c <= '9') continue;      /* the magnitude: always 1 step */
-          else if (c == ' ' || c == '\t') continue;
-          else { logkv("cluster/zoom","ignored byte",(u64)(unsigned)(c & 0xff),0); }
-        }
-        /* tolerate a client that does not terminate the last line */
-        if (sign && dir){
-          int d = dir;
-          if (env_on("MIB3_SHIM_ZOOM_INVERT",0)) d = -d;
-          if (zoom_push(d)) logkv("cluster/zoom","queued dir",(u64)(u32)(d > 0 ? 1 : 0),0);
-          else logline("cluster/zoom","queue full -- step dropped");
-        } }
-    }
-    logline("cluster/zoom","peer gone");
-    close(conn);
-  }
-  return 0;   /* unreachable */
-}
-
-/* Idempotent: start the listener once, with the cluster uuid + session globals
- * primed (the exported wrapper below is what the harness drives). */
-static int zoom_listen_start(void)
-{
-  extern int setenv(const char*,const char*,int);
-  static char path[128];
-  static int once = 0;
-  void *th = 0;
-  const char *p;
-  if (g_zoom_started) return 0;
-  if (!env_on("MIB3_SHIM_ZOOM",1)){ logline("cluster/zoom","disabled (MIB3_SHIM_ZOOM=0)"); return 0; }
-  if (!p_pthreadCreate){ logline("cluster/zoom","no pthread -- disabled"); return 0; }
-  p = getenv("MIB3_SHIM_ZOOM_SOCK");
-  if (!p || !p[0]) p = "/dev/shm/mib3zoom.sock";
-  { unsigned long n = 0; while (p[n] && n < sizeof(path)-1){ path[n] = p[n]; n++; } path[n] = 0; }
-  (void)setenv;                                  /* (kept for future knobs) */
-  if (once) return 0;
-  once = 1;
-  if (p_pthreadCreate(&th, 0, zoom_listen_thread, path) != 0){
-    logline("cluster/zoom","pthread_create failed"); return -1;
-  }
-  g_zoom_started = 1;
-  return 0;
-}
-
-/* ---- test/bench surface (mirrors mib3shim_cluster_setup's role) ----------- */
-/* Prime the uuid + session and start the listener.  Production calls
- * zoom_listen_start() from cluster_setup (uuid already primed by the advert);
- * the harness has no advert, so it primes them here. */
-int mib3shim_zoom_listen(void *session, const char *uuid, const char *sock)
-{
-  resolve();
-  if (uuid && uuid[0]){
-    unsigned long n = 0;
-    while (uuid[n] && n < sizeof(g_cluster_uuid_str)-1){ g_cluster_uuid_str[n] = uuid[n]; n++; }
-    g_cluster_uuid_str[n] = 0;
-  }
-  if (sock && sock[0]){
-    extern int setenv(const char*,const char*,int);
-    setenv("MIB3_SHIM_ZOOM_SOCK", sock, 1);
-  }
-  g_cmd_session = session;
-  return zoom_listen_start();
-}
-/* Drain up to `max` queued steps and ship them on `session` (0 -> g_cmd_session).
- * Production calls this at the top of the cluster thread's loop; the harness
- * calls it directly.  Returns the number shipped. */
-int mib3shim_zoom_pump(void *session, int max)
-{
-  int k, sent = 0;
-  void *s = session ? session : g_cmd_session;
-  if (max <= 0) max = 4;
-  for (k = 0; k < max; k++){
-    int d = zoom_pop();
-    if (!d) break;
-    cluster_send_zoom(s, d > 0);
-    sent++;
-  }
-  if (g_zoom_qdrop){ logkv("cluster/zoom","dropped total",(u64)g_zoom_qdrop,0); g_zoom_qdrop = 0; }
-  return sent;
 }
 
 /* ---- AVCC <-> Annex-B (the refs' proven helpers) ---------------------------
@@ -1827,11 +1618,6 @@ static void *cluster_thread(void *arg){
       logkv("cluster/thread","cipher",(u64)(u32)c->cipher,0);
       while (!stop){
         long got = 0, n;
-        /* Steering-wheel zoom steps queued by the listener thread: ship them
-         * HERE, on the thread that owns a valid session (see the ZOOM block).
-         * At most 4 per iteration so a burst cannot starve the video path. */
-        { int z = mib3shim_zoom_pump(c->session, 4);
-          if (z > 0) logkv("cluster/zoom","steps shipped",(u64)(u32)z,0); }
         /* 128-byte screen header (bodySize u32 LE @0, opcode @4) */
         while (got < 128){ n = read(connfd, hdr + got, 128 - got); if (n <= 0){ logkv("cluster/thread","hdr read ended (0=EOF,1=err)",(u64)(n==0?0:1),0); logkv("cluster/thread","  bytes got",(u64)got,0); stop = 1; break; } got += n; }
         if (stop) break;
@@ -2162,11 +1948,6 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   c->keylen = keylen; c->cipher = cipher; c->counter = 0;
   c->night = g_night_mode; c->aes_inited = 0;
   g_cmd_session = session;   /* the command target once the stream connects */
-  /* the wheel->CarPlay zoom path (LANE_CLUSTER_ZOOM_2026-10-18): one listener
-   * per process, started here so it outlives per-connection cluster threads.
-   * It only QUEUES steps; the cluster thread ships them (no session lifetime
-   * contract is added). */
-  (void)zoom_listen_start();
   {
     char *cfg = (char*)(*(void**)((char*)session + 0x10));
     c->flags = cfg ? *(int*)(cfg + 0xac) : 0;
