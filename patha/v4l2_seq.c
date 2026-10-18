@@ -272,6 +272,10 @@ static int send_rgba(const unsigned char *nv12, int w, int h){
     for (j = 0; j < h; j++){
       const unsigned char *yrow = Y + (long)j*w;
       const unsigned char *urow = UV + (long)(j>>1)*w;
+      /* Rows are emitted TOP-FIRST (row 0 = top of the image).  That is the
+       * natural contract for an RGBA frame; orientation is the RENDERER's job,
+       * so the presenter's quad maps screen-top to v=0 (see QUAD in mib3egl.c).
+       * Do not flip here. */
       unsigned long o = (unsigned long)j*w;
       for (i = 0; i < w; i += 2){
         int d = (int)urow[i] - 128, e = (int)urow[i+1] - 128;

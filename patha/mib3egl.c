@@ -228,8 +228,14 @@ static const char *FS_SRC =
   "uniform sampler2D uTex;\n"
   "void main(){ gl_FragColor = texture2D(uTex, vTex); }\n";
 /* full-screen quad: x,y,u,v (NDC) */
-static const float QUAD[16] = { -1.f,-1.f, 0.f,0.f,   1.f,-1.f, 1.f,0.f,
-                                -1.f, 1.f, 0.f,1.f,   1.f, 1.f, 1.f,1.f };
+/* Quad: x,y (clip space) + u,v (texture coords).
+ * GL has y=-1 at the BOTTOM of the viewport, and the RGBA frames we receive are
+ * TOP-FIRST (row 0 = the top of the image).  So the screen top must sample v=0
+ * and the screen bottom v=1.  The original had it the other way round, which
+ * rendered every frame upside down (seen on the car 2026-10-18; invisible while
+ * the surface held a flat colour). */
+static const float QUAD[16] = { -1.f,-1.f, 0.f,1.f,   1.f,-1.f, 1.f,1.f,
+                                -1.f, 1.f, 0.f,0.f,   1.f, 1.f, 1.f,0.f };
 
 static unsigned g_tex, g_prog;
 static int g_lpos, g_ltex, g_lsamp;
