@@ -1638,6 +1638,10 @@ typedef struct {
   long night; int aes_inited;
 } cl_ctx;
 
+/* the type-111 listener we currently own (or -1).  A newer SETUP supersedes it;
+ * see the listener-ownership note in cluster_thread and own_listen. */
+static volatile int g_lsock = -1;
+
 static void *cluster_thread(void *arg){
   extern long read(int, void*, unsigned long);
   cl_ctx *c = (cl_ctx*)arg;
@@ -1647,10 +1651,38 @@ static void *cluster_thread(void *arg){
   extern int accept(int, void*, unsigned int*);
   logkv("cluster/thread","listening fd",(u64)(u32)c->lsock,0);
   logline("cluster/thread","waiting for the phone to connect");
-  if (c->lsock >= 0) connfd = accept(c->lsock, 0, 0);   /* blocking */
+  /* ---- LISTENER OWNERSHIP (stability, 2026-10-18) -------------------------
+   * The old code did ONE blocking accept() with no timeout.  If the phone never
+   * opened the type-111 stream for this session (it aborted the stream, or its
+   * SYN was dropped), this thread stayed in accept() forever and the listener
+   * kept port 5000 bound for the life of the process.  The NEXT type-111 SETUP
+   * then failed to bind 5000 (SO_REUSEADDR does not permit a second live
+   * listener) and own_listen() fell through to 6031 -- a port the unit's own
+   * firewall drops for the phone's interface (lge/app_ro/network: only
+   * "-i ncm0 --dport 5000:5001/6030/7000" are allowed).  The phone would then
+   * dial a black hole that WE advertised: the documented libairplay outcome is
+   * "the phone gave up on an advertised but unserviced cluster" (-6722/-6753,
+   * 23 s sessions).  refs/rgi hit the same class and fixed it the same way
+   * (SESSION_LIFECYCLE.md defect 4: "infinite 111 accept ... later 111 SETUP
+   * fails -6728" -> one-second accept tick rechecking the stop flag).
+   * So: accept with a short tick, and abandon the listener as soon as a newer
+   * SETUP has superseded it (g_lsock no longer points at our fd). */
+  while (c->lsock >= 0 && connfd < 0){
+    struct pollfd { int fd; short events; short revents; } pfd;
+    extern int poll(void*, unsigned long, int);
+    pfd.fd = c->lsock; pfd.events = 1 /*POLLIN*/; pfd.revents = 0;
+    { int pr = poll(&pfd, 1, 250);
+      if (g_lsock != c->lsock){ logline("cluster/thread","listener superseded -- abandoning it"); break; }
+      if (pr < 0) continue;
+      if (pr > 0 && (pfd.revents & 1)) connfd = accept(c->lsock, 0, 0);
+      /* POLLNVAL/HUP means the listener went away under us. */
+      if (pr > 0 && (pfd.revents & ~1) && connfd < 0) break;
+    }
+  }
   logkv("cluster/thread","conn fd",(u64)(u32)connfd,0);
   if (connfd >= 0){
     if (p_close){ p_close(c->lsock); }
+    if (g_lsock == c->lsock) g_lsock = -1;
     c->lsock = -1;
     logline("cluster/thread","stream connected");
     /* THE SINK STANDS UP HERE -- on this thread, NOT in the SETUP seam.  A
@@ -1866,6 +1898,16 @@ static int own_listen(int *out_port){
   chain[nc++] = 5000;
   chain[nc++] = 6031;
   chain[nc++] = 0;   /* ephemeral */
+  /* SUPERSEDE THE PREVIOUS LISTENER FIRST (stability, 2026-10-18).
+   * A listener left over from an earlier type-111 SETUP holds 5000, and
+   * SO_REUSEADDR does NOT permit a second live listener on the same port, so
+   * without this the bind would fail and we would fall through to 6031 -- a
+   * port the phone cannot reach (see the listener-ownership note in
+   * cluster_thread).  Closing it here also unsticks the old thread's poll. */
+  if (g_lsock >= 0){
+    int old = g_lsock; g_lsock = -1; close(old);
+    logkv("cluster/listen","superseded old listener fd",(u64)(u32)old,0);
+  }
   fd = socket(10 /*AF_INET6*/, 1 /*SOCK_STREAM*/, 0);
   if (fd < 0) return -1;
   setsockopt(fd, 1 /*SOL_SOCKET*/, 2 /*SO_REUSEADDR*/, &one, sizeof(one));
@@ -1885,6 +1927,7 @@ static int own_listen(int *out_port){
     if (!bound){ close(fd); return -1; }
   }
   if (listen(fd, 8) != 0){ close(fd); return -1; }
+  g_lsock = fd;                 /* we own it until a newer SETUP supersedes it */
   *out_port = 0;
   if (getsockname(fd, &got, &glen) == 0){
     *out_port = (int)(((got.port & 0xff) << 8) | (got.port >> 8));   /* ntohs */
@@ -2022,6 +2065,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   return 0;
 
 fail_sock:
+  if (g_lsock >= 0 && g_lsock == lsock) g_lsock = -1;
   if (p_close && lsock >= 0) p_close(lsock);
   return -1;
 }
