@@ -187,6 +187,16 @@ static unsigned long g_rdrop = 0;
 static unsigned long g_adrop = 0;
 static unsigned long g_capret = 0;   /* capture buffers returned (flush or real) */
 static unsigned long g_qfail  = 0;   /* output QBUF failures */
+extern long time(long *);
+struct my_tv2 { long s, us; };
+extern int gettimeofday(struct my_tv2 *, void *);
+static long g_send_ms = 0;                     /* ms: convert+write for the last frame */
+static long t_out=0, t_cap=0, t_rd=0, t_feed=0, n_loop=0, g_tmark=0;   /* loop timing buckets */
+static long now_ms(void){ struct my_tv2 t; gettimeofday(&t, 0); return t.s*1000 + t.us/1000; }
+static long g_conns = 0;             /* helper connections accepted this process */
+static long g_last_gone = 0;         /* time() the shim last disconnected */
+static unsigned long g_kdrop = 0;    /* dropped: no keyframe / no sequence header yet */
+static unsigned long g_qdrop = 0;    /* dropped: output queue full */
 static char g_rsockpath[108];
 static char g_in_sock[108];
 static unsigned char *g_rgba = 0;
@@ -209,6 +219,15 @@ static void rgba_connect(void){
    * partial frame is harmless -- we just drop that frame. */
   { struct { long s; long us; } tv; tv.s = 0; tv.us = 60000;
     setsockopt(g_rsock, 1 /*SOL_SOCKET*/, 21 /*SO_SNDTIMEO*/, &tv, sizeof(tv)); }
+  /* A 2.4 MB RGBA frame over the default 208 KB socket buffer cannot be written
+   * without blocking: the presenter only drains the socket once per render tick
+   * (30 fps) => 208 KB*30/s = 6.2 MB/s => a 2.6 fps ceiling for 2.4 MB frames.
+   * The decoder then blocks mid-send, stops reading the AU socket, the shim's
+   * 200 ms timeout fires, AUs are dropped, the P-chain breaks and the cluster
+   * garbles (measured 2026-10-18: 9 frames with the presenter vs 102 without).
+   * Queue a whole frame instead, so presentation can NEVER throttle decoding. */
+  { int sndbuf = 4 << 20;
+    setsockopt(g_rsock, 1 /*SOL_SOCKET*/, 7 /*SO_SNDBUF*/, &sndbuf, sizeof(sndbuf)); }
 }
 static int send_testpat(int w, int h){
   int x, y; long o;
@@ -246,31 +265,38 @@ static int send_rgba(const unsigned char *nv12, int w, int h){
   if (g_rsock < 0) rgba_connect();
   if (g_rsock < 0) return -1;
   if (!g_rgba){ g_rgba = (unsigned char*)malloc((unsigned long)w*h*4); if (!g_rgba) return -1; }
-  for (j=0;j<h;j++){
-    int cj = (j>>1)*cw;
-    for (i=0;i<w;i++){
-      int yy = Y[(long)j*w+i];
-      int ci = (cj + (i>>1))*2;
-      int uu = UV[ci], vv = UV[ci+1];
-      int c = yy - 16, d = uu - 128, e = vv - 128;
-      int r, g, b; long o;
-      if (c < 0) c = 0;
-      r = (298*c + 409*e + 128) >> 8;
-      g = (298*c - 100*d - 208*e + 128) >> 8;
-      b = (298*c + 516*d + 128) >> 8;
-      o = ((long)j*w + i)*4;
-      g_rgba[o]   = (unsigned char)(r<0?0:(r>255?255:r));
-      g_rgba[o+1] = (unsigned char)(g<0?0:(g>255?255:g));
-      g_rgba[o+2] = (unsigned char)(b<0?0:(b>255?255:b));
-      g_rgba[o+3] = 255;
+  /* FAST PATH: two pixels per chroma sample, packed 32-bit stores.
+   * The original per-pixel version cost ~32 ms/frame (measured 2026-10-18),
+   * which throttled the whole pipeline to ~4 fps. */
+  { unsigned int *out = (unsigned int*)g_rgba;
+    for (j = 0; j < h; j++){
+      const unsigned char *yrow = Y + (long)j*w;
+      const unsigned char *urow = UV + (long)(j>>1)*w;
+      unsigned long o = (unsigned long)j*w;
+      for (i = 0; i < w; i += 2){
+        int d = (int)urow[i] - 128, e = (int)urow[i+1] - 128;
+        int dr = 409*e + 128, dg = -100*d - 208*e + 128, db = 516*d + 128;
+        int k, cy;
+        for (k = 0; k < 2; k++){
+          int r, g, b;
+          cy = (int)yrow[i+k] - 16; if (cy < 0) cy = 0; cy *= 298;
+          r = (cy + dr) >> 8; g = (cy + dg) >> 8; b = (cy + db) >> 8;
+          r = r < 0 ? 0 : (r > 255 ? 255 : r);
+          g = g < 0 ? 0 : (g > 255 ? 255 : g);
+          b = b < 0 ? 0 : (b > 255 ? 255 : b);
+          out[o+i+k] = (unsigned int)r | ((unsigned int)g << 8)
+                     | ((unsigned int)b << 16) | 0xff000000u;
+        }
+      }
     }
   }
-  { long total = (long)w*h*4, off = 0;
+  { long total = (long)w*h*4, off = 0; long t0 = now_ms();
     while (off < total){
       long wr = write(g_rsock, g_rgba+off, (unsigned long)(total-off));
-      if (wr <= 0){ close(g_rsock); g_rsock = -1; return -1; }
+      if (wr <= 0){ close(g_rsock); g_rsock = -1; g_send_ms = now_ms()-t0; return -1; }
       off += wr;
-    } }
+    }
+    g_send_ms = now_ms()-t0; }
   return 0;
 }
 static int g_ts = 0;          /* V4L2_TS=1 -> stamp output buffers (msm may require it) */
@@ -333,6 +359,20 @@ static int prime_output(int fd, u32 memtype, void **outbuf, int *outfd,
     primed++; (*feed_i)++;
   }
   return primed;
+}
+
+/* Classify an access unit: does it carry a slice? an IDR? (Annex-B scan) */
+static void au_scan(const unsigned char *p, unsigned long n, int *has_slice, int *has_idr, int *has_sps){
+  unsigned long k = 0; *has_slice = 0; *has_idr = 0; *has_sps = 0;
+  while (k + 3 < n){
+    if (p[k] == 0 && p[k+1] == 0 && p[k+2] == 1){
+      unsigned t = p[k+3] & 0x1f;
+      if (t == 1 || t == 5){ *has_slice = 1; if (t == 5) *has_idr = 1; }
+      if (t == 7) *has_sps = 1;
+      k += 3; continue;
+    }
+    k++;
+  }
 }
 
 /* ---- the VENDOR's SECOND SETUP PASS -------------------------------------
@@ -614,6 +654,7 @@ int main(int argc, char **argv){
    * We decode each AU on the hw decoder and push RGBA to mib3egl's presenter. */
   if (g_in_sock[0]){
     int lfd, cfd = -1, nfree = 0, freeidx[OUTN_MAX], i2, restart_pending = 0;
+    unsigned char *pend; unsigned long cfg_len = 0; int seen_idr = 0, cfg_fed = 0; long kwait = 0;
     unsigned char *abuf; unsigned long alen = 0, acap = (2u<<20);
     long nframes = 0;
     struct { unsigned short fam; char path[108]; } sa;
@@ -627,6 +668,8 @@ int main(int argc, char **argv){
     chmod(g_in_sock, 0777);
     abuf = (unsigned char*)malloc(acap);
     if (!abuf) return 1;
+    pend = (unsigned char*)malloc(8192);
+    if (!pend) return 1;
     P("  online: listening on "); P(g_in_sock); P("\n");
     for (i2=0;i2<OUTN;i2++) freeidx[nfree++] = i2;
     { int t = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE; Prc("  online STREAMON output", ioctl(fd, VIDIOC_STREAMON, &t)); }
@@ -674,6 +717,7 @@ int main(int argc, char **argv){
         usleep(4000);
         continue;
       }
+      g_tmark = now_ms();
       for (;;){
         struct v4l2_buffer b; struct v4l2_plane p1; int z3;
         for (z3=0;z3<(int)sizeof(b);z3++) ((char*)&b)[z3]=0;
@@ -683,6 +727,7 @@ int main(int argc, char **argv){
         if (nfree < OUTN) freeidx[nfree++] = (int)b.index;
         did = 1;
       }
+      t_out += now_ms() - g_tmark; g_tmark = now_ms();
       for (;;){
         struct v4l2_buffer b; struct v4l2_plane pl[2]; int z, isreal;
         for (z=0;z<(int)sizeof(b);z++) ((char*)&b)[z]=0;
@@ -703,7 +748,8 @@ int main(int argc, char **argv){
           lum = k ? (lum / (unsigned long)k) : 0;
           nframes++;
           if (nframes<=8 || (nframes%50)==0){
-            P("  FRAME "); Pv(nframes); P(" luma="); Pv((long)lum); P(" drops="); Pv((long)g_rdrop); P(" auskip="); Pv((long)g_adrop); P("\n");
+            P("  FRAME "); Pv(nframes); P(" luma="); Pv((long)lum); P(" drops="); Pv((long)g_rdrop); P(" auskip="); Pv((long)g_adrop);
+            P(" send="); Pv(g_send_ms); P("ms\n");
           }
           if (g_rsockpath[0]) send_rgba((const unsigned char*)capbuf[b.index], w, h);
         }
@@ -717,16 +763,56 @@ int main(int argc, char **argv){
           ioctl(fd, VIDIOC_QBUF, &b2); }
         did = 1;
       }
+      t_cap += now_ms() - g_tmark; g_tmark = now_ms();
       if (cfd < 0){
         int c = accept(lfd, 0, 0);
         if (c >= 0){
-          struct { long s; long us; } tv; tv.s = 0; tv.us = 20000;
+          struct { long s; long us; } tv; tv.s = 0; tv.us = 1000;
+          /* 1 ms, NOT 20 ms: this read is at the top of the loop and a blocking
+           * 20 ms timeout meant ~50 ms per iteration (measured 2026-10-18),
+           * which capped the whole pipeline at a few fps no matter how fast the
+           * decoder or the presenter were. */
           setsockopt(c, 1 /*SOL_SOCKET*/, 20 /*SO_RCVTIMEO*/, &tv, sizeof(tv));
           cfd = c; P("  online: shim CONNECTED\n");
-          /* EVERY fresh connection needs the parse-flush + capture renegotiate:
-           * a new decoder session starts from scratch (no reference frames), so
-           * the fix has to re-arm here, not once per process. */
-          if (envnum("V4L2_ONLINE_FIX",1)) restart_pending = 1;
+          /* Do NOT reset the keyframe gate here.  A transient reconnect (the
+           * phone's CarPlay link dropping -- measured at 8 connections and 7
+           * disconnects in one session) does NOT invalidate the decoder's
+           * reference frames, and resetting made us throw away every AU until
+           * the phone happened to send another keyframe: kdrop=1749, one frame
+           * decoded, then a frozen picture.  The gate is reset only when the
+           * sequence header CHANGES (i.e. a genuinely new stream) -- see the
+           * cfg-change detection in the parse loop. */
+          /* Renegotiate the capture port for a genuinely NEW stream -- NOT for a
+           * transient reconnect.  THE STORM (measured live 2026-10-18): the
+           * renegotiate makes us stop reading the socket for ~100 ms, the shim's
+           * 200 ms SO_SNDTIMEO fires, it drops the AU and reconnects, and with
+           * per-connection renegotiation that becomes a storm -- auskip climbed
+           * past 1200 and the decoded frames came out black, because the phone's
+           * stream is P-slices only (one IDR at frame 1) and each restart throws
+           * the reference frames away.  So: always on the first connection, and
+           * afterwards only after a real gap (V4L2_RESTART_GAP seconds). */
+          if (envnum("V4L2_ONLINE_FIX",1)){
+            long now = time(0);
+            long gap = (long)envnum("V4L2_RESTART_GAP", 0);
+            /* FIRST CONNECTION ONLY (measured live 2026-10-18).  The
+             * renegotiate is safe only while NOTHING has been fed to the
+             * driver yet: it tears the capture queue down (STREAMOFF +
+             * REQBUFS(0)), and doing that MID-STREAM wedges the output queue
+             * for good -- the driver then returns no output buffers and no
+             * capture buffers, feed freezes and every later AU is dropped
+             * (feed=37, nfree=0, frames frozen).  The first-connection pass
+             * works because the output queue is still empty (that is the run
+             * that produced real frames).
+             * So: one renegotiate per decoder PROCESS.  A new phone session
+             * must get a NEW decoder process (restart it), not a second
+             * renegotiate.  V4L2_RESTART_GAP=<secs> re-enables the old
+             * gap-gated behaviour for experiments only. */
+            if (g_conns == 0 || (gap > 0 && g_last_gone && (now - g_last_gone) >= gap)){
+              restart_pending = 1;
+              P("  online: FIRST CONNECTION -> renegotiate\n");
+            } else P("  online: later connection -> feed as-is (do NOT renegotiate mid-stream)\n");
+            g_conns++;
+          }
         }
       }
       if (cfd >= 0){
@@ -736,9 +822,10 @@ int main(int argc, char **argv){
         else if (r == 0){
           P("  online: shim gone (alen="); Pv((long)alen); P(" space="); Pv((long)space);
           P(" nfree="); Pv((long)nfree); P(")\n");
-          close(cfd); cfd = -1; alen = 0;
+          close(cfd); cfd = -1; alen = 0; g_last_gone = time(0);
         }
       }
+      t_rd += now_ms() - g_tmark; g_tmark = now_ms();
       { unsigned long off = 0;
         while (alen - off >= 16){
           unsigned magic = 0; unsigned long ln = 0; int k;
@@ -748,27 +835,75 @@ int main(int argc, char **argv){
           if (alen - off < 16 + ln) break;
           g_aparse++;
           if (g_au_fd >= 0 && g_au_n < 6000){ write(g_au_fd, abuf+off+16, ln); g_au_n++; }
-          /* Never STALL on a full decoder queue: if no output buffer is free,
-           * drop this AU and keep draining the socket.  Stalling left alen
-           * growing to ~200 KB, which shrank our reads until the socket
-           * back-pressured into the shim's 200 ms send timeout (the storm).
-           * Dropping is safe here because the shim now stamps every AU with
-           * the parameter sets and re-requests a keyframe on (re)connect. */
-          if (nfree <= 0){ off += 16 + ln; g_adrop++; continue; }
-          { int idx = freeidx[--nfree];
-            struct v4l2_buffer b3; struct v4l2_plane pl3; int z4; unsigned long j, n2;
-            n2 = (ln < OUTBUF_SZ) ? ln : OUTBUF_SZ;
-            for (j=0;j<n2;j++) ((unsigned char*)outbuf[idx])[j] = abuf[off+16+j];
-            for (z4=0;z4<(int)sizeof(b3);z4++) ((char*)&b3)[z4]=0;
-            for (z4=0;z4<(int)sizeof(pl3);z4++) ((char*)&pl3)[z4]=0;
-            setplane(&pl3, (unsigned long)outbuf[idx], outfd[idx], outshare[idx], (u32)outlen[idx], (u32)n2);
-            b3.index=(u32)idx; b3.type=V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE; b3.memory=memtype;
-            b3.m.planes=&pl3; b3.length=1; b3.bytesused=(u32)n2;
-            if (g_ts){ b3.flags = 0x4000u; b3.timestamp.tv_sec = 0; b3.timestamp.tv_usec = (g_tsctr++) * 33333; }
-            if (ioctl(fd, VIDIOC_QBUF, &b3) == 0) g_afeed++;
-            else { g_qfail++; freeidx[nfree++] = idx;    /* hand the buffer back */
-              if (g_qfail <= 6){ P("  QBUF out FAIL idx="); Pv(idx); P(" len="); Pv((long)n2);
-                                 P(" errno="); Pv((long)ERRNO); P("\n"); } } }
+          /* Assemble ONE access unit per output buffer, and never start on a
+           * P-slice.  Two defects measured live 2026-10-18:
+           *  (1) the shim sends the SPS/PPS as its OWN record, so the parameter
+           *      sets arrived as a separate buffer AFTER the first IDR -- that
+           *      IDR was parameter-set-less, the firmware could not decode it,
+           *      it held every output buffer and the whole stream wedged
+           *      (capret=0, nfree=0, feed frozen at 10).
+           *  (2) a parameter-set-only record also breaks the vendor's "one AU
+           *      per buffer" rule and wastes an output buffer.
+           * The phone's GOP is ~65 frames (one IDR every ~6.5 s at 10 fps), and
+           * the stream starts mid-GOP, so we must WAIT for a keyframe rather
+           * than feed P-slices at a decoder that has no reference. */
+          { const unsigned char *rp = abuf + off + 16; unsigned long rl = ln;
+            int hs = 0, hi = 0, hsp = 0;
+            au_scan(rp, rl, &hs, &hi, &hsp);
+            if (!hs){                       /* parameter sets / SEI: remember them --
+              * but only forward them when the sequence CHANGES.  Stamping the
+              * SPS/PPS onto EVERY AU made the firmware re-parse the sequence
+              * header per frame, fall behind, hold its output buffers and force
+              * ~88% of frames to be dropped (parse=3204 feed=196, measured
+              * live 2026-10-18) -- that was the artifacting. */
+              int same = (cfg_len == rl); unsigned long q;
+              if (same && rl){ for (q=0;q<rl;q++) if (pend[q] != rp[q]){ same = 0; break; } }
+              if (!same){
+                if (rl <= 8192){ for (q=0;q<rl;q++) pend[q] = rp[q]; cfg_len = rl; }
+                else cfg_len = 0;
+                cfg_fed = 0;                /* a new sequence header must go out */
+                seen_idr = 0; kwait = 0;    /* ...and a new sequence needs its keyframe */
+              }
+              off += 16 + ln; continue;
+            }
+            /* first feed requires a keyframe AND its sequence header -- but never
+             * wait for one forever: this phone emitted only 2 keyframes in 1761
+             * slices (measured 2026-10-18), so a closed gate that waits for one
+             * starves the picture indefinitely.  After 3 s, feed best-effort. */
+            if (!seen_idr){
+              if (cfg_len == 0 && !hsp){ off += 16 + ln; g_kdrop++; g_adrop++; continue; }  /* no parameter sets yet */
+              if (!hi){
+                long nw = time(0);
+                if (!kwait) kwait = nw;
+                if ((nw - kwait) < 3){ off += 16 + ln; g_kdrop++; g_adrop++; continue; }
+                P("  online: keyframe wait timed out -> feeding best-effort\n");
+              } else P("  online: keyframe WITH sequence header -> decoding\n");
+              seen_idr = 1;               /* fall through and feed this AU */
+            }
+            if (nfree <= 0){ off += 16 + ln; g_qdrop++; g_adrop++; continue; }
+            { int idx = freeidx[--nfree];
+              struct v4l2_buffer b3; struct v4l2_plane pl3; int z4; unsigned long j, used = 0, n2, pfx;
+              pfx = cfg_fed ? 0 : cfg_len;
+              for (j=0;j<pfx && used < OUTBUF_SZ;j++) ((unsigned char*)outbuf[idx])[used++] = pend[j];
+              n2 = (rl < OUTBUF_SZ - used) ? rl : OUTBUF_SZ - used;
+              for (j=0;j<n2;j++) ((unsigned char*)outbuf[idx])[used+j] = rp[j];
+              used += n2;
+              for (z4=0;z4<(int)sizeof(b3);z4++) ((char*)&b3)[z4]=0;
+              for (z4=0;z4<(int)sizeof(pl3);z4++) ((char*)&pl3)[z4]=0;
+              setplane(&pl3, (unsigned long)outbuf[idx], outfd[idx], outshare[idx], (u32)outlen[idx], (u32)used);
+              b3.index=(u32)idx; b3.type=V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE; b3.memory=memtype;
+              b3.m.planes=&pl3; b3.length=1; b3.bytesused=(u32)used;
+              if (g_ts){ b3.flags = 0x4000u; b3.timestamp.tv_sec = 0; b3.timestamp.tv_usec = (g_tsctr++) * 33333; }
+              if (ioctl(fd, VIDIOC_QBUF, &b3) == 0){
+                g_afeed++;
+                if (pfx) cfg_fed = 1;
+                if (hi){ if (!seen_idr) P("  online: first keyframe WITH sequence header -> decoding\n");
+                         seen_idr = 1; }
+              }
+              else { g_qfail++; freeidx[nfree++] = idx;
+                if (g_qfail <= 6){ P("  QBUF out FAIL idx="); Pv(idx); P(" len="); Pv((long)used);
+                                   P(" errno="); Pv((long)ERRNO); P("\n"); } } }
+            }
           off += 16 + ln;
         }
         if (off){ unsigned long k2; for (k2=0;k2<alen-off;k2++) abuf[k2]=abuf[off+k2]; alen -= off; }
@@ -804,13 +939,16 @@ int main(int argc, char **argv){
         vendor_restart(fd, memtype, capbuf, capfd, capshare, capsz0, capsz1,
                        (u32)w, (u32)h, capfcc, CAPN);
       }
+      t_feed += now_ms() - g_tmark; n_loop++;
       if (!did) usleep(2000);
       { static unsigned long st = 0;
-        if ((++st % 400) == 0){
+        if ((++st % 200) == 0){
           P("  STATUS parse="); Pv((long)g_aparse); P(" feed="); Pv((long)g_afeed);
           P(" qfail="); Pv((long)g_qfail); P(" capret="); Pv((long)g_capret);
-          P(" skip="); Pv((long)g_adrop); P(" nfree="); Pv((long)nfree);
-          P(" frames="); Pv((long)nframes); P(" alen="); Pv((long)alen); P("\n");
+          P(" kdrop="); Pv((long)g_kdrop); P(" qdrop="); Pv((long)g_qdrop);
+          P(" frames="); Pv((long)nframes); P(" nfree="); Pv((long)nfree); P(" alen="); Pv((long)alen); P("\n");
+          if (n_loop){ P("  TIMING/iter out="); Pv(t_out*1000/n_loop); P("us cap="); Pv(t_cap*1000/n_loop);
+            P("us read="); Pv(t_rd*1000/n_loop); P("us feed="); Pv(t_feed*1000/n_loop); P("us  iters="); Pv(n_loop); P("\n"); }
         } }
     }
     { int t; t=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; ioctl(fd, VIDIOC_STREAMOFF, &t);
@@ -959,6 +1097,7 @@ int main(int argc, char **argv){
           ioctl(fd, VIDIOC_QBUF, &b2); }
       }
       /* reclaim spent output buffers and feed more */
+      g_tmark = now_ms();
       for (;;){
         struct v4l2_buffer b; struct v4l2_plane p1; int z3;
         for (z3=0;z3<(int)sizeof(b);z3++) ((char*)&b)[z3]=0;
