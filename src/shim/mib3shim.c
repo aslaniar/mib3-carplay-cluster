@@ -1453,7 +1453,15 @@ static int ship_cmd(void *session, const char *type, CFMutableDictionaryRef para
   if (!cmd) return -1;
   int rc = -1;
   {
-    CFStringRef kt = sstr(type), kp = sstr("params"), vt = sstr(type);
+    /* KEY BUG FOUND 2026-10-18 by the new command-capture bench (harness/
+     * libstubcmd.c): this used to pass `sstr(type)` as the dictionary KEY, so
+     * every command went out as {"<name>": "<name>", "params": {...}} -- with
+     * NO "type" key at all.  Both reference receivers build
+     * {"type": "<name>", "params": {...}} (playport AirPlaySession.kt:139,
+     * rgi altscreen_hook.c alt_ship) and iOS dispatches on that key.
+     * `showUI`/`forceKeyFrame`/`setNightMode`/`changeMapZoomLevel` were all
+     * therefore shipped in a shape the phone does not recognise. */
+    CFStringRef kt = sstr("type"), kp = sstr("params"), vt = sstr(type);
     if (kt && kp && vt && params){
       p_CFDictionarySetValue(cmd, kt, vt);
       p_CFDictionarySetValue(cmd, kp, params);
