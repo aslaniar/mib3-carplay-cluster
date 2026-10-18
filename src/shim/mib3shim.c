@@ -1619,7 +1619,7 @@ static void *cluster_thread(void *arg){
       while (!stop){
         long got = 0, n;
         /* 128-byte screen header (bodySize u32 LE @0, opcode @4) */
-        while (got < 128){ n = read(connfd, hdr + got, 128 - got); if (n <= 0){ stop = 1; break; } got += n; }
+        while (got < 128){ n = read(connfd, hdr + got, 128 - got); if (n <= 0){ logkv("cluster/thread","hdr read ended (0=EOF,1=err)",(u64)(n==0?0:1),0); logkv("cluster/thread","  bytes got",(u64)got,0); stop = 1; break; } got += n; }
         if (stop) break;
         {
           unsigned bs = (unsigned)(unsigned char)hdr[0] | ((unsigned)(unsigned char)hdr[1] << 8) |
@@ -1640,7 +1640,7 @@ static void *cluster_thread(void *arg){
             } else { logline("cluster/thread","no malloc"); break; }
           }
           got = 0;
-          while (got < (long)bs){ n = read(connfd, rbuf + got, (long)bs - got); if (n <= 0){ stop = 1; break; } got += n; }
+          while (got < (long)bs){ n = read(connfd, rbuf + got, (long)bs - got); if (n <= 0){ logkv("cluster/thread","body read ended (0=EOF,1=err)",(u64)(n==0?0:1),0); logkv("cluster/thread","  bodySize",(u64)bs,0); logkv("cluster/thread","  bytes got",(u64)got,0); stop = 1; break; } got += n; }
           if (stop) break;
           if (op == 1){
             /* codec config: UNENCRYPTED avcC (rgi avcc_config.h; the phone also
@@ -1737,7 +1737,20 @@ static void *cluster_thread(void *arg){
               logkv("cluster/thread","plain",(u64)pl,0);
               logline("cluster/thread/plain-head", hs);   /* want 00000001 (Annex-B NAL) */
             }
-          } else others++;   /* opcodes 2/4/5: keepalive/misc -- ignore (rgi) */
+          } else {
+            others++;   /* opcodes 2/4/5: keepalive/misc -- previously ignored.
+                         * Navigation start drops the whole session, and control
+                         * traffic is the prime suspect, so LOG ALL OF IT. */
+            { const char *H = "0123456789abcdef"; int k; char hs[96]; char bh[192];
+              unsigned lim = 48, bl = (bs < 64u) ? (unsigned)bs : 64u;
+              for (k = 0; k < (int)lim; k++){ unsigned char cc = hdr[k]; hs[k*2] = H[cc>>4]; hs[k*2+1] = H[cc&15]; }
+              hs[lim*2] = 0;
+              for (k = 0; k < (int)bl; k++){ unsigned char cc = rbuf[k]; bh[k*2] = H[cc>>4]; bh[k*2+1] = H[cc&15]; }
+              bh[bl*2] = 0;
+              logkv("cluster/ctl","opcode",(u64)op,0);
+              logkv("cluster/ctl","bodySize",(u64)bs,0);
+              logline("cluster/ctl/hdr-head", hs);
+              logline("cluster/ctl/body-head", bh); } }
         }
       }
       logkv("cluster/thread","frames total",(u64)frames,0);
