@@ -185,6 +185,8 @@ static unsigned long g_aparse = 0, g_afeed = 0;
 static int  g_rsock = -1;
 static unsigned long g_rdrop = 0;
 static unsigned long g_adrop = 0;
+static unsigned long g_capret = 0;   /* capture buffers returned (flush or real) */
+static unsigned long g_qfail  = 0;   /* output QBUF failures */
 static char g_rsockpath[108];
 static char g_in_sock[108];
 static unsigned char *g_rgba = 0;
@@ -307,6 +309,101 @@ static int sfmt(int fd, u32 type, u32 w, u32 h, u32 fcc, u32 npl, u32 psz0, u32 
   return rc;
 }
 
+/* Queue the first OUTN access units into the output buffers.  Extracted so the
+ * vendor's second pass can re-prime from AU 0 after it renegotiates the capture
+ * queue (the renegotiate reclaims the output buffers we primed in the parse
+ * pass; with none queued the driver never returns one and we would deadlock). */
+static int prime_output(int fd, u32 memtype, void **outbuf, int *outfd,
+                        int *outshare, unsigned long *outlen, long *aub,
+                        const unsigned char *fdata, int nau, int *feed_i, int outn){
+  int primed = 0, i, z;
+  for (i=0;i<outn && *feed_i<nau;i++){
+    struct v4l2_buffer b; struct v4l2_plane pl; u32 used; long lo, hi, j;
+    lo = aub[*feed_i]; hi = aub[*feed_i+1]; used = (u32)(hi-lo);
+    if (used > OUTBUF_SZ) used = OUTBUF_SZ;
+    for (j=0;j<(long)used;j++) ((unsigned char*)outbuf[i])[j] = fdata[lo+j];
+    for (z=0;z<(int)sizeof(b);z++) ((char*)&b)[z]=0;
+    for (z=0;z<(int)sizeof(pl);z++) ((char*)&pl)[z]=0;
+    setplane(&pl, (unsigned long)outbuf[i], outfd[i], outshare[i], (u32)outlen[i], used);
+    b.index=(u32)i; b.type=V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE; b.memory=memtype;
+    b.m.planes=&pl; b.length=1; b.bytesused=used;
+    if (g_ts){ b.flags = 0x4000u; b.timestamp.tv_sec = 0; b.timestamp.tv_usec = (g_tsctr++) * 33333; }
+    if (ioctl(fd, VIDIOC_QBUF, &b) != 0){ P("  QBUF out fail idx="); Pv(i);
+      P(" used="); Pv((long)used); P(" errno="); Pv((long)ERRNO); P("\n"); break; }
+    primed++; (*feed_i)++;
+  }
+  return primed;
+}
+
+/* ---- the VENDOR's SECOND SETUP PASS -------------------------------------
+ * data/v4l2_vendor_ref_20261017.txt lines 138-152.  After the first input
+ * buffer has been parsed the driver FLUSHES the whole capture queue (every
+ * buffer comes back DONE with bytesused=0) and expects the client to
+ * renegotiate it: the same REQBUFS(1) that granted 20 in the first pass grants
+ * only 6 afterwards -- the driver now knows the stream's real DPB size.  Only
+ * after that pass does the vendor see real frames (DONE|KEYFRAME on output,
+ * DONE|PFRAME on capture).
+ *
+ * We never did this, which is fine for a stream whose first SPS matches the
+ * format we already set, and fatal for one that makes the driver re-evaluate.
+ * Gated by V4L2_RESTART=1 (default off: keep the proven path the default).
+ * Returns the number of live capture buffers, or -1. */
+static int vendor_restart(int fd, u32 memtype, void **capbuf, int *capfd,
+                          int *capshare, u32 capsz0, u32 capsz1,
+                          u32 w, u32 h, u32 capfcc, int want){
+  struct v4l2_requestbuffers rb; int t, rc, i, z, n, okp = 0, okq = 0;
+  P("--- vendor second setup pass (renegotiate capture) ---\n");
+  t = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+  Prc("  STREAMOFF capture", ioctl(fd, VIDIOC_STREAMOFF, &t));
+  for (z=0;z<(int)sizeof(rb);z++) ((char*)&rb)[z]=0;
+  rb.count=0; rb.type=(u32)t; rb.memory=memtype;
+  rc = ioctl(fd, VIDIOC_REQBUFS, &rb);
+  P("  REQBUFS cap(0) rc="); Pv(rc); if (rc){ P(" errno="); Pv((long)ERRNO); } P("\n");
+  for (z=0;z<(int)sizeof(rb);z++) ((char*)&rb)[z]=0;
+  rb.count=(u32)want; rb.type=(u32)t; rb.memory=memtype;
+  rc = ioctl(fd, VIDIOC_REQBUFS, &rb);
+  if (rc != 0){                        /* a flush still in flight refuses this */
+    int tryn;
+    for (tryn=0; tryn<4 && rc!=0; tryn++){ usleep(50000);
+      for (z=0;z<(int)sizeof(rb);z++) ((char*)&rb)[z]=0;
+      rb.count=(u32)want; rb.type=(u32)t; rb.memory=memtype;
+      rc = ioctl(fd, VIDIOC_REQBUFS, &rb); }
+  }
+  P("  REQBUFS cap ask="); Pv(want); P(" rc="); Pv(rc); if (rc){ P(" errno="); Pv((long)ERRNO); }
+  P(" granted="); Pv((long)rb.count); P("\n");
+  n = (int)rb.count;
+  if (n <= 0 || n > CAPN_MAX){ P("  !! renegotiate gave no capture buffers\n"); return -1; }
+  /* the vendor re-does the capture S_FMT here (G_FMT then S_FMT) */
+  sfmt(fd, (u32)t, w, h, capfcc, 1, (u32)(w*h*3/2), w, 16384);
+  for (i=0;i<n;i++){
+    struct v4l2_buffer b; struct v4l2_plane pl[2];
+    for (z=0;z<(int)sizeof(b);z++) ((char*)&b)[z]=0;
+    for (z=0;z<(int)sizeof(pl);z++) ((char*)&pl)[z]=0;
+    setplane(&pl[0], (unsigned long)capbuf[i], capfd[i], capshare[i], capsz0, 0);
+    setplane(&pl[1], (unsigned long)capbuf[i]+(unsigned long)capsz0, capfd[i], capshare[i], capsz1, 0);
+    b.index=(u32)i; b.type=(u32)t; b.memory=memtype; b.m.planes=pl; b.length=2;
+    if (ioctl(fd, VIDIOC_PREPARE_BUF, &b) == 0) okp++;
+  }
+  Pk("  restart PREPARE_BUF ok", okp);
+  Prc("  STREAMON capture", ioctl(fd, VIDIOC_STREAMON, &t));
+  { struct v4l2_control c; c.id=0x99201a; c.value=2;
+    Prc("  S_CTRL 0x99201a=2", ioctl(fd, VIDIOC_S_CTRL, &c)); }
+  for (i=0;i<n;i++){
+    struct v4l2_buffer b; struct v4l2_plane pl[2];
+    for (z=0;z<(int)sizeof(b);z++) ((char*)&b)[z]=0;
+    for (z=0;z<(int)sizeof(pl);z++) ((char*)&pl)[z]=0;
+    setplane(&pl[0], (unsigned long)capbuf[i], capfd[i], capshare[i], capsz0, 0);
+    setplane(&pl[1], (unsigned long)capbuf[i]+(unsigned long)capsz0, capfd[i], capshare[i], capsz1, 0);
+    b.index=(u32)i; b.type=(u32)t; b.memory=memtype; b.m.planes=pl; b.length=2;
+    if (ioctl(fd, VIDIOC_QBUF, &b) == 0) okq++;
+  }
+  Pk("  restart QBUF cap ok", okq);
+  { struct v4l2_control c; c.id=0x99201a; c.value=0;
+    Prc("  S_CTRL 0x99201a=0", ioctl(fd, VIDIOC_S_CTRL, &c)); }
+  Pk("  restart live capture buffers", (long)n);
+  return n;
+}
+
 int main(int argc, char **argv){
   const char *path = (argc>1)?argv[1]:"/tmp/kit/real.264";
   int maxchunk = (argc>2)?my_atoi(argv[2]):200;
@@ -350,6 +447,7 @@ int main(int argc, char **argv){
     if (da && da[0]) g_au_fd = open(da, 0101 | 01000, 0644); }
   int loopfile = envnum("V4L2_LOOP",0) ? 1 : 0;
   int testpat  = envnum("V4L2_TESTPAT",0) ? 1 : 0;
+  int do_restart = envnum("V4L2_RESTART",0) ? 1 : 0;
   { char *iv = getenv("V4L2_IONFLAG"); if (iv && iv[0]){ unsigned int r=0; int k=0;
       if (iv[0]=='0'&&(iv[1]=='x'||iv[1]=='X')){ k=2; for(;iv[k];k++){ int d; char c=iv[k]; if(c>='0'&&c<='9')d=c-'0'; else if(c>='a'&&c<='f')d=c-'a'+10; else if(c>='A'&&c<='F')d=c-'A'+10; else break; r=r*16+(unsigned)d; } }
       else { for(;iv[k]>='0'&&iv[k]<='9';k++) r=r*10+(unsigned)(iv[k]-'0'); }
@@ -515,7 +613,7 @@ int main(int argc, char **argv){
    *   then `len` bytes of Annex-B access unit.
    * We decode each AU on the hw decoder and push RGBA to mib3egl's presenter. */
   if (g_in_sock[0]){
-    int lfd, cfd = -1, nfree = 0, freeidx[OUTN_MAX], i2;
+    int lfd, cfd = -1, nfree = 0, freeidx[OUTN_MAX], i2, restart_pending = 0;
     unsigned char *abuf; unsigned long alen = 0, acap = (2u<<20);
     long nframes = 0;
     struct { unsigned short fam; char path[108]; } sa;
@@ -546,6 +644,27 @@ int main(int argc, char **argv){
         r4 = ioctl(fd, VIDIOC_DECODER_CMD, d);
         P("  online DECODER_CMD rc="); Pv(r4); P("\n");
       } }
+    if (do_restart){
+      int nlive = vendor_restart(fd, memtype, capbuf, capfd, capshare,
+                                 capsz0, capsz1, (u32)w, (u32)h, capfcc, CAPN);
+      if (nlive > 0) Pk("  online restart live cap bufs", (long)nlive);
+    }
+    /* ---- the LIVE fix -----------------------------------------------------
+     * Two defects were isolated by ablation on 2026-10-17 (see
+     * data/ablate_results_20261017.txt):
+     *   (a) the driver returns NOTHING AT ALL (0 capture buffers) until it is
+     *       sent the flush command.  We used to send it only when the driver
+     *       raised a DQEVENT, and on this stream it never does -> the chain was
+     *       dead before it started.  The vendor sends it unconditionally after
+     *       STREAMON.
+     *   (b) the flush alone still yields 0 real frames: the capture port must be
+     *       RE-NEGOTIATED after the decoder has ingested bitstream data
+     *       (STREAMOFF -> REQBUFS(0) -> REQBUFS -> S_FMT -> PREPARE -> STREAMON
+     *       -> S_CTRL 0x99201a=2 -> QBUF -> S_CTRL 0x99201a=0).  Only then does
+     *       the hardware emit frames.
+     * Both are done ONCE, when the first AU has been queued, matching the
+     * vendor's ordering and its ~60 ms gap between STREAMON and the restart. */
+    if (envnum("V4L2_ONLINE_FIX",1)) restart_pending = 1;
     for (;;){
       int did = 0;
       static int tpk = 0;
@@ -570,7 +689,13 @@ int main(int argc, char **argv){
         for (z=0;z<(int)sizeof(pl);z++) ((char*)&pl)[z]=0;
         b.type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; b.memory=memtype; b.m.planes=pl; b.length=2;
         if (ioctl(fd, VIDIOC_DQBUF, &b) != 0) break;
+        g_capret++;
         isreal = ((b.flags & 0x18) != 0) ? 1 : 0;
+        if (g_capret <= 24 || isreal){
+          P("  CAP n="); Pv((long)g_capret); P(" idx="); Pv((long)b.index); P(" flags=0x");
+          { const char*hx="0123456789abcdef"; int q; for(q=7;q>=0;q--) write(1,&hx[(b.flags>>(q*4))&0xf],1); }
+          P(" p0.used="); Pv((long)pl[0].bytesused); P(" real="); Pv((long)isreal); P("\n");
+        }
         if (isreal){
           unsigned long lum = 0; int k = 0, i2;
           const unsigned char *YY = (const unsigned char*)capbuf[b.index];
@@ -598,6 +723,10 @@ int main(int argc, char **argv){
           struct { long s; long us; } tv; tv.s = 0; tv.us = 20000;
           setsockopt(c, 1 /*SOL_SOCKET*/, 20 /*SO_RCVTIMEO*/, &tv, sizeof(tv));
           cfd = c; P("  online: shim CONNECTED\n");
+          /* EVERY fresh connection needs the parse-flush + capture renegotiate:
+           * a new decoder session starts from scratch (no reference frames), so
+           * the fix has to re-arm here, not once per process. */
+          if (envnum("V4L2_ONLINE_FIX",1)) restart_pending = 1;
         }
       }
       if (cfd >= 0){
@@ -636,15 +765,50 @@ int main(int argc, char **argv){
             b3.index=(u32)idx; b3.type=V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE; b3.memory=memtype;
             b3.m.planes=&pl3; b3.length=1; b3.bytesused=(u32)n2;
             if (g_ts){ b3.flags = 0x4000u; b3.timestamp.tv_sec = 0; b3.timestamp.tv_usec = (g_tsctr++) * 33333; }
-            ioctl(fd, VIDIOC_QBUF, &b3); g_afeed++; }
+            if (ioctl(fd, VIDIOC_QBUF, &b3) == 0) g_afeed++;
+            else { g_qfail++; freeidx[nfree++] = idx;    /* hand the buffer back */
+              if (g_qfail <= 6){ P("  QBUF out FAIL idx="); Pv(idx); P(" len="); Pv((long)n2);
+                                 P(" errno="); Pv((long)ERRNO); P("\n"); } } }
           off += 16 + ln;
         }
         if (off){ unsigned long k2; for (k2=0;k2<alen-off;k2++) abuf[k2]=abuf[off+k2]; alen -= off; }
+      }
+      if (restart_pending && g_afeed > 0){
+        unsigned char d[72]; int z5, r5;
+        restart_pending = 0;
+        usleep(60000);                 /* let the driver ingest the first AU */
+        for (z5=0;z5<72;z5++) d[z5]=0; *(u32*)d = 4;
+        r5 = ioctl(fd, VIDIOC_DECODER_CMD, d);
+        P("  online: first AU queued -> DECODER_CMD rc="); Pv(r5); P("\n");
+        /* The driver answers the flush by handing back EVERY capture buffer
+         * EMPTY (its "parse pass").  The vendor drains that completely BEFORE
+         * it renegotiates -- and so must we: renegotiating with the flush still
+         * in flight makes REQBUFS fail EINVAL, which destroys the capture queue
+         * and kills the session (measured live 2026-10-17). */
+        { int n = 0, spins;
+          for (spins=0; spins<60; spins++){
+            int got = 0;
+            for (;;){
+              struct v4l2_buffer b; struct v4l2_plane pl[2]; int z6;
+              for (z6=0;z6<(int)sizeof(b);z6++) ((char*)&b)[z6]=0;
+              for (z6=0;z6<(int)sizeof(pl);z6++) ((char*)&pl)[z6]=0;
+              b.type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; b.memory=memtype;
+              b.m.planes=pl; b.length=2;
+              if (ioctl(fd, VIDIOC_DQBUF, &b) != 0) break;
+              n++; got = 1;
+            }
+            if (n > 0 && !got) break;
+            usleep(10000);
+          }
+          Pk("  online: drained capture flush", (long)n); }
+        vendor_restart(fd, memtype, capbuf, capfd, capshare, capsz0, capsz1,
+                       (u32)w, (u32)h, capfcc, CAPN);
       }
       if (!did) usleep(2000);
       { static unsigned long st = 0;
         if ((++st % 400) == 0){
           P("  STATUS parse="); Pv((long)g_aparse); P(" feed="); Pv((long)g_afeed);
+          P(" qfail="); Pv((long)g_qfail); P(" capret="); Pv((long)g_capret);
           P(" skip="); Pv((long)g_adrop); P(" nfree="); Pv((long)nfree);
           P(" frames="); Pv((long)nframes); P(" alen="); Pv((long)alen); P("\n");
         } }
@@ -685,21 +849,8 @@ int main(int argc, char **argv){
     }
     Pk("  AUs", nau);
     /* prime the output queue with the first AUs */
-    { int primed=0, z;
-      for (i=0;i<OUTN && feed_i<nau;i++){
-        struct v4l2_buffer b; struct v4l2_plane pl; u32 used; long lo, hi, j;
-        lo = aub[feed_i]; hi = aub[feed_i+1]; used = (u32)(hi-lo);
-        if (used > OUTBUF_SZ) used = OUTBUF_SZ;
-        for (j=0;j<(long)used;j++) ((unsigned char*)outbuf[i])[j] = fdata[lo+j];
-        for (z=0;z<(int)sizeof(b);z++) ((char*)&b)[z]=0;
-        for (z=0;z<(int)sizeof(pl);z++) ((char*)&pl)[z]=0;
-        setplane(&pl, (unsigned long)outbuf[i], outfd[i], outshare[i], (u32)outlen[i], used);
-        b.index=(u32)i; b.type=V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE; b.memory=memtype;
-        b.m.planes=&pl; b.length=1; b.bytesused=used;
-        if (g_ts){ b.flags = 0x4000u; b.timestamp.tv_sec = 0; b.timestamp.tv_usec = (g_tsctr++) * 33333; }
-        if (ioctl(fd, VIDIOC_QBUF, &b) != 0){ P("  QBUF out fail idx="); Pv(i); P("\n"); break; }
-        primed++; feed_i++;
-      }
+    { int primed = prime_output(fd, memtype, outbuf, outfd, outshare, outlen,
+                                aub, fdata, nau, &feed_i, OUTN);
       chunks = primed;
       Pk("  primed output", primed); }
   }
@@ -722,6 +873,50 @@ int main(int argc, char **argv){
       r4 = ioctl(fd, VIDIOC_DECODER_CMD, d);
       P("  DECODER_CMD cmd=4 rc="); Pv(r4); if (r4!=0){ P(" errno="); Pv((long)ERRNO); } P("\n");
     } else P("  (no DQEVENT -> no early flush)\n"); }
+
+  /* V4L2_RESTART=1: replay the vendor's SECOND setup pass.  Its first pass
+   * only parses headers (the driver flushes every capture buffer back empty);
+   * the real decode happens only after the capture queue is renegotiated --
+   * see data/v4l2_vendor_ref_20261017.txt lines 138-152. */
+  if (do_restart){
+    int drain = 0, got = 0;
+    P("--- restart: absorbing the parse pass ---\n");
+    for (;;){
+      struct v4l2_buffer b; struct v4l2_plane pl[2]; int z;
+      for (z=0;z<(int)sizeof(b);z++) ((char*)&b)[z]=0;
+      for (z=0;z<(int)sizeof(pl);z++) ((char*)&pl)[z]=0;
+      b.type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; b.memory=memtype; b.m.planes=pl; b.length=2;
+      if (ioctl(fd, VIDIOC_DQBUF, &b) != 0) break;
+      drain++;
+      { struct v4l2_buffer b2; struct v4l2_plane pl2[2]; int z2;
+        for (z2=0;z2<(int)sizeof(b2);z2++) ((char*)&b2)[z2]=0;
+        for (z2=0;z2<(int)sizeof(pl2);z2++) ((char*)&pl2)[z2]=0;
+        setplane(&pl2[0], (unsigned long)capbuf[b.index], capfd[b.index], capshare[b.index], capsz0, 0);
+        setplane(&pl2[1], (unsigned long)capbuf[b.index]+(unsigned long)capsz0, capfd[b.index], capshare[b.index], capsz1, 0);
+        b2.index=b.index; b2.type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; b2.memory=memtype;
+        b2.m.planes=pl2; b2.length=2;
+        ioctl(fd, VIDIOC_QBUF, &b2); }
+    }
+    Pk("  restart: absorbed capture flush", drain);
+    for (;;){          /* the parse pass's primed output buffers come back too */
+      struct v4l2_buffer b; struct v4l2_plane p1; int z3;
+      for (z3=0;z3<(int)sizeof(b);z3++) ((char*)&b)[z3]=0;
+      for (z3=0;z3<(int)sizeof(p1);z3++) ((char*)&p1)[z3]=0;
+      b.type=V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE; b.memory=memtype; b.m.planes=&p1; b.length=1;
+      if (ioctl(fd, VIDIOC_DQBUF, &b) != 0) break;
+      got++;
+    }
+    Pk("  restart: reclaimed output bufs", got);
+    if (vendor_restart(fd, memtype, capbuf, capfd, capshare, capsz0, capsz1,
+                       (u32)w, (u32)h, capfcc, CAPN) > 0){
+      /* the new session has no reference frames: start again at AU 0 */
+      feed_i = 0; chunks = 0;
+      { int primed = prime_output(fd, memtype, outbuf, outfd, outshare, outlen,
+                                  aub, fdata, nau, &feed_i, OUTN);
+        chunks = primed;
+        Pk("  restart: re-primed output", primed); }
+    }
+  }
 
   /* --- decode loop: feed every AU, drain capture, count only REAL frames -- */
   { int ncap=0, real=0, nout=0, loops=0, dumped=0, idle=0, flushed=0;
