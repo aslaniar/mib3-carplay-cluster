@@ -1577,9 +1577,17 @@ typedef struct {
   long night; int aes_inited;
 } cl_ctx;
 
+/* Which cluster thread owns the helper (AU) socket.  One phone session gets one
+ * cluster setup and therefore one thread, but the unit measured 8 connects / 7
+ * disconnects in a single run, so a newer thread can exist while an older one is
+ * still unwinding.  Only the newest is allowed to close the helper socket (see
+ * the stream-closed path). */
+static volatile unsigned cl_thread_gen = 0;
+
 static void *cluster_thread(void *arg){
   extern long read(int, void*, unsigned long);
   cl_ctx *c = (cl_ctx*)arg;
+  unsigned cl_my_gen = ++cl_thread_gen;
   int connfd = -1;
   logline("cluster/thread","started (self-contained receiver)");
   if (!c) return 0;
@@ -1759,6 +1767,20 @@ static void *cluster_thread(void *arg){
       logkv("cluster/thread","other-opcodes",(u64)others,0);
       if (p_free && rbuf) p_free(rbuf);
       logline("cluster/thread","stream closed");
+      /* TELL THE DECODER THE STREAM IS OVER.  Nothing downstream can see the
+       * phone hang up otherwise: the AU socket stays open, so v4l2_seq's read()
+       * never returns 0, it keeps running, and the presenter keeps re-committing
+       * its LAST frame -- which is exactly why the cluster shows a map of a road
+       * that no longer exists, forever (LANE_CLUSTER_TRANSITION_2026-10-18).
+       * Closing the helper socket IS the EOF the decoder already handles
+       * (`online: shim gone` -> re-accept), so no decoder change is needed.
+       * GUARD: only the NEWEST cluster thread may close it -- an older session's
+       * thread exiting must not tear down a newer session's AU channel (the unit
+       * measured 8 connects / 7 disconnects in one run). */
+      if (cl_thread_gen == cl_my_gen)
+        { helper_close(); logline("cluster/thread","helper socket closed (EOF for the decoder)"); }
+      else
+        logline("cluster/thread","a newer cluster thread owns the helper socket -- not closing it");
     }
     if (p_close) p_close(connfd);
   } else {
