@@ -513,7 +513,7 @@ eval_once() {
     tlog "SHUTDOWN" "resuming an interrupted shutdown"
     do_shutdown "resumed"
     ;;
-  *) set_state "NAV" "unknown-state-recovered($_STATE=$STATE)" ;;
+  *) tlog "$STATE" "note=unknown-state (recovering to NAV)"; set_state "NAV" "unknown-state-recovered" ;;
   esac
   return 0
 }
