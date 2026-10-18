@@ -84,7 +84,8 @@ NFRAMES="${MIB3_TR_NFRAMES:-3}"        # frames needed to call the decode path l
 MAXATT="${MIB3_TR_MAXATT:-3}"          # switch attempts before we stop trying
 RETRY="${MIB3_TR_RETRY:-5}"            # seconds between switch attempts
 RESTORE_T="${MIB3_TR_RESTORE_T:-10}"   # oracle gate for the nav hand-back (MS-S samples 1 Hz)
-FEED_T="${MIB3_TR_FEED_T:-12}"         # wall guard on the neutral feeder
+FEED_T="${MIB3_TR_FEED_T:-8}"          # wall guard on ONE neutral-feed attempt
+FEED_TRIES="${MIB3_TR_FEED_TRIES:-2}"  # a stall here must not become a slow shutdown
 FEEDCOUNT="${MIB3_TR_FEEDCOUNT:-3}"    # 1-3 frames is enough: the presenter keeps the last one
 FBTRIES="${MIB3_TR_FBTRIES:-6}"        # bounded nav-restore retries from FALLBACK
 FBPERIOD="${MIB3_TR_FBPERIOD:-60}"     # after giving up, how rarely to try again (s)
@@ -288,7 +289,7 @@ neutral_show() {
   [ -x "$RGBAFEED" ] || { tlog "$STATE" neutral=SKIP no-rgba_feed path="$RGBAFEED"; return 1; }
   mk_neutral || { tlog "$STATE" neutral=FAIL cannot-build "$NEUTRAL"; return 1; }
   _i=0
-  while [ "$_i" -lt 4 ]; do
+  while [ "$_i" -lt "$FEED_TRIES" ]; do
     "$RGBAFEED" "$RGBASOCK" "$NEUTRAL" "$W" "$H" --count "$FEEDCOUNT" --fps 10 \
         > "$RUN/neutral.log" 2>&1 &
     _fp=$!
