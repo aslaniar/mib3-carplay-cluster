@@ -49,7 +49,6 @@ SPNAME=navi-kombi-streamparameters
 NAVNAME=navi-kombi-renderingsurface
 OURNAME=test
 OURID=3000
-NAVID=33          # the car nav engine's own ivi surface (name navi-kombi-renderingsurface)
 
 stick_path() {
   [ -n "${MIB3_DLV_STICK:-}" ] && { printf '%s' "$MIB3_DLV_STICK"; return 0; }
@@ -288,11 +287,6 @@ wait_oracle() {
   return 1
 }
 oracle_since() { sed -n "$1,\$p" "$MSSLOG" 2>/dev/null; }
-# the last surface id MS-S built an encoder for = what the cluster is (or is not)
-# actually showing.  Empty when the oracle has said nothing yet.
-oracle_last_share() {
-  grep -ao "share_surface_id = [0-9]*" "$MSSLOG" 2>/dev/null | tail -n 1 | sed 's/.*= *//'
-}
 oracle_live() { [ -s "$MSSLOG" ] 2>/dev/null; }
 
 # read-only preconditions; echoes the reason on failure
@@ -404,110 +398,8 @@ handover_arm() {
   say "HANDOVER ARM FAIL: no 'share_surface_id = $OURID' within 30s"; oracle_tail; return 1
 }
 
-# ----------------------------------------------------------------------------
-# handover back [secs] -- the REVERSE switch: hand the cluster back to the car's
-# own map (ivi 33).  Used by transition_ctl.sh's SHUTDOWN/FALLBACK path.
-#
-# WHY IT IS NOT JUST `restore`: it is gated on MS-S's own decisions, and it knows
-# about the one trap that makes a plain "delete ours, create the nav" leave the
-# cluster showing our stale frame:
-#
-#   THE RE-CREATED-NAV TRAP.  If the nav engine re-created its element during our
-#   session (the documented behaviour), MS-S's diff identity (surfaceId, ip, port)
-#   says the nav is "already present" -- so when we delete OUR element, MS-S runs
-#   stopShare(ours) but NEVER calls startShare for the nav (no identity changed).
-#   Result: no TransportStream at all, the cluster retains our last frame, and
-#   every gate looks "fine".  The only thing that forces a start is a resync
-#   (stop+recreate), so step 5 below retries through one.  [STATIC]+[EXEC]
-# ----------------------------------------------------------------------------
-handover_back() {
-  _to="${1:-20}"
-  R="$(uris)"; D="$(disps)"; S="$(sps)"
-  DISP="$(uri_of "$D" navi-kombi-display)"; SP="$(uri_of "$S" $SPNAME)"
-  OURU="$(uri_of "$R" $OURNAME)"; NAVU="$(uri_of "$R" $NAVNAME)"
-  valid_uri "$DISP" || { say "HANDOVER BACK NO-GO: bad display uri '$DISP'"; return 1; }
-  _mk="$(oracle_lines)"
-
-  # [1] drop our element -- this is what makes MS-S stop sharing ivi $OURID
-  if [ -n "$OURU" ]; then
-    bc "handover:back:delete-ours $OURU"; h DELETE "http://$RSI:$DMP$OURU" >/dev/null; echo
-  else
-    # NOTHING OF OURS IS ATTACHED.  MS-S can only be pointing at ivi $OURID
-    # through OUR element, so there is nothing to take down -- but that does NOT
-    # mean the car's map is streaming: an element can exist while MS-S shares
-    # nothing (that is exactly the FALLBACK state).  So the cheap exit is gated
-    # on MS-S's OWN last decision, not on the element list.
-    _last="$(oracle_last_share)"
-    if [ "${NOOR:-0}" != "1" ] && [ "$_last" = "$NAVID" ]; then
-      say "HANDOVER BACK OK: nothing of ours was attached and MS-S is already on the car's map ($NAVID)"
-      return 0
-    fi
-    say "HANDOVER BACK: nothing of ours was attached (MS-S last share='${_last:-?}')"
-  fi
-
-  # [2] wait for MS-S to stop OUR stream ((ip,port) freed).  Only meaningful if
-  #     we had an element: MS-S logs "stopShare status = 0. Returning.." and no
-  #     STOP STREAMING when nothing was shared, which is not a failure.
-  if [ "${NOOR:-0}" = "1" ]; then
-    say "HANDOVER BACK: DEGRADED (no oracle) -- slept 3s instead of waiting for STOP STREAMING"
-    sleep 3
-  elif [ -n "$OURU" ]; then
-    if wait_oracle "STOP STREAMING|stopShare \[" "$_to" "$_mk"; then
-      say "HANDOVER BACK: MS-S stopped our stream"
-    else
-      say "HANDOVER BACK WARN: no STOP STREAMING within ${_to}s -- continuing; the resync retry below covers it"
-    fi
-  fi
-
-  # [3] re-create the car's own element if the nav engine has not already
-  if [ -z "$(uri_of "$(uris)" $NAVNAME)" ]; then
-    [ -n "$SP" ] || { say "HANDOVER BACK NO-GO: no streamParameters uri"; return 1; }
-    bc "handover:back:create-nav"
-    h POST "http://$RSI:$DMP/displaymanagement/renderingSurfaces" \
-      "{\"name\":\"$NAVNAME\",\"display\":\"$DISP\",\"streamParameters\":\"$SP\",\"topLeftX\":0,\"topLeftY\":0,\"width\":1280,\"height\":480}" >/dev/null; echo
-    sleep 1
-    NAVU="$(uri_of "$(uris)" $NAVNAME)"
-  else
-    say "HANDOVER BACK: the nav element is already present"
-  fi
-  [ -n "$NAVU" ] || { say "HANDOVER BACK FAIL: the nav element could not be registered"; return 1; }
-
-  # [4] gate on the nav's encoder
-  if [ "${NOOR:-0}" = "1" ]; then
-    sleep 3; say "HANDOVER BACK: DEGRADED (no oracle) -- nav element re-registered; cannot verify the encoder"
-    return 0
-  fi
-  # THE GATE IS `share_surface_id`, NOT `startShare`.  A `startShare [id = 33]` is
-  # logged even when Weston has no ivi 33 (the absent case: MS-S grabs, gets
-  # "does not exist", sets holder=3 and builds NO encoder) -- so gating on
-  # startShare alone would report success while the cluster shows nothing.
-  # Only `share_surface_id = 33` means the encoder was actually built.  [STATIC]
-  if wait_oracle "share_surface_id = $NAVID" "$_to" "$_mk"; then
-    say "HANDOVER BACK OK: encoder built for the car's map ($NAVID)"
-    return 0
-  fi
-
-  # [5] THE RESCUE -- the re-created-nav trap: identity 33 never left MS-S's
-  #     stream list, so no startShare was issued.  Only a resync forces one.
-  say "HANDOVER BACK: no nav share yet -- forcing a resync (re-created-nav trap)"
-  bc "handover:back:resync"
-  _mk2="$(oracle_lines)"
-  if [ "${MIB3_DLV_RESYNC_FLIP:-1}" = "1" ]; then
-    h POST "http://$RSI:$DMP$SP" '{"resync":false}' >/dev/null 2>&1; echo; sleep 1
-  fi
-  h POST "http://$RSI:$DMP$SP" '{"resync":true}' >/dev/null 2>&1; echo
-  if wait_oracle "share_surface_id = $NAVID" "$_to" "$_mk2"; then
-    say "HANDOVER BACK OK (after resync): encoder built for $NAVID"
-    return 0
-  fi
-  say "HANDOVER BACK FAIL: the car's map is not being shared again (no 'share_surface_id = $NAVID')"
-  oracle_tail
-  return 2
-}
-
 do_handover() {
   _st="${1:-full}"
-  _to="${2:-}"
   bc "handover:start stage=$_st"
   oracle_on
   if oracle_live; then NOOR=0; else
@@ -521,7 +413,6 @@ do_handover() {
     park)   handover_park; return $? ;;
     attach) handover_attach; return $? ;;
     arm)    handover_arm; return $? ;;
-    back)   handover_back "${_to:-20}"; return $? ;;
   esac
   handover_check || return 1
   handover_park  || { say "STOP: park not observed -- not attaching (run again when MS-S logs STOP STREAMING)"; return 1; }
@@ -549,7 +440,7 @@ watch_live() {
 case "${1:-}" in
   status)  status ;;
   apply)   acquire || exit 1; do_apply ;;
-  handover) shift; acquire || exit 1; do_handover "${1:-full}" "${2:-}"; exit $? ;;
+  handover) shift; acquire || exit 1; do_handover "${1:-full}"; exit $? ;;
   restore) acquire || exit 1; do_restore ;;
   verify)  do_verify ;;
   watch)   shift; watch_live "$@" ;;
@@ -559,5 +450,5 @@ case "${1:-}" in
              tail)  oracle_tail ;;
              *) echo "usage: $0 oracle {start|stop|tail}"; exit 2 ;;
            esac ;;
-  *) echo "usage: $0 {status|apply|handover [check|park|attach|arm|back [secs]|full]|verify|restore|watch [secs]|oracle {start|stop|tail}}"; exit 2 ;;
+  *) echo "usage: $0 {status|apply|handover [check|park|attach|arm|full]|verify|restore|watch [secs]|oracle {start|stop|tail}}"; exit 2 ;;
 esac

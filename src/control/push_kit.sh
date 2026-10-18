@@ -22,11 +22,12 @@ ssh "$HOST" 'mkdir -p /tmp/kit'
 FILES="mib3shim.so mib3clusterhelper \
   inject/inject.py inject/inject_shim.py inject/target_env.py inject/run_inject.sh \
   live_kit/deliver_ctl.sh live_kit/chain_up.sh live_kit/chain_down.sh \
-  live_kit/transition_ctl.sh \
   live_kit/v4l2_run.sh live_kit/v4l2_sweep.sh \
   live_kit/start_mss_log.sh live_kit/patha_deliver.sh live_kit/patha_auto.sh \
   live_kit/start_cluster_helper.sh live_kit/probe.sh \
-  tools/v4l2_seq tools/mib3egl tools/ausock tools/socktest tools/rgba_feed"
+  live_kit/wheel_zoom.sh \
+  tools/v4l2_seq tools/mib3egl tools/ausock tools/socktest tools/rgba_feed \
+  tools/mib3wheel"
 
 # WHY the delivery scripts are listed (they were NOT, and it cost a whole trip
 # on 2026-10-17): start_mss_log.sh is the ORACLE -- MS-S's own log on port 54321.
@@ -36,12 +37,6 @@ FILES="mib3shim.so mib3clusterhelper \
 # (essential, because the phone cannot be in the car and tethered to the laptop
 # at the same time).  DO NOT remove them from this list.
 # See MIB3_RE/CLOSEOUT_2026-10-17_DECODE.md S4 and LANE_MS_S_SHARE_TRIGGER_2026-10-17.md.
-#
-# transition_ctl.sh is the LIFECYCLE controller (2026-10-18): the state machine
-# that keeps the car's own map up until we have a real frame, and hands the
-# cluster back (or shows a neutral frame) when the phone leaves, so the cluster
-# never freezes on a stale CarPlay map.  It is the operator's one entry point:
-#   nohup sh /tmp/kit/transition_ctl.sh run & 
 
 for f in $FILES; do
   [ -f "$f" ] || { echo "[!] missing $f -- run sh build.sh and sh tools/build.sh first"; exit 1; }
@@ -52,4 +47,4 @@ done
 # shim in an already-running carplay (a mapped .so cannot be replaced in place).
 cat mib3shim.so | ssh "$HOST" 'cat > /tmp/kit/mib3shim2.so'
 
-ssh "$HOST" 'chmod +x /tmp/kit/*.sh /tmp/kit/*.py /tmp/kit/mib3shim.so /tmp/kit/mib3shim2.so /tmp/kit/v4l2_seq /tmp/kit/mib3egl /tmp/kit/ausock /tmp/kit/socktest /tmp/kit/rgba_feed /tmp/kit/mib3clusterhelper 2>/dev/null; echo "--- /tmp/kit ---"; ls -la /tmp/kit'
+ssh "$HOST" 'chmod +x /tmp/kit/*.sh /tmp/kit/*.py /tmp/kit/mib3shim.so /tmp/kit/mib3shim2.so /tmp/kit/v4l2_seq /tmp/kit/mib3egl /tmp/kit/ausock /tmp/kit/socktest /tmp/kit/rgba_feed /tmp/kit/mib3clusterhelper /tmp/kit/mib3wheel 2>/dev/null; echo "--- /tmp/kit ---"; ls -la /tmp/kit'
