@@ -1448,40 +1448,6 @@ static int ship_cmd(void *session, const char *type, CFMutableDictionaryRef para
   if (!session || !p_SendCommand || !p_CFDictionaryCreateMutable ||
       !p_CFDictionarySetValue || !p_kCFLDictKeyCB || !p_kCFLDictValCB || !p_CFRelease)
     return -1;
-  /* ---- GENERATION GUARD (stability, 2026-10-18) ---------------------------
-   * AirPlayReceiverSessionSendCommand is a dispatch_sync_f onto the SESSION's own
-   * control queue, with NO timeout, that builds an RTSP POST /command and
-   * HTTPClientSendMessage()s it (corpus libAirPlay decompiled.c:12863-12899 ->
-   * FUN_00113038 at 9935; the shipped binary at VA 0x17f3c calls
-   * dispatch_sync_f@plt).  This runs on the CLUSTER RECEIVER THREAD.
-   *
-   * Two hazards follow, and the refs/rgi implementation removed this exact
-   * pattern (its SESSION_LIFECYCLE.md defects 3 and 5: "stock command under
-   * alt_lock ... deadlock and use-after-free edge" and "night-mode refresh on
-   * the receive thread ... could outlive a teardown"):
-   *   (a) while the call is in flight we are not read()ing the phone's cluster
-   *       socket, so that stream looks silent-but-ESTABLISHED; and
-   *   (b) `session` was captured at SETUP time.  A superseded receiver thread
-   *       (a new type-111 SETUP creates a new one; the old thread lives until
-   *       its socket ends) would command through an OLD session object.
-   *
-   * Cheap guards, no behaviour change on the healthy path:
-   *   1. only the CURRENT setup generation may command (g_cmd_session is written
-   *      by cluster_setup on every type-111 SETUP);
-   *   2. mirror stock's own liveness byte (session+0x446, set once by
-   *      AirPlayReceiverSessionStart and never cleared: decompiled.c:13087,
-   *      tested at 12877) so we do not enter dispatch_sync on a dead session.
-   * MIB3_SHIM_CMDGEN=0 restores the old unconditional behaviour. */
-  if (env_on("MIB3_SHIM_CMDGEN",1)){
-    if (session != g_cmd_session){
-      logline("cluster/cmd/skipped-superseded", type);
-      return -2;
-    }
-    if (*(volatile signed char*)((char*)session + 0x446) == 0){
-      logline("cluster/cmd/skipped-session-not-started", type);
-      return -3;
-    }
-  }
   CFMutableDictionaryRef cmd = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
   if (!cmd) return -1;
   int rc = -1;
@@ -1535,33 +1501,6 @@ static void cluster_send_forcekeyframe(void *session, const char *why)
   logline("cluster/cmd/idr-why", why);
   if (p_CFRelease) p_CFRelease(p);
 }
-/* ---- storm limiter (stability, 2026-10-18) --------------------------------
- * WHY: the helper link can flap.  v4l2_seq's own comment records the measured
- * case -- "measured at 8 connections and 7 disconnects in one session", and
- * "the 200 ms SO_SNDTIMEO fires, it drops the AU and reconnects ... a storm"
- * (shim/tools/v4l2_seq.c, the THE STORM paragraph).  Every reconnect used to
- * fire a forceKeyFrame at the phone from the receiver thread, i.e. 7 RTSP
- * POSTs into a live session at the exact moment the pipeline was already
- * struggling, each one a blocking dispatch_sync (see ship_cmd's note).
- * A forced IDR is also the most expensive frame the phone can make (1280x480,
- * full intra).  One request per MIB3_SHIM_FKR_MIN seconds (default 5) is plenty:
- * the gate only needs to be reopened, and the phone emits ~1 IDR per stream
- * anyway (2 IDRs in 1761 slices, LANE_CLUSTER_WORKING 2026-10-18 S2).
- * MIB3_SHIM_FKR_MIN=0 disables the limiter. ---------------------------------- */
-static long g_last_fkr_s = 0;
-static void cluster_send_forcekeyframe_limited(void *session, const char *why)
-{
-  extern long time(long *);
-  long min = (long)env_num("MIB3_SHIM_FKR_MIN", 5);
-  long now = time(0);
-  if (min > 0 && g_last_fkr_s != 0 && (now - g_last_fkr_s) < min){
-    logkv("cluster/cmd","forceKeyFrame rate-limited (s since last)",(u64)(now - g_last_fkr_s),0);
-    logline("cluster/cmd/idr-skipped-why", why);
-    return;
-  }
-  g_last_fkr_s = now;
-  cluster_send_forcekeyframe(session, why);
-}
 static void cluster_send_nightmode(void *session)
 {
   if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
@@ -1572,6 +1511,190 @@ static void cluster_send_nightmode(void *session)
   int rc = ship_cmd(session, "setNightMode", p);
   logkv("cluster/cmd","setNightMode rc",(u64)(u32)rc,0);
   if (p_CFRelease) p_CFRelease(p);
+}
+
+/* ==========================================================================
+ * ZOOM: the STEERING-WHEEL up/down mirror (2026-10-18).
+ *
+ * WHY THIS EXISTS (see LANE_CLUSTER_ZOOM_2026-10-18.md):
+ * The wheel roller does NOT reach CarPlay.  On this unit it goes
+ *   cluster (CAN MFL) -> BAP NavigationSd MapScale SetGet -> navsd_app
+ *   -> POST {relativeSteps} to /maprenderer/discreteInputs/<renderer>
+ *   -> the CAR'S OWN nav zooms -> navsd reports BAP MapScale Status -> the
+ *   cluster paints its own scale OSD.
+ * Our video replaces the nav's map, so the wheel moved a map nobody sees.
+ *
+ * The fix is the CarPlay cluster API for exactly this: send
+ *   changeMapZoomLevel {uuid: <cluster display uuid>, zoomDirection: 0|1}
+ * (0 = zoom IN, non-zero = zoom OUT -- rgi command revert + DashBoard's
+ * CRSUIClusterZoomAction).  The phone routes it to the cluster scene, Apple
+ * Maps zooms.
+ *
+ * WHERE THE STEPS COME FROM: the external tool `mib3wheel` (shim/tools/
+ * mib3wheel.c) watches the unit's own maprenderer RSI and writes "+1"/"-1"
+ * lines into an AF_UNIX socket we own.  This module is the receiving end.
+ *
+ * WHY A MAILBOX INSTEAD OF SENDING FROM THE LISTENER THREAD: the listener
+ * would have to hold the session pointer, i.e. it could send into a torn-down
+ * session (a use-after-free inside carplay => reboot).  Instead the listener
+ * only QUEUES the step and the CLUSTER THREAD -- which already owns a valid
+ * session for the length of that stream -- drains the queue and ships.  No new
+ * lifetime contract, no lock.
+ * ========================================================================*/
+#define ZOOM_Q 16
+static volatile int g_zoom_q[ZOOM_Q];
+static volatile int g_zoom_qw, g_zoom_qr, g_zoom_qdrop;
+static volatile int g_zoom_started;
+
+/* returns 1 queued, 0 dropped (full) */
+static int zoom_push(int dir)
+{
+  int w = g_zoom_qw, n = (w + 1) % ZOOM_Q;
+  if (n == g_zoom_qr){ g_zoom_qdrop++; return 0; }     /* full: drop the OLDEST */
+  g_zoom_q[w] = dir; g_zoom_qw = n;
+  return 1;
+}
+/* +1 = zoom in, -1 = zoom out, 0 = empty */
+static int zoom_pop(void)
+{
+  int r = g_zoom_qr;
+  if (r == g_zoom_qw) return 0;
+  { int v = g_zoom_q[r]; g_zoom_qr = (r + 1) % ZOOM_Q; return v; }
+}
+
+/* Ship ONE changeMapZoomLevel for the cluster display.  zoomDirection is the
+ * rgi/DashBoard wire form: 0 = in, anything else = out. */
+static void cluster_send_zoom(void *session, int dir_in)
+{
+  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!g_cluster_uuid_str[0]){ logline("cluster/zoom","skipped (no cluster uuid)"); return; }
+  CFMutableDictionaryRef p = cmd_params_uuid();
+  if (!p) return;
+  dseti(p, "zoomDirection", (s64)(dir_in ? 0 : 1));
+  { int rc = ship_cmd(session, "changeMapZoomLevel", p);
+    logkv("cluster/zoom","dir (0=in 1=out)",(u64)(u32)(dir_in ? 0 : 1),0);
+    logkv("cluster/zoom","changeMapZoomLevel rc",(u64)(u32)rc,0); }
+  if (p_CFRelease) p_CFRelease(p);
+}
+
+/* The listener thread: accept wheel steps from mib3wheel, queue them.
+ * Never sends anything itself (see the mailbox note above).  It runs for the
+ * life of the process; a reboot is the undo. */
+static void *zoom_listen_thread(void *arg)
+{
+  extern int socket(int,int,int);
+  extern int bind(int,const void*,unsigned int);
+  extern int listen(int,int);
+  extern int accept(int,void*,unsigned int*);
+  extern int unlink(const char*);
+  extern long read(int,void*,unsigned long);
+  extern int close(int);
+  const char *path = (const char*)arg;
+  struct sun { unsigned short family; char p[108]; };
+  struct sun sa;
+  int fd, conn, i;
+  logline("cluster/zoom","listener starting");
+  unlink(path);
+  fd = socket(1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
+  if (fd < 0){ logline("cluster/zoom","socket() failed"); return 0; }
+  { unsigned char *q = (unsigned char*)&sa;
+    for (i = 0; i < (int)sizeof(sa); i++) q[i] = 0;
+    sa.family = 1;
+    { unsigned long n = 0; while (path[n] && n < sizeof(sa.p)-1){ sa.p[n] = path[n]; n++; } }
+  }
+  if (bind(fd, &sa, (unsigned int)sizeof(sa)) != 0){
+    logline("cluster/zoom","bind failed"); close(fd); return 0;
+  }
+  if (listen(fd, 4) != 0){ logline("cluster/zoom","listen failed"); close(fd); return 0; }
+  logline("cluster/zoom/listen", path);
+  for (;;){
+    conn = accept(fd, 0, 0);
+    if (conn < 0) continue;
+    logkv("cluster/zoom","peer fd",(u64)(u32)conn,0);
+    for (;;){
+      char buf[64]; long n = read(conn, buf, sizeof(buf));
+      if (n <= 0) break;
+      { long k;
+        for (k = 0; k < n; k++){
+          char c = buf[k];
+          int dir = 0;
+          if (c == '+') dir = 1;
+          else if (c == '-') dir = -1;
+          else if (c == 'i' || c == 'I') dir = 1;      /* "in"  */
+          else if (c == 'o' || c == 'O') dir = -1;     /* "out" */
+          else if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+          else { logkv("cluster/zoom","ignored byte",(u64)(unsigned)(c & 0xff),0); continue; }
+          if (env_on("MIB3_SHIM_ZOOM_INVERT",0)) dir = -dir;
+          if (zoom_push(dir)) logkv("cluster/zoom","queued dir",(u64)(u32)(dir > 0 ? 1 : 0),0);
+          else logline("cluster/zoom","queue full -- step dropped");
+        } }
+    }
+    logline("cluster/zoom","peer gone");
+    close(conn);
+  }
+  return 0;   /* unreachable */
+}
+
+/* Idempotent: start the listener once, with the cluster uuid + session globals
+ * primed (the exported wrapper below is what the harness drives). */
+static int zoom_listen_start(void)
+{
+  extern int setenv(const char*,const char*,int);
+  static char path[128];
+  static int once = 0;
+  void *th = 0;
+  const char *p;
+  if (g_zoom_started) return 0;
+  if (!env_on("MIB3_SHIM_ZOOM",1)){ logline("cluster/zoom","disabled (MIB3_SHIM_ZOOM=0)"); return 0; }
+  if (!p_pthreadCreate){ logline("cluster/zoom","no pthread -- disabled"); return 0; }
+  p = getenv("MIB3_SHIM_ZOOM_SOCK");
+  if (!p || !p[0]) p = "/dev/shm/mib3zoom.sock";
+  { unsigned long n = 0; while (p[n] && n < sizeof(path)-1){ path[n] = p[n]; n++; } path[n] = 0; }
+  (void)setenv;                                  /* (kept for future knobs) */
+  if (once) return 0;
+  once = 1;
+  if (p_pthreadCreate(&th, 0, zoom_listen_thread, path) != 0){
+    logline("cluster/zoom","pthread_create failed"); return -1;
+  }
+  g_zoom_started = 1;
+  return 0;
+}
+
+/* ---- test/bench surface (mirrors mib3shim_cluster_setup's role) ----------- */
+/* Prime the uuid + session and start the listener.  Production calls
+ * zoom_listen_start() from cluster_setup (uuid already primed by the advert);
+ * the harness has no advert, so it primes them here. */
+int mib3shim_zoom_listen(void *session, const char *uuid, const char *sock)
+{
+  resolve();
+  if (uuid && uuid[0]){
+    unsigned long n = 0;
+    while (uuid[n] && n < sizeof(g_cluster_uuid_str)-1){ g_cluster_uuid_str[n] = uuid[n]; n++; }
+    g_cluster_uuid_str[n] = 0;
+  }
+  if (sock && sock[0]){
+    extern int setenv(const char*,const char*,int);
+    setenv("MIB3_SHIM_ZOOM_SOCK", sock, 1);
+  }
+  g_cmd_session = session;
+  return zoom_listen_start();
+}
+/* Drain up to `max` queued steps and ship them on `session` (0 -> g_cmd_session).
+ * Production calls this at the top of the cluster thread's loop; the harness
+ * calls it directly.  Returns the number shipped. */
+int mib3shim_zoom_pump(void *session, int max)
+{
+  int k, sent = 0;
+  void *s = session ? session : g_cmd_session;
+  if (max <= 0) max = 4;
+  for (k = 0; k < max; k++){
+    int d = zoom_pop();
+    if (!d) break;
+    cluster_send_zoom(s, d > 0);
+    sent++;
+  }
+  if (g_zoom_qdrop){ logkv("cluster/zoom","dropped total",(u64)g_zoom_qdrop,0); g_zoom_qdrop = 0; }
+  return sent;
 }
 
 /* ---- AVCC <-> Annex-B (the refs' proven helpers) ---------------------------
@@ -1633,19 +1756,10 @@ static int avcc_prepare(unsigned char *p, unsigned long len, unsigned char ls, i
 /* per-setup context: the servicing thread reads ONLY this, never a shared
  * global that a later setup could overwrite (that was the UAF/corruption path). */
 typedef struct {
-  void *screen; int lsock; int lsockgen; void *session; int flags; void *stream;
+  void *screen; int lsock; void *session; int flags; void *stream;
   unsigned char key[32]; int keylen; int cipher; long counter;   /* B: stream crypto */
   long night; int aes_inited;
 } cl_ctx;
-
-/* The type-111 listener we currently own, plus a GENERATION token.  A newer
- * SETUP supersedes both; see the listener-ownership note in cluster_thread.
- * The token, not the fd number, is the ownership test: own_listen closes the old
- * fd and immediately socket()s a new one, which the kernel hands back with the
- * SAME number -- so an fd comparison would let a stale receiver thread accept on
- * the NEW listener and service the new phone stream with an OLD key/session. */
-static volatile int g_lsock = -1;
-static volatile int g_lsock_gen = 0;
 
 static void *cluster_thread(void *arg){
   extern long read(int, void*, unsigned long);
@@ -1656,38 +1770,10 @@ static void *cluster_thread(void *arg){
   extern int accept(int, void*, unsigned int*);
   logkv("cluster/thread","listening fd",(u64)(u32)c->lsock,0);
   logline("cluster/thread","waiting for the phone to connect");
-  /* ---- LISTENER OWNERSHIP (stability, 2026-10-18) -------------------------
-   * The old code did ONE blocking accept() with no timeout.  If the phone never
-   * opened the type-111 stream for this session (it aborted the stream, or its
-   * SYN was dropped), this thread stayed in accept() forever and the listener
-   * kept port 5000 bound for the life of the process.  The NEXT type-111 SETUP
-   * then failed to bind 5000 (SO_REUSEADDR does not permit a second live
-   * listener) and own_listen() fell through to 6031 -- a port the unit's own
-   * firewall drops for the phone's interface (lge/app_ro/network: only
-   * "-i ncm0 --dport 5000:5001/6030/7000" are allowed).  The phone would then
-   * dial a black hole that WE advertised: the documented libairplay outcome is
-   * "the phone gave up on an advertised but unserviced cluster" (-6722/-6753,
-   * 23 s sessions).  refs/rgi hit the same class and fixed it the same way
-   * (SESSION_LIFECYCLE.md defect 4: "infinite 111 accept ... later 111 SETUP
-   * fails -6728" -> one-second accept tick rechecking the stop flag).
-   * So: accept with a short tick, and abandon the listener as soon as a newer
-   * SETUP has superseded it (g_lsock no longer points at our fd). */
-  while (c->lsock >= 0 && connfd < 0){
-    struct pollfd { int fd; short events; short revents; } pfd;
-    extern int poll(void*, unsigned long, int);
-    pfd.fd = c->lsock; pfd.events = 1 /*POLLIN*/; pfd.revents = 0;
-    { int pr = poll(&pfd, 1, 250);
-      if (g_lsock_gen != c->lsockgen){ logline("cluster/thread","listener superseded -- abandoning it"); break; }
-      if (pr < 0) continue;
-      if (pr > 0 && (pfd.revents & 1)) connfd = accept(c->lsock, 0, 0);
-      /* POLLNVAL/HUP means the listener went away under us. */
-      if (pr > 0 && (pfd.revents & ~1) && connfd < 0) break;
-    }
-  }
+  if (c->lsock >= 0) connfd = accept(c->lsock, 0, 0);   /* blocking */
   logkv("cluster/thread","conn fd",(u64)(u32)connfd,0);
   if (connfd >= 0){
     if (p_close){ p_close(c->lsock); }
-    if (g_lsock_gen == c->lsockgen){ g_lsock = -1; g_lsock_gen++; }
     c->lsock = -1;
     logline("cluster/thread","stream connected");
     /* THE SINK STANDS UP HERE -- on this thread, NOT in the SETUP seam.  A
@@ -1716,6 +1802,11 @@ static void *cluster_thread(void *arg){
       logkv("cluster/thread","cipher",(u64)(u32)c->cipher,0);
       while (!stop){
         long got = 0, n;
+        /* Steering-wheel zoom steps queued by the listener thread: ship them
+         * HERE, on the thread that owns a valid session (see the ZOOM block).
+         * At most 4 per iteration so a burst cannot starve the video path. */
+        { int z = mib3shim_zoom_pump(c->session, 4);
+          if (z > 0) logkv("cluster/zoom","steps shipped",(u64)(u32)z,0); }
         /* 128-byte screen header (bodySize u32 LE @0, opcode @4) */
         while (got < 128){ n = read(connfd, hdr + got, 128 - got); if (n <= 0){ logkv("cluster/thread","hdr read ended (0=EOF,1=err)",(u64)(n==0?0:1),0); logkv("cluster/thread","  bytes got",(u64)got,0); stop = 1; break; } got += n; }
         if (stop) break;
@@ -1822,7 +1913,7 @@ static void *cluster_thread(void *arg){
                   /* A freshly (re)connected helper has no reference frames, so
                    * ask the phone for a keyframe and a real IDR will follow. */
                   if (!was_conn && mib3shim_helper_connected())
-                    cluster_send_forcekeyframe_limited(c->session, "helper-connect"); }
+                    cluster_send_forcekeyframe(c->session, "helper-connect"); }
               } else logline("cluster/thread","malformed AU (avcc_prepare) -- dropped");
             }
             if ((frames & 0x3f) == 1){
@@ -1879,7 +1970,7 @@ static void *cluster_thread(void *arg){
  * ephemeral port are DROPPED by the firewall -- the phone's SYN never arrives
  * -- so they are fallbacks that require live_kit/cluster_port_fw.sh to insert
  * the RAM-only allow rule first. */
-static int own_listen(int *out_port, int *out_gen){
+static int own_listen(int *out_port){
   extern int socket(int, int, int);
   extern int setsockopt(int, int, int, const void*, unsigned int);
   extern int bind(int, const void*, unsigned int);
@@ -1903,17 +1994,6 @@ static int own_listen(int *out_port, int *out_gen){
   chain[nc++] = 5000;
   chain[nc++] = 6031;
   chain[nc++] = 0;   /* ephemeral */
-  /* SUPERSEDE THE PREVIOUS LISTENER FIRST (stability, 2026-10-18).
-   * A listener left over from an earlier type-111 SETUP holds 5000, and
-   * SO_REUSEADDR does NOT permit a second live listener on the same port, so
-   * without this the bind would fail and we would fall through to 6031 -- a
-   * port the phone cannot reach (see the listener-ownership note in
-   * cluster_thread).  Closing it here also unsticks the old thread's poll. */
-  if (g_lsock >= 0){
-    int old = g_lsock; g_lsock = -1; g_lsock_gen++; close(old);
-    logkv("cluster/listen","superseded old listener fd",(u64)(u32)old,0);
-    logkv("cluster/listen","new listener generation",(u64)(u32)g_lsock_gen,0);
-  }
   fd = socket(10 /*AF_INET6*/, 1 /*SOCK_STREAM*/, 0);
   if (fd < 0) return -1;
   setsockopt(fd, 1 /*SOL_SOCKET*/, 2 /*SO_REUSEADDR*/, &one, sizeof(one));
@@ -1933,9 +2013,6 @@ static int own_listen(int *out_port, int *out_gen){
     if (!bound){ close(fd); return -1; }
   }
   if (listen(fd, 8) != 0){ close(fd); return -1; }
-  g_lsock = fd;                 /* we own it until a newer SETUP supersedes it */
-  g_lsock_gen++;
-  if (out_gen) *out_gen = g_lsock_gen;
   *out_port = 0;
   if (getsockname(fd, &got, &glen) == 0){
     *out_port = (int)(((got.port & 0xff) << 8) | (got.port >> 8));   /* ntohs */
@@ -1978,7 +2055,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
     else logline("cluster","chacha derive failed");
   }
 
-  int port = 0, lgen = 0, lsock = own_listen(&port, &lgen);
+  int port = 0, lsock = own_listen(&port);
   if (lsock < 0){ logline("cluster","own listener failed"); goto fail_sock; }
   logkv("cluster","dataPort",(u64)(u32)port,0);
 
@@ -2055,11 +2132,16 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   }
   cl_ctx *c = (cl_ctx*)p_malloc(sizeof(cl_ctx));
   if (!c){ logline("cluster","ctx alloc failed"); goto fail_sock; }
-  c->screen = 0; c->lsock = lsock; c->lsockgen = lgen; c->session = session; c->stream = 0;
+  c->screen = 0; c->lsock = lsock; c->session = session; c->stream = 0;
   { int j; for (j = 0; j < 32; j++) c->key[j] = skey[j]; }
   c->keylen = keylen; c->cipher = cipher; c->counter = 0;
   c->night = g_night_mode; c->aes_inited = 0;
   g_cmd_session = session;   /* the command target once the stream connects */
+  /* the wheel->CarPlay zoom path (LANE_CLUSTER_ZOOM_2026-10-18): one listener
+   * per process, started here so it outlives per-connection cluster threads.
+   * It only QUEUES steps; the cluster thread ships them (no session lifetime
+   * contract is added). */
+  (void)zoom_listen_start();
   {
     char *cfg = (char*)(*(void**)((char*)session + 0x10));
     c->flags = cfg ? *(int*)(cfg + 0xac) : 0;
@@ -2073,7 +2155,6 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   return 0;
 
 fail_sock:
-  if (g_lsock >= 0 && g_lsock == lsock){ g_lsock = -1; g_lsock_gen++; }
   if (p_close && lsock >= 0) p_close(lsock);
   return -1;
 }
