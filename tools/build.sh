@@ -24,11 +24,13 @@ set -e
 CC=/opt/homebrew/opt/llvm/bin/clang
 LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
-# run from the script's own directory so the relative source paths resolve
-cd "$(dirname "$0")" || exit 1
+# run from the script's own directory so the relative source paths resolve.
+# Resolve both paths to ABSOLUTE first -- same relative-$0 bug as shim/build.sh:
+# resolving $0 after the cd made the documented invocation from MIB3_RE fail.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOTFS="$(cd "$HERE/../../../R8830L_ROOTFS" && pwd)"
+cd "$HERE" || exit 1
 MD5SUM() { if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
-
-ROOTFS="$(cd "$(dirname "$0")/../../../R8830L_ROOTFS" && pwd)"
 LIBC="$ROOTFS/lib64/libc.so.6"
 LIBDL="$ROOTFS/lib64/libdl-2.23.so"
 WLCLIENT="$ROOTFS/usr/lib64/libwayland-client.so.0.3.0"
@@ -124,12 +126,14 @@ for b in mib3surface mib3egl mib3egl2 rgba_feed mib3clusterstream; do
 done
 
 echo
-echo "--- known-good md5s (reproduce byte-identical with this script) ---"
-echo "  mib3surface       d09cd0dad7045fac206f400e04ae0188"
-echo "  mib3egl2          ef73fdd517afff801f77606ccf700791"
-echo "  (mib3egl/rgba_feed are pinned in harness/run_delivery.sh -- they change when their source does)"
-echo "  (actual, this build:)"
-for b in mib3surface mib3egl mib3egl2 rgba_feed mib3clusterstream; do
-  [ -f "$b" ] && printf '  %-16s %s\n' "$b" "$(MD5SUM "$b")"
+echo "--- pins (md5) ---"
+echo "  HISTORY, do not quote as current: the 2026-10-16 pins"
+echo "  (mib3surface d09cd0da..., mib3egl2 ef73fdd5...) NO LONGER reproduce --"
+echo "  their sources changed since.  The truth is the list this script just"
+echo "  measured; verified 2026-10-18: mib3egl 7612f74a (the upright fix),"
+echo "  v4l2_seq f6abd36c, mib3surface aaff6555, mib3egl2 beabf11a,"
+echo "  rgba_feed a056eabc.  (actual, this build:)"
+for b in mib3surface mib3egl mib3egl2 rgba_feed v4l2_seq ausock socktest omx_decode mib3clusterstream; do
+  [ -f "$b" ] && printf '  %-20s %s\n' "$b" "$(MD5SUM "$b")"
 done
 exit 0

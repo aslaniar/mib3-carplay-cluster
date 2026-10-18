@@ -6,9 +6,14 @@ set -e
 CC=/opt/homebrew/opt/llvm/bin/clang
 LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
-# run from the script's own directory so the relative source paths resolve
-cd "$(dirname "$0")" || exit 1
-ROOTFS="$(cd "$(dirname "$0")/../../R8830L_ROOTFS" && pwd)"
+# run from the script's own directory so the relative source paths resolve.
+# Resolve both paths to ABSOLUTE first: $0 is relative, so resolving it AFTER
+# the cd below silently produced $PWD/../.. and made the documented
+# `sh shim/build.sh` (from MIB3_RE) fail with "cd: ... No such file or
+# directory".  Works from any cwd now.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOTFS="$(cd "$HERE/../../R8830L_ROOTFS" && pwd)"
+cd "$HERE" || exit 1
 LIBC="$ROOTFS/lib64/libc.so.6"
 LIBDL="$(ls "$ROOTFS"/lib64/libdl-*.so 2>/dev/null | head -n1)"
 echo "linking against: $LIBC  $LIBDL"
