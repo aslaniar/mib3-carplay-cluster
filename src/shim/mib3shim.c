@@ -242,6 +242,8 @@ static void bc(const char *step){
 extern int socket(int, int, int);
 extern int connect(int, const void*, unsigned int);
 extern int setsockopt(int, int, int, const void*, unsigned int);
+extern int *__errno_location(void);
+#define SHIM_ERRNO (*__errno_location())
 #define O_NONBLOCK_ 04000
 #define SOL_SOCKET_ 1
 #define SO_SNDTIMEO_ 21
@@ -260,8 +262,12 @@ static int helper_connect(void){
     for (i = 0; i < 107 && p[i]; i++) sa.path[i] = p[i]; }
   sa.fam = 1 /*AF_UNIX*/;
   fd = socket(1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
-  if (fd < 0) return -1;
-  if (connect(fd, &sa, sizeof(sa)) != 0){ close(fd); return -1; }
+  if (fd < 0){ logkv("sink","helper socket() errno",(u64)(unsigned)SHIM_ERRNO,0); return -1; }
+  if (connect(fd, &sa, sizeof(sa)) != 0){
+    logline("sink/helper-path", helper_path());
+    logkv("sink","helper connect() errno",(u64)(unsigned)SHIM_ERRNO,0);
+    close(fd); return -1;
+  }
   { struct { long s; long us; } tv; tv.s = 0; tv.us = 200000;
     setsockopt(fd, SOL_SOCKET_, SO_SNDTIMEO_, &tv, sizeof(tv)); }
   hlp_fd = fd; hlp_conns++;
@@ -1384,6 +1390,7 @@ static int g_sink_lf = 0;        /* local bridge->surface fallback allowed */
 static void sink_resolve(void);
 static int  sink_start(int w, int h, unsigned ivi_id);   /* deferred to cluster_thread */
 static int  sink_feed(const void *data, unsigned long len, unsigned long ts);
+int  mib3shim_helper_connected(void);
 /* FRAME INTERCEPTION state (route B).  The cluster stream's ScreenStreamRef
  * (per-stream identity) is held in a small REGISTRY (not a single slot): the
  * interposer diverts any stream present in it, and every cluster thread removes
@@ -1703,10 +1710,21 @@ static void *cluster_thread(void *arg){
                     cluster_send_forcekeyframe(c->session, "first-IDR");
                   }
                 }
-                /* the decoded payload is now Annex-B; hand it to the sink
-                 * (helper = out-of-process [safe]; local = in-carplay [hazardous,
-                 * ACK-gated]; off/dry = dropped). */
-                sink_feed(rbuf, (unsigned long)pl, 0);
+                /* The receiver hands us SLICES ONLY -- the parameter sets arrive
+                 * out of band (the opcode-1 avcC record handled above) and are
+                 * NOT present in the media AUs.  A decoder fed bare slices with
+                 * no SPS/PPS decodes nothing; it conceals to flat black (that is
+                 * exactly the "decodes but the surface is black" symptom).  So
+                 * stamp the SPS/PPS onto EVERY AU: ~32 bytes, and it makes each
+                 * AU self-contained, which also makes the helper robust across
+                 * reconnects. */
+                if (g_cl_cfg_len > 0) sink_feed(g_cl_cfg_annexb, g_cl_cfg_len, 0);
+                { int was_conn = mib3shim_helper_connected();
+                  sink_feed(rbuf, (unsigned long)pl, 0);
+                  /* A freshly (re)connected helper has no reference frames, so
+                   * ask the phone for a keyframe and a real IDR will follow. */
+                  if (!was_conn && mib3shim_helper_connected())
+                    cluster_send_forcekeyframe(c->session, "helper-connect"); }
               } else logline("cluster/thread","malformed AU (avcc_prepare) -- dropped");
             }
             if ((frames & 0x3f) == 1){

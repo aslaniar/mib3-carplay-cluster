@@ -83,6 +83,8 @@ def make_idr(w, h, luma):
     bw.ue(0)          # pps_id
     bw.u(4, 0)        # frame_num (log2_max_frame_num = 4)
     bw.ue(0)          # idr_pic_id
+    bw.u(1, 0)        # dec_ref_pic_marking: no_output_of_prior_pics_flag   (IDR, nal_ref_idc!=0)
+    bw.u(1, 0)        # dec_ref_pic_marking: long_term_reference_flag
     bw.se(0)          # slice_qp_delta
     bw.ue(1)          # disable_deblocking_filter_idc = 1 (disabled)
     mbw, mbh = w // 16, h // 16
@@ -115,12 +117,17 @@ def make_idr_i16(w, h):
     bw.ue(0)          # pps_id
     bw.u(4, 0)        # frame_num
     bw.ue(0)          # idr_pic_id
+    bw.u(1, 0)        # dec_ref_pic_marking: no_output_of_prior_pics_flag   (IDR, nal_ref_idc!=0)
+    bw.u(1, 0)        # dec_ref_pic_marking: long_term_reference_flag
     bw.se(0)          # slice_qp_delta
     bw.ue(1)          # disable_deblocking_filter_idc
     mbw, mbh = w // 16, h // 16
     for _ in range(mbh * mbw):
         bw.ue(1 + 2)  # mb_type: I_16x16, intra16x16PredMode=2 (DC), CBP 0/0
         bw.ue(0)      # intra_chroma_pred_mode = DC
+        bw.se(0)      # mb_qp_delta (ALWAYS present for I_16x16)
+        bw.u(1, 1)    # Intra16x16DCLevel coeff_token: TotalCoeff=0, nC<2 -> '1'
+        # (CBP luma/chroma are 0: no AC blocks, no chroma residual)
     bw.rbsp_trailing()
     return nal(0x65, bw.bytes())
 

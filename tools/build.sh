@@ -71,6 +71,16 @@ build_egl mib3egl.c     mib3egl
 [ -f v4l2_probe.c ] && build_libc v4l2_probe.c v4l2_probe
 # v4l2_dec: drive /dev/video32 (the H.264 decoder) directly, V4L2 M2M
 [ -f v4l2_dec.c ] && build_libc v4l2_dec.c v4l2_dec
+# v4l2_seq: the VENDOR-EXACT /dev/video32 sequence (2-plane capture + PREPARE_BUF
+# + private S_CTRLs) captured by strace on the car 2026-10-17. This is the tool
+# that now DECODES the phone's cluster stream into buffers we own.
+[ -f v4l2_seq.c ] && build_libc v4l2_seq.c v4l2_seq
+# ausock: feed Annex-B AUs from a file into the helper's AF_UNIX socket
+# (AUSOCK_UID/AUSOCK_GID drop privileges so the carplay-credential path can be
+# exercised without a phone).
+[ -f ausock.c ] && build_libc ausock.c ausock
+# socktest: reproduce the shim's helper connect as a given uid/gid and print errno
+[ -f socktest.c ] && build_libc socktest.c socktest
 # omx_probe: is the HW decoder drivable via the OpenMAX component API?
 [ -f omx_probe.c ] && build_libc omx_probe.c omx_probe
 [ -f omx_ports.c ] && build_libc omx_ports.c omx_ports
@@ -80,6 +90,7 @@ build_egl mib3egl.c     mib3egl
 [ -f omx_run.c ] && build_libc omx_run.c omx_run
 [ -f omx_fix.c ] && build_libc omx_fix.c omx_fix
 [ -f omx_full.c ] && build_libc omx_full.c omx_full
+[ -f omx_decode.c ] && build_libc omx_decode.c omx_decode   # REDTEAM_DECODE_2026-10-17: the corrected driver (supersedes omx_full on the unit)
 # wl_trace.so: the DRAW-CALL TRACER -- a shared library (not an executable: no crt,
 # no _start).  Loaded into OUR OWN helper only (LD_PRELOAD, or first in
 # MIB3_HELPER_LIBS) to log the EGL/Wayland calls the vendor video device makes.
