@@ -1448,6 +1448,40 @@ static int ship_cmd(void *session, const char *type, CFMutableDictionaryRef para
   if (!session || !p_SendCommand || !p_CFDictionaryCreateMutable ||
       !p_CFDictionarySetValue || !p_kCFLDictKeyCB || !p_kCFLDictValCB || !p_CFRelease)
     return -1;
+  /* ---- GENERATION GUARD (stability, 2026-10-18) ---------------------------
+   * AirPlayReceiverSessionSendCommand is a dispatch_sync_f onto the SESSION's own
+   * control queue, with NO timeout, that builds an RTSP POST /command and
+   * HTTPClientSendMessage()s it (corpus libAirPlay decompiled.c:12863-12899 ->
+   * FUN_00113038 at 9935; the shipped binary at VA 0x17f3c calls
+   * dispatch_sync_f@plt).  This runs on the CLUSTER RECEIVER THREAD.
+   *
+   * Two hazards follow, and the refs/rgi implementation removed this exact
+   * pattern (its SESSION_LIFECYCLE.md defects 3 and 5: "stock command under
+   * alt_lock ... deadlock and use-after-free edge" and "night-mode refresh on
+   * the receive thread ... could outlive a teardown"):
+   *   (a) while the call is in flight we are not read()ing the phone's cluster
+   *       socket, so that stream looks silent-but-ESTABLISHED; and
+   *   (b) `session` was captured at SETUP time.  A superseded receiver thread
+   *       (a new type-111 SETUP creates a new one; the old thread lives until
+   *       its socket ends) would command through an OLD session object.
+   *
+   * Cheap guards, no behaviour change on the healthy path:
+   *   1. only the CURRENT setup generation may command (g_cmd_session is written
+   *      by cluster_setup on every type-111 SETUP);
+   *   2. mirror stock's own liveness byte (session+0x446, set once by
+   *      AirPlayReceiverSessionStart and never cleared: decompiled.c:13087,
+   *      tested at 12877) so we do not enter dispatch_sync on a dead session.
+   * MIB3_SHIM_CMDGEN=0 restores the old unconditional behaviour. */
+  if (env_on("MIB3_SHIM_CMDGEN",1)){
+    if (session != g_cmd_session){
+      logline("cluster/cmd/skipped-superseded", type);
+      return -2;
+    }
+    if (*(volatile signed char*)((char*)session + 0x446) == 0){
+      logline("cluster/cmd/skipped-session-not-started", type);
+      return -3;
+    }
+  }
   CFMutableDictionaryRef cmd = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
   if (!cmd) return -1;
   int rc = -1;
@@ -1500,6 +1534,33 @@ static void cluster_send_forcekeyframe(void *session, const char *why)
   logkv("cluster/cmd","forceKeyFrame rc",(u64)(u32)rc,0);
   logline("cluster/cmd/idr-why", why);
   if (p_CFRelease) p_CFRelease(p);
+}
+/* ---- storm limiter (stability, 2026-10-18) --------------------------------
+ * WHY: the helper link can flap.  v4l2_seq's own comment records the measured
+ * case -- "measured at 8 connections and 7 disconnects in one session", and
+ * "the 200 ms SO_SNDTIMEO fires, it drops the AU and reconnects ... a storm"
+ * (shim/tools/v4l2_seq.c, the THE STORM paragraph).  Every reconnect used to
+ * fire a forceKeyFrame at the phone from the receiver thread, i.e. 7 RTSP
+ * POSTs into a live session at the exact moment the pipeline was already
+ * struggling, each one a blocking dispatch_sync (see ship_cmd's note).
+ * A forced IDR is also the most expensive frame the phone can make (1280x480,
+ * full intra).  One request per MIB3_SHIM_FKR_MIN seconds (default 5) is plenty:
+ * the gate only needs to be reopened, and the phone emits ~1 IDR per stream
+ * anyway (2 IDRs in 1761 slices, LANE_CLUSTER_WORKING 2026-10-18 S2).
+ * MIB3_SHIM_FKR_MIN=0 disables the limiter. ---------------------------------- */
+static long g_last_fkr_s = 0;
+static void cluster_send_forcekeyframe_limited(void *session, const char *why)
+{
+  extern long time(long *);
+  long min = (long)env_num("MIB3_SHIM_FKR_MIN", 5);
+  long now = time(0);
+  if (min > 0 && g_last_fkr_s != 0 && (now - g_last_fkr_s) < min){
+    logkv("cluster/cmd","forceKeyFrame rate-limited (s since last)",(u64)(now - g_last_fkr_s),0);
+    logline("cluster/cmd/idr-skipped-why", why);
+    return;
+  }
+  g_last_fkr_s = now;
+  cluster_send_forcekeyframe(session, why);
 }
 static void cluster_send_nightmode(void *session)
 {
@@ -1724,7 +1785,7 @@ static void *cluster_thread(void *arg){
                   /* A freshly (re)connected helper has no reference frames, so
                    * ask the phone for a keyframe and a real IDR will follow. */
                   if (!was_conn && mib3shim_helper_connected())
-                    cluster_send_forcekeyframe(c->session, "helper-connect"); }
+                    cluster_send_forcekeyframe_limited(c->session, "helper-connect"); }
               } else logline("cluster/thread","malformed AU (avcc_prepare) -- dropped");
             }
             if ((frames & 0x3f) == 1){
