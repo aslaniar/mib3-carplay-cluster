@@ -23,7 +23,18 @@ FILES="mib3shim.so mib3clusterhelper \
   inject/inject.py inject/inject_shim.py inject/target_env.py inject/run_inject.sh \
   live_kit/deliver_ctl.sh live_kit/chain_up.sh live_kit/chain_down.sh \
   live_kit/v4l2_run.sh live_kit/v4l2_sweep.sh \
+  live_kit/start_mss_log.sh live_kit/patha_deliver.sh live_kit/patha_auto.sh \
+  live_kit/start_cluster_helper.sh live_kit/probe.sh \
   tools/v4l2_seq tools/mib3egl tools/ausock tools/socktest tools/rgba_feed"
+
+# WHY the delivery scripts are listed (they were NOT, and it cost a whole trip
+# on 2026-10-17): start_mss_log.sh is the ORACLE -- MS-S's own log on port 54321.
+# Without it the operator cannot read MS-S's decisions at all and every delivery
+# diagnosis is blind.  patha_deliver.sh carries the ECU-side lever; patha_auto.sh
+# is the hands-free watcher that flips delivery when the phone's frames arrive
+# (essential, because the phone cannot be in the car and tethered to the laptop
+# at the same time).  DO NOT remove them from this list.
+# See MIB3_RE/CLOSEOUT_2026-10-17_DECODE.md S4 and LANE_MS_S_SHARE_TRIGGER_2026-10-17.md.
 
 for f in $FILES; do
   [ -f "$f" ] || { echo "[!] missing $f -- run sh build.sh and sh tools/build.sh first"; exit 1; }
