@@ -736,6 +736,7 @@ static void resolve(void){
   logkv("init","real_SessionSetup",(u64)real_SessionSetup,1);
   logkv("init","real_CopyServerInfo",(u64)real_CopyServerInfo,1);
   logkv("init","p_realSSPD",(u64)p_realSSPD,1);
+  logkv("init","p_SendCommand",(u64)p_SendCommand,1);
 }
 
 static int env_on(const char *name, int dflt){
@@ -1614,18 +1615,34 @@ static void *zoom_listen_thread(void *arg)
     for (;;){
       char buf[64]; long n = read(conn, buf, sizeof(buf));
       if (n <= 0) break;
-      { long k;
+      /* line protocol: "+1", "1", "-1", "in", "out" (one per line or streamed).
+       * Parse sign words; ignore digits that follow a sign so "+1" is one step,
+       * not two. */
+      { long k; int dir = 0, sign = 0;
         for (k = 0; k < n; k++){
           char c = buf[k];
-          int dir = 0;
-          if (c == '+') dir = 1;
-          else if (c == '-') dir = -1;
-          else if (c == 'i' || c == 'I') dir = 1;      /* "in"  */
-          else if (c == 'o' || c == 'O') dir = -1;     /* "out" */
-          else if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
-          else { logkv("cluster/zoom","ignored byte",(u64)(unsigned)(c & 0xff),0); continue; }
-          if (env_on("MIB3_SHIM_ZOOM_INVERT",0)) dir = -dir;
-          if (zoom_push(dir)) logkv("cluster/zoom","queued dir",(u64)(u32)(dir > 0 ? 1 : 0),0);
+          if (c == '+'){ sign = 1; dir = 1; }
+          else if (c == '-'){ sign = 1; dir = -1; }
+          else if (c == 'i' || c == 'I'){ sign = 1; dir = 1; }
+          else if (c == 'o' || c == 'O'){ sign = 1; dir = -1; }
+          else if (c == '\n' || c == '\r'){
+            if (sign && dir){
+              int d = dir;
+              if (env_on("MIB3_SHIM_ZOOM_INVERT",0)) d = -d;
+              if (zoom_push(d)) logkv("cluster/zoom","queued dir",(u64)(u32)(d > 0 ? 1 : 0),0);
+              else logline("cluster/zoom","queue full -- step dropped");
+            }
+            sign = 0; dir = 0;
+          }
+          else if (c >= '0' && c <= '9') continue;      /* the magnitude: always 1 step */
+          else if (c == ' ' || c == '\t') continue;
+          else { logkv("cluster/zoom","ignored byte",(u64)(unsigned)(c & 0xff),0); }
+        }
+        /* tolerate a client that does not terminate the last line */
+        if (sign && dir){
+          int d = dir;
+          if (env_on("MIB3_SHIM_ZOOM_INVERT",0)) d = -d;
+          if (zoom_push(d)) logkv("cluster/zoom","queued dir",(u64)(u32)(d > 0 ? 1 : 0),0);
           else logline("cluster/zoom","queue full -- step dropped");
         } }
     }
