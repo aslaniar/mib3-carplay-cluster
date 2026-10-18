@@ -219,9 +219,14 @@ smack_grants() {
 presenter_up() {
   pres_alive && { tlog "$STATE" actuator presenter=already-running pid="$(pids_of "${MIB3_TR_EGLNAME:-mib3egl}")"; return 0; }
   [ -x "$EGL" ] || { tlog "$STATE" actuator presenter=MISSING path="$EGL"; return 1; }
+  # NOTE the 4th positional: 0 = UNBOUNDED.  A positive value (the house runbook
+  # says 3600) makes mib3egl self-terminate after secs*fps frames -- an hour at
+  # 30 fps -- and when the presenter goes, MS-S logs "does not exist", stops
+  # encoding our surface, and the cluster retains the last frame: the lie comes
+  # back on a long drive.  A controller that is meant to run all day must pass 0.
   XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/platform/weston}" \
   WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
-    nohup "$EGL" "$IVIID" "$W" "$H" 3600 00ff00 --persist --fps 30 \
+    nohup "$EGL" "$IVIID" "$W" "$H" 0 00ff00 --persist --fps 30 \
       --rgba-sock "$RGBASOCK" >> "$EGLLOG" 2>&1 &
   bc "presenter:start"
   _i=0; while [ "$_i" -lt 8 ]; do pres_alive && break; sleep 1; _i=$((_i+1)); done
@@ -419,6 +424,10 @@ eval_once() {
       # second one mid-stream wedges the output queue.  So if the phone starts a
       # session and nothing is decoding, this controller starts a fresh decoder
       # (and never reuses one across sessions -- see SHUTDOWN/decoder_down).
+      # ORDER IS LOAD-BEARING (chain_up.sh): the presenter owns ivi $IVIID and the
+      # rgba socket the decoder writes into, so it goes up first.  It must be up
+      # before the frames arrive -- and it must keep running for the whole drive.
+      if ! pres_alive; then presenter_up || true; fi
       if ! dec_alive; then decoder_up || true; fi
       set_state "PENDING" "session-up=$UP frames=$F dec=$(dec_alive && echo up || echo absent)"
       FRAME_LAST="$F"; save_state
