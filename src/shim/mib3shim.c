@@ -1490,7 +1490,18 @@ static int ship_cmd(void *session, const char *type, CFMutableDictionaryRef para
       logline("cluster/cmd/skipped-superseded", type);
       return -2;
     }
-    if (*(volatile signed char*)((char*)session + 0x446) == 0){
+    /* The 0x446 liveness byte is a REVERSE-ENGINEERED offset from the decompiled
+     * corpus (AirPlayReceiverSessionStart / decompiled.c:13087).  The corpus is a
+     * different BUILD from this unit in general, so if this offset is wrong on
+     * this image the check silently disables EVERY command (showUI /
+     * forceKeyFrame / nightMode / changeMapZoomLevel) while everything still
+     * looks connected -- a silent, trip-costing failure.  It is therefore its own
+     * knob so the operator can neutralise it WITHOUT a rebuild:
+     *   MIB3_SHIM_CMDALIVE=0  -> skip the byte check (the generation check above
+     *                            still applies; that one is sound by construction).
+     * Every trip should grep the log for these two skip lines. */
+    if (env_on("MIB3_SHIM_CMDALIVE",1) &&
+        *(volatile signed char*)((char*)session + 0x446) == 0){
       logline("cluster/cmd/skipped-session-not-started", type);
       return -3;
     }
