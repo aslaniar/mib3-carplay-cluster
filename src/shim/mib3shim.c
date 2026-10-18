@@ -242,6 +242,7 @@ static void bc(const char *step){
 extern int socket(int, int, int);
 extern int connect(int, const void*, unsigned int);
 extern int setsockopt(int, int, int, const void*, unsigned int);
+extern long send(int, const void*, unsigned long, int);
 extern int *__errno_location(void);
 #define SHIM_ERRNO (*__errno_location())
 #define O_NONBLOCK_ 04000
@@ -273,6 +274,17 @@ static int helper_connect(void){
   hlp_fd = fd; hlp_conns++;
   return 0;
 }
+/* MSG_NOSIGNAL: a write to a socket whose peer is gone raises SIGPIPE as well as
+ * returning EPIPE, and SIGPIPE's default action is to KILL THE PROCESS.  This shim
+ * runs INSIDE carplay, whose failure action on this unit is reboot-immediate -- so
+ * a helper (decoder) dying while we are mid-write must not be able to take the
+ * process, and the car, down with it.  This became a routine path on 2026-10-18:
+ * the lifecycle controller stops our decoder at the end of every session
+ * (lanes/closeouts: LANE_CLUSTER_TRANSITION_2026-10-18.md S9).  send(MSG_NOSIGNAL)
+ * keeps the fix local to these two writes; it does not touch the process's
+ * signal disposition, so nothing else in carplay changes. */
+#define MIB3_MSG_NOSIGNAL 0x4000
+
 static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   unsigned char hdr[MIB3_HELP_HDRLEN];
   u32 m32; u64 m64; int i;
@@ -282,8 +294,8 @@ static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   m32 = MIB3_HELP_MAGIC; for (i=0;i<4;i++) hdr[i]   = (unsigned char)((m32 >> (i*8)) & 0xff);
   m32 = (u32)len;        for (i=0;i<4;i++) hdr[4+i] = (unsigned char)((m32 >> (i*8)) & 0xff);
   m64 = ++hlp_seq;       for (i=0;i<8;i++) hdr[8+i] = (unsigned char)((m64 >> (i*8)) & 0xff);
-  if (write(hlp_fd, hdr, MIB3_HELP_HDRLEN) != (long)MIB3_HELP_HDRLEN){ hlp_drop++; helper_close(); return -1; }
-  if (write(hlp_fd, data, len) != (long)len){ hlp_drop++; helper_close(); return -1; }
+  if (send(hlp_fd, hdr, MIB3_HELP_HDRLEN, MIB3_MSG_NOSIGNAL) != (long)MIB3_HELP_HDRLEN){ hlp_drop++; helper_close(); return -1; }
+  if (send(hlp_fd, data, len, MIB3_MSG_NOSIGNAL) != (long)len){ hlp_drop++; helper_close(); return -1; }
   hlp_sent++;
   return 0;
 }
@@ -1856,9 +1868,20 @@ typedef struct {
 static volatile int g_lsock = -1;
 static volatile int g_lsock_gen = 0;
 
+/* Which cluster thread owns the helper (AU) socket.  One phone session gets one
+ * cluster setup and therefore one thread, but the unit measured 8 connects / 7
+ * disconnects in a single run, so a newer thread can exist while an older one is
+ * still unwinding.  Only the newest is allowed to close the helper socket (see
+ * the stream-closed path).
+ * [integration note: this is a SECOND, independent generation token; the one
+ * above owns the listener, this one owns the helper/AU socket.  They are not
+ * interchangeable -- a thread can be newest for one and not the other.] */
+static volatile unsigned cl_thread_gen = 0;
+
 static void *cluster_thread(void *arg){
   extern long read(int, void*, unsigned long);
   cl_ctx *c = (cl_ctx*)arg;
+  unsigned cl_my_gen = ++cl_thread_gen;
   int connfd = -1;
   logline("cluster/thread","started (self-contained receiver)");
   if (!c) return 0;
@@ -2071,6 +2094,20 @@ static void *cluster_thread(void *arg){
       logkv("cluster/thread","other-opcodes",(u64)others,0);
       if (p_free && rbuf) p_free(rbuf);
       logline("cluster/thread","stream closed");
+      /* TELL THE DECODER THE STREAM IS OVER.  Nothing downstream can see the
+       * phone hang up otherwise: the AU socket stays open, so v4l2_seq's read()
+       * never returns 0, it keeps running, and the presenter keeps re-committing
+       * its LAST frame -- which is exactly why the cluster shows a map of a road
+       * that no longer exists, forever (LANE_CLUSTER_TRANSITION_2026-10-18).
+       * Closing the helper socket IS the EOF the decoder already handles
+       * (`online: shim gone` -> re-accept), so no decoder change is needed.
+       * GUARD: only the NEWEST cluster thread may close it -- an older session's
+       * thread exiting must not tear down a newer session's AU channel (the unit
+       * measured 8 connects / 7 disconnects in one run). */
+      if (cl_thread_gen == cl_my_gen)
+        { helper_close(); logline("cluster/thread","helper socket closed (EOF for the decoder)"); }
+      else
+        logline("cluster/thread","a newer cluster thread owns the helper socket -- not closing it");
     }
     if (p_close) p_close(connfd);
   } else {
