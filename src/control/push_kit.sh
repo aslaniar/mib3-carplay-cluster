@@ -26,7 +26,7 @@ FILES="mib3shim.so mib3clusterhelper \
   live_kit/v4l2_run.sh live_kit/v4l2_sweep.sh \
   live_kit/start_mss_log.sh live_kit/patha_deliver.sh live_kit/patha_auto.sh \
   live_kit/start_cluster_helper.sh live_kit/probe.sh \
-  live_kit/wheel_zoom.sh live_kit/viewarea.sh \
+  live_kit/wheel_zoom.sh live_kit/usb_diag.sh live_kit/viewarea.sh \
   tools/v4l2_seq tools/mib3egl tools/ausock tools/socktest tools/rgba_feed \
   tools/mib3wheel tools/mib3ctl"
 
