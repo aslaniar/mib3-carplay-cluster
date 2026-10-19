@@ -296,16 +296,33 @@ static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   u32 m32; u64 m64; int i;
   (void)ts;
   if (!data || !len || len > MIB3_HELP_MAXLEN) return -1;
-  if (hlp_fd < 0){ if (helper_connect() != 0){ hlp_drop++; return -1; } }
+  if (hlp_fd < 0){
+    /* With no decoder attached, every AU would otherwise attempt connect()
+     * (~100/s, measured as syscall churn).  One attempt per second is plenty:
+     * the socket appears once the decoder starts. */
+    static long last_try = 0;
+    extern long time(long *);
+    long now = time(0);
+    if (now != last_try){
+      last_try = now;
+      if (helper_connect() != 0){ hlp_drop++; return -1; }
+    } else { hlp_drop++; return -1; }
+  }
   m32 = MIB3_HELP_MAGIC; for (i=0;i<4;i++) hdr[i]   = (unsigned char)((m32 >> (i*8)) & 0xff);
   m32 = (u32)len;        for (i=0;i<4;i++) hdr[4+i] = (unsigned char)((m32 >> (i*8)) & 0xff);
   m64 = ++hlp_seq;       for (i=0;i<8;i++) hdr[8+i] = (unsigned char)((m64 >> (i*8)) & 0xff);
   if (send(hlp_fd, hdr, MIB3_HELP_HDRLEN, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT)
       != (long)MIB3_HELP_HDRLEN){
-    /* Nothing of the record went out, so the stream is still in sync: drop the
-     * AU but KEEP the socket (a transient full buffer must not cause a reconnect
-     * storm). */
-    hlp_drop++; return -1; }
+    /* Nothing of the record went out, so the stream is still in sync.  Keep the
+     * socket ONLY if the failure was EAGAIN/EWOULDBLOCK (11) -- a transient full
+     * buffer must not churn the link.  Anything else (EPIPE after the helper
+     * died, ECONNRESET, ...) must CLOSE it, or the shim keeps a stale fd to an
+     * unlinked socket and never reconnects: measured 2026-10-19, the shim logged
+     * 'helper connected' while the decoder never saw a connection, and the
+     * cluster stayed on its fallback colour forever. */
+    hlp_drop++;
+    if (SHIM_ERRNO != 11) helper_close();
+    return -1; }
   if (send(hlp_fd, data, len, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT) != (long)len){
     /* Partial record = permanent desync; the helper must reconnect. */
     hlp_drop++; helper_close(); return -1; }
@@ -2240,28 +2257,52 @@ static void *zoom_listen_thread(void *arg)
   }
   if (listen(fd, 4) != 0){ logline("cluster/zoom","listen failed"); close(fd); return 0; }
   logline("cluster/zoom/listen", path);
-  for (;;){
-    conn = accept(fd, 0, 0);
-    if (conn < 0) continue;
-    logkv("cluster/zoom","peer fd",(u64)(u32)conn,0);
+  /* MULTI-CLIENT.  mib3wheel keeps its connection open for the whole session, so
+   * a single-client accept loop leaves every one-shot (mib3ctl / viewarea.sh /
+   * wheel_zoom) sitting unaccepted in the backlog: the command is written and
+   * silently never runs.  Found by reading this loop, 2026-10-19. */
+  {
+    struct { int fd; char lb[64]; int ln; } cl[8];
+    int i;
+    for (i = 0; i < 8; i++){ cl[i].fd = -1; cl[i].ln = 0; }
     for (;;){
-      char buf[64]; long n = read(conn, buf, sizeof(buf));
-      char lb[64]; int ln = 0;
-      long k;
-      if (n <= 0) break;
-      /* Line protocol on ONE socket: zoom steps ("+1","-1","in","out") and
-       * view-area requests ("v3","view 1","next","prev").  Accumulate and
-       * dispatch per line; a token that arrives without a terminator is
-       * dispatched at the end of the chunk, exactly as the old parser did. */
-      for (k = 0; k < n; k++){
-        char c = buf[k];
-        if (c == '\n' || c == '\r'){ ctl_handle_line(lb, ln); ln = 0; continue; }
-        if (ln < (int)sizeof(lb) - 1) lb[ln++] = c;
+      struct { int fd; short events; short revents; } pfd[9];
+      int n = 1, ci[9];
+      extern int poll(void*, unsigned long, int);
+      pfd[0].fd = fd; pfd[0].events = 1; pfd[0].revents = 0; ci[0] = -1;
+      for (i = 0; i < 8; i++) if (cl[i].fd >= 0){
+        pfd[n].fd = cl[i].fd; pfd[n].events = 1; pfd[n].revents = 0; ci[n] = i; n++;
       }
-      ctl_handle_line(lb, ln);
+      if (poll(pfd, (unsigned long)n, -1) < 0) continue;
+      if (pfd[0].revents & 1){
+        conn = accept(fd, 0, 0);
+        if (conn >= 0){
+          int slot = -1;
+          for (i = 0; i < 8; i++) if (cl[i].fd < 0){ slot = i; break; }
+          if (slot >= 0){
+            cl[slot].fd = conn; cl[slot].ln = 0;
+            logkv("cluster/zoom","peer fd",(u64)(u32)conn,0);
+          } else close(conn);                 /* table full: drop this client */
+        }
+      }
+      for (i = 1; i < n; i++) if (pfd[i].revents & 1){
+        int j = ci[i];
+        char buf[64]; long r, k;
+        if (cl[j].fd < 0) continue;
+        r = read(cl[j].fd, buf, sizeof(buf));
+        if (r <= 0){
+          logline("cluster/zoom","peer gone");
+          close(cl[j].fd); cl[j].fd = -1; cl[j].ln = 0;
+          continue;
+        }
+        for (k = 0; k < r; k++){
+          char c = buf[k];
+          if (c == '\n' || c == '\r'){ ctl_handle_line(cl[j].lb, cl[j].ln); cl[j].ln = 0; continue; }
+          if (cl[j].ln < (int)sizeof(cl[j].lb) - 1) cl[j].lb[cl[j].ln++] = c;
+        }
+        ctl_handle_line(cl[j].lb, cl[j].ln);
+      }
     }
-    logline("cluster/zoom","peer gone");
-    close(conn);
   }
   return 0;   /* unreachable */
 }
