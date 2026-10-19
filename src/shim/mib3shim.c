@@ -2371,15 +2371,6 @@ int mib3shim_viewarea_send(void *session, int index)
   resolve();
   return cluster_send_viewarea(session ? session : g_cmd_session, index, 250, "harness");
 }
-/* Bench entry point: fire the completion path by hand (the harness cannot make
- * libAirplay call it).  `gen` is the generation to stamp: 0 = current. */
-int mib3shim_cmdack_fire(int status, int gen, const char *type)
-{
-  cmd_ack_slot *sl = cmd_ack_take(type ? type : "synthetic", -1);
-  if (gen) sl->gen = (unsigned)gen;
-  cmd_completion(status, 0, sl);
-  return 0;
-}
 
 /* Drain queued appearance updates for the cluster thread. */
 int mib3shim_appear_pump(void *session, int max)
@@ -3216,6 +3207,12 @@ static void run_banner(void){
   bs(&b,"  VA_CMD="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_CMD",1),10,0);
   bs(&b,"  VA_VISIBLE="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_VISIBLE",0),10,0);
   bs(&b,"  APPEARANCE="); bu64(&b,(u64)env_on("MIB3_SHIM_APPEARANCE",0),10,0);
+  /* command-channel health, cumulative since injection: /0 accepted, /refused,
+   * /stale.  A non-zero REFUSED or STALE here is the first thing to read when a
+   * command "did nothing". */
+  bs(&b,"  ACKOK="); bu64(&b,(u64)g_ack_ok,10,0);
+  bs(&b,"  ACKREF="); bu64(&b,(u64)g_ack_refused,10,0);
+  bs(&b,"  ACKSTALE="); bu64(&b,(u64)g_ack_stale,10,0);
   bs(&b," ======\n");
   bs(&b,"[mib3shim] ================================================================\n");
   mem[b.n]=0;
