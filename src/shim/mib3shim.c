@@ -307,6 +307,10 @@ typedef CFIndex     (*fn_CFArrayGetCount)(CFArrayRef);
 typedef CFTypeRef   (*fn_CFArrayGetValueAtIndex)(CFArrayRef,CFIndex);
 typedef CFMutableArrayRef (*fn_CFArrayCreateMutable)(CFAllocatorRef,CFIndex,const void*);
 typedef void        (*fn_CFArrayAppendValue)(CFMutableArrayRef,const void*);
+/* CFArrayAppendInt64(dict, s64) -- exported by the unit's libCoreUtils CFLite
+ * (verified: llvm-readelf on lge/app_rw/lib64/libCoreUtils.so).  Needed for
+ * adjacentViewAreas = [0] in updateViewArea (see the VIEW AREAS block). */
+typedef void        (*fn_CFArrayAppendInt64)(CFMutableArrayRef,s64);
 typedef void        (*fn_CFDictionarySetValue)(CFMutableDictionaryRef,const void*,const void*);
 typedef CFTypeRef   (*fn_CFDictionaryGetValue)(CFDictionaryRef,const void*);
 typedef void        (*fn_CFShow)(CFTypeRef);
@@ -443,6 +447,7 @@ static fn_CFStringGetCString        p_CFStringGetCString;
 static fn_CFArrayGetCount           p_CFArrayGetCount;
 static fn_CFArrayGetValueAtIndex    p_CFArrayGetValueAtIndex;
 static fn_CFArrayAppendValue        p_CFArrayAppendValue;
+static fn_CFArrayAppendInt64        p_CFArrayAppendInt64;
 static fn_CFDictionarySetValue      p_CFDictionarySetValue;
 static fn_CFDictionaryGetValue      p_CFDictionaryGetValue;
 static fn_CFShow                    p_CFShow;
@@ -655,6 +660,18 @@ static char g_cluster_uuid_str[64];
 static volatile long g_night_mode = 0;     /* the advertised nightMode (for setNightMode) */
 /* session that owns the live cluster stream (command target for showUI etc.) */
 static void *volatile g_cmd_session = 0;
+/* COMMAND GENERATION (2026-10-19, view-area lane).  Bumped every time the
+ * command target changes (cluster_setup for a new type-111 SETUP, and the
+ * harness entry point).  A completion callback compares the generation it was
+ * issued under with this value and DROPS (does not apply/log as current) a reply
+ * that belongs to a superseded session.  Same idea as cl_thread_gen and
+ * g_lsock_gen -- deliberately a THIRD, independent token, because it guards a
+ * third thing (the RTSP command channel), and the three can disagree. */
+static volatile unsigned g_cmd_gen = 0;
+/* The view-area index we believe the PHONE has applied, and the index we last
+ * REQUESTED.  g_va_current moves only on a status-0 completion (never on send),
+ * so a refused switch cannot strand the display in a state we think we are in. */
+static volatile int g_va_current = 0;
 
 #define CLUSTER_URL_DEFAULT "maps:/car/instrumentcluster/map"
 static char g_cluster_url[160];            /* showUI url (== the advertised initialURL) */
@@ -669,6 +686,7 @@ static void resolve(void){
   p_CFArrayGetCount           = (fn_CFArrayGetCount)          R("CFArrayGetCount");
   p_CFArrayGetValueAtIndex    = (fn_CFArrayGetValueAtIndex)   R("CFArrayGetValueAtIndex");
   p_CFArrayAppendValue        = (fn_CFArrayAppendValue)       R("CFArrayAppendValue");
+  p_CFArrayAppendInt64        = (fn_CFArrayAppendInt64)       R("CFArrayAppendInt64");
   p_CFDictionarySetValue      = (fn_CFDictionarySetValue)     R("CFDictionarySetValue");
   p_CFDictionaryGetValue      = (fn_CFDictionaryGetValue)     R("CFDictionaryGetValue");
   p_CFShow                    = (fn_CFShow)                   R("CFShow");
@@ -876,6 +894,183 @@ static s64 dgeti64k(CFDictionaryRef d, const char *key, s64 dflt){
   return v;
 }
 
+/* ==========================================================================
+ * VIEW AREAS (2026-10-19, view-area lane).
+ *
+ * WHY.  The instrument cluster has a VIEW button that cycles its layout: one
+ * layout is a full-panel map, another is a two-gauge layout with the map in the
+ * middle.  When the driver picks the gauge layout, the CLUSTER ECU paints the
+ * gauges over the video we deliver -- and the PHONE never learns that its window
+ * shrank, because we advertise exactly ONE view area (the full 1280x480 panel)
+ * and never send updateViewArea.  So Apple Maps keeps drawing as if it owned the
+ * whole panel, and a large part of it disappears behind the gauges.
+ *
+ * WHAT THE PHONE NEEDS.  The /info display entry carries `viewAreas` (an array of
+ * {originXPixels,originYPixels,widthPixels,heightPixels,safeArea?}),
+ * `initialViewArea` (an index) and `adjacentViewAreas`.  The phone bounds-checks
+ * an updateViewArea index against THAT array, so a second area must be
+ * PREDECLARED before we can switch to it.  Two-part change:
+ *   (a) declare N areas here, and
+ *   (b) switch between them with updateViewArea (cluster_send_viewarea).
+ *
+ * SHAPE CHOSEN (and why).  Per refs/rgi -- verified on real hardware,
+ * docs/cluster-and-rgi/KDK_GEOMETRY_AND_ANIMATION.md + THIRD_PARTY_NAV_APPS.md --
+ * EVERY declared area keeps the FULL encoded/visible frame and the areas differ
+ * only in the NESTED `safeArea`.  rgi measured that an area whose *visible* frame
+ * was reduced got the stream rejected at activation (root cause unknown); keeping
+ * the visible frame full avoided that.  Our default follows that proven shape,
+ * with MIB3_SHIM_VA_VISIBLE=1 as the deliberate experiment for the trip.
+ *
+ * KNOBS (all default OFF: the shipped default advert is the single full-panel
+ * area, byte-for-byte what it is today):
+ *   MIB3_SHIM_VIEWAREAS=1        declare multiple view areas (default: off)
+ *   MIB3_SHIM_VA_COUNT=n         how many (default 2)
+ *   MIB3_SHIM_VA<i>="x,y,w,h[,sx,sy,sw,sh]"  explicit rects for area i
+ *   MIB3_SHIM_VA_VISIBLE=1       also shrink the *visible* frame of areas >0 to
+ *                                their safe rect (the rgi-refuted shape)
+ *   MIB3_SHIM_VA_NOOUTSIDE=1     omit drawUIOutsideSafeArea from safeArea
+ *   MIB3_SHIM_VA_CMD=0           do not ship updateViewArea on a switch
+ * ========================================================================*/
+typedef struct { int x, y, w, h; int sx, sy, sw, sh; } va_rect;
+
+/* Provisional safe rect for the gauge layout on the 1280x480 panel.
+ * THIS IS A GUESS AND IS LABELLED AS ONE -- see the lane doc.  It is centred:
+ * (1280-480)/2 = 400 and (480-400)/2 = 40, and 480 px wide so that CarPlay's
+ * CPSInstrumentClusterCardLayout does not classify it "narrow" -- rgi measured
+ * that threshold at ~498 px on a 1440 px panel = 34.6% of the width, and 34.6%
+ * of 1280 is 443, so 480 clears it.  400 px tall clears rgi's other limit
+ * (~290 px for the centred card).  It is NOT measured on the Arteon. */
+#define VA_GAUGE_SAFE "400,40,480,400"
+
+static int va_parse_rect(const char *s, va_rect *r)
+{
+  int v[8]; int n = 0; int any = 0;
+  if (!s || !r) return 0;
+  for (;;){
+    while (*s == ' ' || *s == '\t' || *s == ',') s++;
+    if (*s < '0' || *s > '9') break;
+    { int x = 0; any = 1; while (*s >= '0' && *s <= '9'){ x = x*10 + (*s - '0'); s++; } v[n++] = x; }
+    if (n >= 8) break;
+  }
+  if (n < 4 || !any) return 0;
+  r->x = v[0]; r->y = v[1]; r->w = v[2]; r->h = v[3];
+  if (n >= 8){ r->sx = v[4]; r->sy = v[5]; r->sw = v[6]; r->sh = v[7]; }
+  else { r->sx = r->x; r->sy = r->y; r->sw = r->w; r->sh = r->h; }
+  return 1;
+}
+static int va_count(void)
+{
+  long n = (long)env_num("MIB3_SHIM_VA_COUNT", 2);
+  if (n < 1) n = 1;
+  if (n > 8) n = 8;
+  return (int)n;
+}
+/* Fill rect i (1-based env name suffix: area 0 -> MIB3_SHIM_VA0). */
+static int va_rect_at(int i, int cw, int chp, va_rect *r)
+{
+  char nm[24]; int j = 0; const char *p = "MIB3_SHIM_VA";
+  while (*p && j < (int)sizeof(nm) - 3) nm[j++] = *p++;
+  nm[j++] = (char)('0' + (i % 10)); nm[j] = 0;
+  { const char *s = getenv(nm); if (s && s[0] && va_parse_rect(s, r)) return 1; }
+  if (i == 0){                                     /* area 0 = the full panel */
+    r->x = 0; r->y = 0; r->w = cw; r->h = chp;
+    r->sx = 0; r->sy = 0; r->sw = cw; r->sh = chp;
+    return 1;
+  }
+  { va_rect g; va_parse_rect(VA_GAUGE_SAFE, &g);   /* provisional default */
+    r->x = 0; r->y = 0; r->w = cw; r->h = chp;
+    r->sx = g.sx; r->sy = g.sy; r->sw = g.sw; r->sh = g.sh;
+    /* clamp to the real panel so an odd size can never yield a safeArea that
+     * lies outside the display */
+    if (r->sx < 0) r->sx = 0;
+    if (r->sy < 0) r->sy = 0;
+    if (r->sw > cw - r->sx) r->sw = cw - r->sx;
+    if (r->sh > chp - r->sy) r->sh = chp - r->sy;
+  }
+  return 1;
+}
+/* One area dict: visible rect + nested safeArea (+ optional
+ * drawUIOutsideSafeArea, the same CFBoolean-true object the single-area path
+ * uses today).  Returns +1 owned by the caller. */
+static CFMutableDictionaryRef va_build_one(const va_rect *r)
+{
+  CFMutableDictionaryRef area, safe;
+  if (!p_CFDictionaryCreateMutable || !p_kCFLDictKeyCB || !p_kCFLDictValCB) return 0;
+  area = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
+  safe = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
+  if (!area || !safe){
+    if (p_CFRelease){ if (safe) p_CFRelease(safe); if (area) p_CFRelease(area); }
+    return 0;
+  }
+  dseti(area, "widthPixels",  (s64)r->w);
+  dseti(area, "heightPixels", (s64)r->h);
+  dseti(area, "originXPixels",(s64)r->x);
+  dseti(area, "originYPixels",(s64)r->y);
+  dseti(safe, "widthPixels",  (s64)r->sw);
+  dseti(safe, "heightPixels", (s64)r->sh);
+  dseti(safe, "originXPixels",(s64)r->sx);
+  dseti(safe, "originYPixels",(s64)r->sy);
+  if (p_kCFLBooleanTrue && !env_on("MIB3_SHIM_VA_NOOUTSIDE",0)){
+    void *btrue = *(void **)p_kCFLBooleanTrue;
+    if (btrue) dseto(safe, "drawUIOutsideSafeArea", btrue);
+  }
+  dseto(area, "safeArea", safe);
+  if (p_CFRelease) p_CFRelease(safe);
+  return area;
+}
+/* one "visible=x,y,w,h safe=x,y,w,h" line, no allocation */
+static void va_log_rect(int i, const va_rect *r)
+{
+  char b[160]; int k = 0; int v[8]; int q, j;
+  v[0]=r->x; v[1]=r->y; v[2]=r->w; v[3]=r->h;
+  v[4]=r->sx; v[5]=r->sy; v[6]=r->sw; v[7]=r->sh;
+  for (q = 0; q < 2; q++){
+    const char *t = q ? " safe=" : "visible=";
+    while (*t) b[k++] = *t++;
+    for (j = 0; j < 4; j++){
+      int x = v[q*4 + j]; char d[12]; int m = 0;
+      if (x < 0) x = 0;
+      if (!x) d[m++] = '0';
+      while (x){ d[m++] = (char)('0' + (x % 10)); x /= 10; }
+      if (j) b[k++] = ',';
+      while (m) b[k++] = d[--m];
+    }
+  }
+  b[k] = 0;
+  logkv("cluster/va","area index",(u64)(u32)i,0);
+  logline("cluster/va/rect", b);
+}
+
+/* The multi-area `viewAreas` array.  Returns +1 owned by the caller.  Logs one
+ * `cluster/va/area` line per declared area (new lines only -- the existing
+ * "viewAreas added" meaning is untouched). */
+static CFMutableArrayRef va_build(int cw, int chp)
+{
+  fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
+  CFMutableArrayRef va;
+  int n = va_count(), i;
+  if (!mka || !p_kCFTypeArrayCallBacks || !p_CFArrayAppendValue) return 0;
+  va = mka(0, n, p_kCFTypeArrayCallBacks);
+  if (!va) return 0;
+  for (i = 0; i < n; i++){
+    va_rect r;
+    CFMutableDictionaryRef a;
+    if (!va_rect_at(i, cw, chp, &r)) continue;
+    /* MIB3_SHIM_VA_VISIBLE=1: use the safe rect as the visible frame too (the
+     * shape rgi measured as rejected at activation -- a deliberate trip test). */
+    if (i > 0 && env_on("MIB3_SHIM_VA_VISIBLE",0)){
+      r.x = r.sx; r.y = r.sy; r.w = r.sw; r.h = r.sh;
+    }
+    a = va_build_one(&r);
+    if (!a) continue;
+    p_CFArrayAppendValue(va, a);       /* array retains */
+    if (p_CFRelease) p_CFRelease(a);
+    va_log_rect(i, &r);
+  }
+  logkv("cluster/va","count declared",(u64)(unsigned)p_CFArrayGetCount(va),0);
+  return va;
+}
+
 static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
   CFMutableDictionaryRef d = last_dict(inArray);
   if (!d){ logline("cluster","no dict to annotate"); return; }
@@ -893,8 +1088,21 @@ static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
     dsetv(d, "initialURL", us);
     logline("cluster/initialURL", us); }
   }
-  /* viewAreas = [ { view rect + safeArea (full panel, drawUIOutsideSafeArea) } ] */
-  if (p_CFDictionaryCreateMutable && p_CFDictionarySetInt64 && p_CFArrayAppendValue &&
+  /* viewAreas = [ { view rect + safeArea (full panel, drawUIOutsideSafeArea) } ]
+   *
+   * DEFAULT PATH IS UNCHANGED (byte-for-byte): one full-panel area.  With
+   * MIB3_SHIM_VIEWAREAS=1, va_build() declares N areas instead (see the VIEW
+   * AREAS block above).  Both paths emit the SAME "viewAreas added" line, so no
+   * existing log line changes meaning. */
+  if (env_on("MIB3_SHIM_VIEWAREAS",0)){
+    CFMutableArrayRef va2 = va_build(cw, chp);
+    if (va2){
+      dseto(d, "viewAreas", va2);
+      dseti(d, "initialViewArea", 0);
+      logline("cluster","viewAreas added");
+      if (p_CFRelease) p_CFRelease(va2);        /* dict retains it */
+    }
+  } else if (p_CFDictionaryCreateMutable && p_CFDictionarySetInt64 && p_CFArrayAppendValue &&
       p_CFDictionarySetValue && p_kCFTypeArrayCallBacks && p_kCFLDictKeyCB && p_kCFLDictValCB){
     fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
     CFMutableArrayRef va = mka ? mka(0,0,p_kCFTypeArrayCallBacks) : 0;
@@ -1456,7 +1664,98 @@ static int cl_stream_has(void *s){
  * ======================================================================== */
 /* build {type:.., params:..}; params is consumed (retained by the cmd dict,
  * our +1 released here after SendCommand returns, per the stock pattern). */
-static int ship_cmd(void *session, const char *type, CFMutableDictionaryRef params)
+/* ---- COMMAND COMPLETION (2026-10-19, view-area lane) ----------------------
+ * AirPlayReceiverSessionSendCommand(session, cmd, completion, ctx): the stock
+ * response handler for POST /command calls
+ *     completion(int status, CFDictionaryRef resp|NULL, void *ctx)
+ * with status 0 = the phone ACCEPTED/applied and non-zero = refused.  Until now
+ * we always passed (0,0) and could not tell "delivered" from "refused" -- the
+ * same blindness that hid the missing "type" key (INTEGRATION_2026-10-18).
+ *
+ * WHERE IT RUNS: libairplay's HTTP-client thread, some time AFTER SendCommand
+ * returns, and it may outlive the session that issued it.  It therefore does
+ * NOTHING but compare the generation it was issued under with g_cmd_gen and
+ * write one log line.  It touches no CF object (the resp dictionary is
+ * deliberately ignored), takes no lock, and performs no display or socket I/O,
+ * so it cannot deadlock the control queue or race a teardown.
+ *
+ * LIFETIME: `ctx` is one of a small ring of STATIC slots, valid for the life of
+ * the process -- no malloc, nothing to free, no cross-thread ownership.  ship_cmd
+ * runs on one thread at a time (the cluster receiver thread / the harness), so
+ * the round-robin is monotonic; a slot reused before its reply arrives simply
+ * logs under the newer command's name, which is bounded and harmless.
+ *
+ * MIB3_SHIM_CMDACK=0 restores the exact old call, SendCommand(session, cmd, 0, 0).
+ * -------------------------------------------------------------------------*/
+#define CMD_ACK_SLOTS 8
+typedef struct {
+  volatile int  inuse;
+  volatile unsigned gen;
+  volatile int  idx;
+  char          type[24];
+} cmd_ack_slot;
+static cmd_ack_slot g_ack_slots[CMD_ACK_SLOTS];
+static volatile int g_ack_rr = 0;
+/* counters, so one grep shows the health of the whole command channel */
+static volatile long g_ack_ok = 0, g_ack_refused = 0, g_ack_stale = 0;
+
+static void cmd_ack_name(int idx)
+{
+  if (idx == 0)        logline("cluster/cmd/ack","viewarea index 0 (full panel) APPLIED");
+  else if (idx < 0)    logline("cluster/cmd/ack","(not a view-area command)");
+  else                 logkv("cluster/cmd/ack","viewarea index APPLIED",(u64)(u32)idx,0);
+}
+
+/* The completion callback.  Return type is void; the stock pattern in the
+ * decompiled corpus (libAirPlay ProcessFrames' response path) is a plain
+ * function pointer with this exact 3-argument shape. */
+static void cmd_completion(int status, void *resp, void *ctx)
+{
+  cmd_ack_slot *s = (cmd_ack_slot *)ctx;
+  (void)resp;                       /* deliberately untouched: CF object, other thread */
+  if (!s) return;
+  if (s->gen != g_cmd_gen){
+    /* A superseded type-111 session's late reply.  Dropped, never applied --
+     * acting on it would command a session that no longer exists. */
+    g_ack_stale++;
+    logkv("cluster/cmd/ack/stale","status",(u64)(u32)status,0);
+    logline("cluster/cmd/ack/stale", s->type);
+    return;
+  }
+  if (status == 0) g_ack_ok++; else g_ack_refused++;
+  logkv("cluster/cmd/ack","status (0=accepted)",(u64)(u32)status,0);
+  logline("cluster/cmd/ack/type", s->type);
+  if (s->idx >= 0){
+    if (status == 0){
+      /* the phone APPLIED the view-area switch -- only now do we believe it */
+      g_va_current = s->idx;
+      logkv("cluster/va/applied","index",(u64)(u32)s->idx,0);
+      cmd_ack_name(s->idx);
+    } else {
+      /* refused: g_va_current is deliberately NOT moved.  The display is
+       * whatever it was before; this is a logged no-op. */
+      logkv("cluster/va/refused","index",(u64)(u32)s->idx,0);
+    }
+  }
+  if (status != 0) logline("cluster/cmd/ack/refused", s->type);
+}
+
+/* hand out the next slot for a command of `type` (idx<0 = no view-area index) */
+static cmd_ack_slot *cmd_ack_take(const char *type, int idx)
+{
+  cmd_ack_slot *s;
+  int n = g_ack_rr;
+  g_ack_rr = (n + 1) % CMD_ACK_SLOTS;
+  s = &g_ack_slots[n];
+  { int i = 0; while (type && type[i] && i < (int)sizeof(s->type) - 1){ s->type[i] = type[i]; i++; }
+    s->type[i] = 0; }
+  s->idx   = idx;
+  s->gen   = g_cmd_gen;
+  s->inuse = 1;
+  return s;
+}
+
+static int ship_cmd_i(void *session, const char *type, CFMutableDictionaryRef params, int va_idx)
 {
   if (!session || !p_SendCommand || !p_CFDictionaryCreateMutable ||
       !p_CFDictionarySetValue || !p_kCFLDictKeyCB || !p_kCFLDictValCB || !p_CFRelease)
@@ -1522,12 +1821,24 @@ static int ship_cmd(void *session, const char *type, CFMutableDictionaryRef para
     if (kt && kp && vt && params){
       p_CFDictionarySetValue(cmd, kt, vt);
       p_CFDictionarySetValue(cmd, kp, params);
-      rc = p_SendCommand(session, cmd, 0, 0);  /* serialized onto the session's own control queue */
+      /* COMPLETION (2026-10-19): MIB3_SHIM_CMDACK=1 (default) passes a real
+       * callback so the phone's verdict is visible in the log; =0 is the exact
+       * pre-2026-10-19 call, SendCommand(session, cmd, 0, 0). */
+      if (env_on("MIB3_SHIM_CMDACK",1)){
+        cmd_ack_slot *slot = cmd_ack_take(type, va_idx);
+        rc = p_SendCommand(session, cmd, (void*)cmd_completion, slot);
+      } else {
+        rc = p_SendCommand(session, cmd, 0, 0);  /* serialized onto the session's own control queue */
+      }
     }
     if (p_CFRelease){ if (vt) p_CFRelease(vt); if (kp) p_CFRelease(kp); if (kt) p_CFRelease(kt); }
   }
   p_CFRelease(cmd);                            /* caller releases after SendCommand returns (stock pattern) */
   return rc;
+}
+static int ship_cmd(void *session, const char *type, CFMutableDictionaryRef params)
+{
+  return ship_cmd_i(session, type, params, -1);
 }
 /* params dict with the cluster display uuid preset */
 static CFMutableDictionaryRef cmd_params_uuid(void)
@@ -1607,6 +1918,130 @@ static void cluster_send_nightmode(void *session)
 }
 
 /* ==========================================================================
+ * UPDATE VIEW AREA (2026-10-19, view-area lane) -- THE KEY ITEM.
+ *
+ * The cluster's VIEW button changes the layout the ECU paints, but nothing tells
+ * the phone, so Apple Maps keeps rendering into the whole panel and the gauges
+ * cover it.  This ships the CarPlay command that re-frames the cluster scene:
+ *
+ *   {type:"updateViewArea",
+ *    params:{uuid, viewAreaIndex, animationDurationMillis, adjacentViewAreas}}
+ *
+ * `adjacentViewAreas` MUST ALWAYS BE PRESENT (rgi, verified against the stock
+ * MHI3 AirPlayReceiverSessionViewAreaUpdate): [] when the FULL-screen area is
+ * current, [0] when a smaller area is current.  iOS keeps
+ * CARScreenInfo.adjacentViewArea SEPARATE from currentViewArea, so omitting the
+ * key is observably different from sending an empty array.
+ *
+ * The phone bounds-checks viewAreaIndex against the viewAreas we declared in
+ * /info (carEndpoint_validateViewAreaParams: "viewAreaIndex < viewAreas.count"),
+ * which is why declaring the areas (va_build) must land first.
+ *
+ * GATES: MIB3_SHIM_VIEWAREAS=1 (we declared them) AND MIB3_SHIM_CMDS=1 (commands
+ * are on) AND MIB3_SHIM_VA_CMD=1 (this one specifically).  A refused or ignored
+ * switch is a LOGGED NO-OP: g_va_current is only updated when the phone's
+ * completion says status 0 -- so a failure can never strand the display in a
+ * state we believe we are in but the phone is not.
+ * ========================================================================*/
+static int cluster_send_viewarea(void *session, int index, int dur_ms, const char *why)
+{
+  CFMutableDictionaryRef p;
+  fn_CFArrayCreateMutable mka;
+  CFMutableArrayRef adj;
+  int rc;
+  if (!session || !env_on("MIB3_SHIM_CMDS",1)) return -1;
+  if (!env_on("MIB3_SHIM_VIEWAREAS",0)){
+    logline("cluster/va/cmd","skipped (MIB3_SHIM_VIEWAREAS=0)");
+    return -1;
+  }
+  if (!env_on("MIB3_SHIM_VA_CMD",1)){
+    logline("cluster/va/cmd","skipped (MIB3_SHIM_VA_CMD=0)");
+    return -1;
+  }
+  if (index < 0 || index >= va_count()){
+    logkv("cluster/va/cmd","index out of range (declared count)",(u64)(u32)va_count(),0);
+    logline("cluster/va/cmd","refused locally -- no command sent");
+    return -1;
+  }
+  if (!g_cluster_uuid_str[0]){ logline("cluster/va/cmd","skipped (no cluster uuid)"); return -1; }
+  mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
+  if (!mka || !p_kCFTypeArrayCallBacks || !p_CFArrayAppendInt64){
+    logline("cluster/va/cmd","skipped (CF helpers missing)");
+    return -1;
+  }
+  p = cmd_params_uuid();
+  if (!p) return -1;
+  dseti(p, "viewAreaIndex", (s64)index);
+  dseti(p, "animationDurationMillis", (s64)(dur_ms > 0 ? dur_ms : 250));
+  adj = mka(0, index == 0 ? 0 : 1, p_kCFTypeArrayCallBacks);
+  if (!adj){ if (p_CFRelease) p_CFRelease(p); return -1; }
+  /* full-screen area current -> []; a smaller area current -> [0] */
+  if (index != 0) p_CFArrayAppendInt64(adj, 0);
+  dseto(p, "adjacentViewAreas", adj);
+  if (p_CFRelease) p_CFRelease(adj);           /* params retains it */
+
+  rc = ship_cmd_i(session, "updateViewArea", p, index);
+  logkv("cluster/va/cmd","index shipped",(u64)(u32)index,0);
+  logkv("cluster/va/cmd","adjacent (0=[],1=[0])",(u64)(unsigned)(index == 0 ? 0 : 1),0);
+  logkv("cluster/va/cmd","updateViewArea rc",(u64)(u32)rc,0);
+  logline("cluster/va/cmd/why", why ? why : "?");
+  if (p_CFRelease) p_CFRelease(p);
+  /* The phone's verdict arrives asynchronously in cmd_completion(); do NOT
+   * assume success here. */
+  return rc;
+}
+
+/* ==========================================================================
+ * APPEARANCE (2026-10-19, view-area lane).
+ *
+ *   {type:"mapAppearanceUpdate"|"uiAppearanceUpdate",
+ *    params:{uuid, appearanceMode, appearanceSetting}}
+ *
+ * Per-SURFACE appearance: finer grained than setNightMode, which is one mode for
+ * the whole session.  rgi ships exactly this pair (altscreen_hook.c:2678-2683)
+ * with a [target][mode][setting] triple where target 0 = UI, 1 = map.
+ *
+ * KNOBS: MIB3_SHIM_APPEARANCE=1 arms it; MIB3_SHIM_APPMODE / MIB3_SHIM_APPSETTING
+ * give the pair; MIB3_SHIM_APPTARGET=map|ui picks which command.  Nothing is
+ * sent unless APPEARANCE is on, so the shipped default is unchanged.  Driven at
+ * runtime by the control-inbox line `a <map|ui> <mode> <setting>`.
+ *
+ * "Drive from the car's theme where possible": NOT POSSIBLE YET -- the only
+ * theme-ish signal we already have is g_night_mode (from setNightMode), and
+ * there is no shipped RSI/viwi service that publishes the cluster's appearance
+ * (see the lane doc, problem A).  dayNight IS exposed on
+ * viwi.service.hmiintegration (port 49506, service `hmiintegration`), which is
+ * the honest candidate for a future auto-drive; it is not wired here.
+ * ========================================================================*/
+static void cluster_send_appearance(void *session, int is_map, int mode, int setting)
+{
+  CFMutableDictionaryRef p;
+  int rc;
+  if (!session || !env_on("MIB3_SHIM_CMDS",1)) return;
+  if (!g_cluster_uuid_str[0]){ logline("cluster/appear","skipped (no cluster uuid)"); return; }
+  p = cmd_params_uuid();
+  if (!p) return;
+  dseti(p, "appearanceMode", (s64)mode);
+  dseti(p, "appearanceSetting", (s64)setting);
+  rc = ship_cmd(session, is_map ? "mapAppearanceUpdate" : "uiAppearanceUpdate", p);
+  logkv("cluster/appear","target (0=ui 1=map)",(u64)(u32)(is_map ? 1 : 0),0);
+  logkv("cluster/appear","appearanceMode",(u64)(u32)mode,0);
+  logkv("cluster/appear","appearanceSetting",(u64)(u32)setting,0);
+  logkv("cluster/appear","rc",(u64)(u32)rc,0);
+  if (p_CFRelease) p_CFRelease(p);
+}
+/* One-shot, at first IDR, when armed. */
+static void cluster_send_appearance_armed(void *session)
+{
+  if (!env_on("MIB3_SHIM_APPEARANCE",0)) return;
+  { const char *t = getenv("MIB3_SHIM_APPTARGET");
+    int is_map = (t && (t[0]=='m'||t[0]=='M')) ? 1 : 0;
+    int mode = (int)env_num("MIB3_SHIM_APPMODE", 0);
+    int set  = (int)env_num("MIB3_SHIM_APPSETTING", 0);
+    cluster_send_appearance(session, is_map, mode, set); }
+}
+
+/* ==========================================================================
  * ZOOM: the STEERING-WHEEL up/down mirror (2026-10-18).
  *
  * WHY THIS EXISTS (see LANE_CLUSTER_ZOOM_2026-10-18.md):
@@ -1673,6 +2108,125 @@ static void cluster_send_zoom(void *session, int dir_in)
 /* The listener thread: accept wheel steps from mib3wheel, queue them.
  * Never sends anything itself (see the mailbox note above).  It runs for the
  * life of the process; a reboot is the undo. */
+/* ---- the control inbox's line grammar -------------------------------------
+ * ONE socket carries two logical channels, so a single small tool can drive
+ * both without a second listener/thread:
+ *   +1 | 1 | in      zoom in        (queued, shipped by the cluster thread)
+ *   -1 | out         zoom out
+ *   v<N> | view <N>  switch to view-area index N
+ *   next | prev      step the view-area index (wrapping over MIB3_SHIM_VA_COUNT)
+ * An unknown line is LOGGED and ignored -- never acted on.  Lines are parsed
+ * from a small accumulator so a streamed client ("+1-1" with no separators)
+ * behaves exactly as it did before this change. */
+#define VA_Q 8
+static volatile int g_va_q[VA_Q];
+static volatile int g_va_qw, g_va_qr, g_va_qdrop;
+#define VA_REQ_NEXT  (-2)
+#define VA_REQ_PREV  (-3)
+static int va_push(int idx)
+{
+  int w = g_va_qw, n = (w + 1) % VA_Q;
+  if (n == g_va_qr){ g_va_qdrop++; return 0; }
+  g_va_q[w] = idx; g_va_qw = n;
+  return 1;
+}
+static int va_pop(void)
+{
+  int r = g_va_qr;
+  if (r == g_va_qw) return -9999;
+  { int v = g_va_q[r]; g_va_qr = (r + 1) % VA_Q; return v; }
+}
+
+/* ---- appearance queue (item 3) -------------------------------------------
+ * packed int: (target<<24) | (mode<<12) | setting.  Same lifetime argument as
+ * the zoom/va queues -- the listener never sends, the cluster thread does. */
+#define AP_Q 4
+static volatile int g_ap_q[AP_Q];
+static volatile int g_ap_qw, g_ap_qr, g_ap_qdrop;
+static int ap_push(int packed)
+{
+  int w = g_ap_qw, n = (w + 1) % AP_Q;
+  if (n == g_ap_qr){ g_ap_qdrop++; return 0; }
+  g_ap_q[w] = packed; g_ap_qw = n;
+  return 1;
+}
+static void ctl_push_zoom(int dir)
+{
+  int d = dir;
+  if (env_on("MIB3_SHIM_ZOOM_INVERT",0)) d = -d;
+  if (zoom_push(d)) logkv("cluster/zoom","queued dir",(u64)(u32)(d > 0 ? 1 : 0),0);
+  else logline("cluster/zoom","queue full -- step dropped");
+}
+/* case-insensitive equality of a NUL-free token */
+static int tok_eq(const char *s, int n, const char *t)
+{
+  int i;
+  for (i = 0; i < n; i++){
+    char a = s[i], b = t[i];
+    if (!b) return 0;
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+    if (a != b) return 0;
+  }
+  return t[n] == 0;
+}
+static void ctl_handle_line(const char *s, int n)
+{
+  int i = 0, dir = 0, sign = 0, num = 0, hasn = 0, isva = 0;
+  if (n <= 0) return;
+  /* --- appearance channel: "a <map|ui> <mode> <setting>" ------------------ */
+  if (s[0] == 'a' || s[0] == 'A'){
+    int target = 0, vals[2], nv = 0, seen = 0;
+    i = 1; vals[0] = -1; vals[1] = -1;
+    while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+    if (i < n && (s[i] == 'm' || s[i] == 'M')){ target = 1; while (i < n && s[i] != ' ' && s[i] != '\t') i++; }
+    else if (i < n && (s[i] == 'u' || s[i] == 'U')){ target = 0; while (i < n && s[i] != ' ' && s[i] != '\t') i++; }
+    while (i < n && nv < 2){
+      while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == ',')) i++;
+      if (i >= n) break;
+      if (s[i] < '0' || s[i] > '9'){ i++; continue; }
+      { int v = 0; while (i < n && s[i] >= '0' && s[i] <= '9'){ v = v*10 + (s[i] - '0'); i++; } vals[nv++] = v; seen = 1; }
+    }
+    if (!seen){ logline("cluster/appear/req","no mode/setting -- ignored"); return; }
+    if (vals[1] < 0) vals[1] = 0;
+    { int packed = ((target & 0xff) << 24) | ((vals[0] & 0xfff) << 12) | (vals[1] & 0xfff);
+      if (ap_push(packed)) logkv("cluster/appear/req","queued (target<<24|mode<<12|setting)",(u64)(u32)packed,0);
+      else logline("cluster/appear/req","queue full -- dropped"); }
+    return;
+  }
+  /* --- view-area channel -------------------------------------------------- */
+  if (s[0] == 'v' || s[0] == 'V'){ isva = 1; i = 1; if (n > 1 && (s[1]=='i'||s[1]=='I')) i = 4; }
+  else if (tok_eq(s, n, "next") || tok_eq(s, n, "prev")){ isva = 1; i = 0; }
+  if (isva){
+    if (tok_eq(s, n, "next")){ if (va_push(VA_REQ_NEXT)) logline("cluster/va/req","next"); else logline("cluster/va/req","queue full"); return; }
+    if (tok_eq(s, n, "prev")){ if (va_push(VA_REQ_PREV)) logline("cluster/va/req","prev"); else logline("cluster/va/req","queue full"); return; }
+    for (; i < n; i++){
+      char c = s[i];
+      if (c == ' ' || c == '\t') continue;
+      if (c >= '0' && c <= '9'){ num = num * 10 + (c - '0'); hasn = 1; continue; }
+      logkv("cluster/va/req","ignored byte",(u64)(unsigned)(c & 0xff),0);
+    }
+    if (hasn){ if (va_push(num)) logkv("cluster/va/req","set index",(u64)(u32)num,0); else logline("cluster/va/req","queue full"); }
+    else logline("cluster/va/req","no index and no next/prev -- ignored");
+    return;
+  }
+  /* --- zoom channel ------------------------------------------------------- */
+  for (; i < n; i++){
+    char c = s[i];
+    if (c == ' ' || c == '\t') continue;
+    if (c == 'i' || c == 'I'){ dir = 1;  continue; }
+    if (c == 'o' || c == 'O'){ dir = -1; continue; }
+    if (c == '+'){ if (!sign) sign = 1; continue; }
+    if (c == '-'){ sign = -1; continue; }
+    if (c >= '0' && c <= '9'){ hasn = 1; continue; }   /* magnitude: always 1 step */
+    logkv("cluster/zoom","ignored byte",(u64)(unsigned)(c & 0xff),0);
+  }
+  if (dir) ctl_push_zoom(dir);
+  else if (sign) ctl_push_zoom(sign);
+  else if (hasn) ctl_push_zoom(1);
+  /* a bare "-" with nothing after it: ignored, as before */
+}
+
 static void *zoom_listen_thread(void *arg)
 {
   extern int socket(int,int,int);
@@ -1706,37 +2260,19 @@ static void *zoom_listen_thread(void *arg)
     logkv("cluster/zoom","peer fd",(u64)(u32)conn,0);
     for (;;){
       char buf[64]; long n = read(conn, buf, sizeof(buf));
+      char lb[64]; int ln = 0;
+      long k;
       if (n <= 0) break;
-      /* line protocol: "+1", "1", "-1", "in", "out" (one per line or streamed).
-       * Parse sign words; ignore digits that follow a sign so "+1" is one step,
-       * not two. */
-      { long k; int dir = 0, sign = 0;
-        for (k = 0; k < n; k++){
-          char c = buf[k];
-          if (c == '+'){ sign = 1; dir = 1; }
-          else if (c == '-'){ sign = 1; dir = -1; }
-          else if (c == 'i' || c == 'I'){ sign = 1; dir = 1; }
-          else if (c == 'o' || c == 'O'){ sign = 1; dir = -1; }
-          else if (c == '\n' || c == '\r'){
-            if (sign && dir){
-              int d = dir;
-              if (env_on("MIB3_SHIM_ZOOM_INVERT",0)) d = -d;
-              if (zoom_push(d)) logkv("cluster/zoom","queued dir",(u64)(u32)(d > 0 ? 1 : 0),0);
-              else logline("cluster/zoom","queue full -- step dropped");
-            }
-            sign = 0; dir = 0;
-          }
-          else if (c >= '0' && c <= '9') continue;      /* the magnitude: always 1 step */
-          else if (c == ' ' || c == '\t') continue;
-          else { logkv("cluster/zoom","ignored byte",(u64)(unsigned)(c & 0xff),0); }
-        }
-        /* tolerate a client that does not terminate the last line */
-        if (sign && dir){
-          int d = dir;
-          if (env_on("MIB3_SHIM_ZOOM_INVERT",0)) d = -d;
-          if (zoom_push(d)) logkv("cluster/zoom","queued dir",(u64)(u32)(d > 0 ? 1 : 0),0);
-          else logline("cluster/zoom","queue full -- step dropped");
-        } }
+      /* Line protocol on ONE socket: zoom steps ("+1","-1","in","out") and
+       * view-area requests ("v3","view 1","next","prev").  Accumulate and
+       * dispatch per line; a token that arrives without a terminator is
+       * dispatched at the end of the chunk, exactly as the old parser did. */
+      for (k = 0; k < n; k++){
+        char c = buf[k];
+        if (c == '\n' || c == '\r'){ ctl_handle_line(lb, ln); ln = 0; continue; }
+        if (ln < (int)sizeof(lb) - 1) lb[ln++] = c;
+      }
+      ctl_handle_line(lb, ln);
     }
     logline("cluster/zoom","peer gone");
     close(conn);
@@ -1786,6 +2322,7 @@ int mib3shim_zoom_listen(void *session, const char *uuid, const char *sock)
     setenv("MIB3_SHIM_ZOOM_SOCK", sock, 1);
   }
   g_cmd_session = session;
+  g_cmd_gen++;
   return zoom_listen_start();
 }
 /* Drain up to `max` queued steps and ship them on `session` (0 -> g_cmd_session).
@@ -1804,6 +2341,71 @@ int mib3shim_zoom_pump(void *session, int max)
   }
   if (g_zoom_qdrop){ logkv("cluster/zoom","dropped total",(u64)g_zoom_qdrop,0); g_zoom_qdrop = 0; }
   return sent;
+}
+
+/* Drain up to `max` queued view-area requests and ship updateViewArea on
+ * `session` (0 -> g_cmd_session).  Production calls this from the cluster thread
+ * next to the zoom pump, so that the command is issued on the thread that owns a
+ * valid session (same lifetime argument as the ZOOM block).  Returns the number
+ * of commands actually shipped. */
+int mib3shim_viewarea_pump(void *session, int max)
+{
+  int k, sent = 0;
+  void *s = session ? session : g_cmd_session;
+  if (max <= 0) max = 1;
+  for (k = 0; k < max; k++){
+    int r = va_pop();
+    int idx;
+    if (r == -9999) break;
+    if (r == VA_REQ_NEXT)      idx = (g_va_current + 1) % va_count();
+    else if (r == VA_REQ_PREV) idx = (g_va_current + va_count() - 1) % va_count();
+    else                       idx = r;
+    if (cluster_send_viewarea(s, idx, 250, "inbox") == 0) sent++;
+  }
+  if (g_va_qdrop){ logkv("cluster/va/req","dropped total",(u64)g_va_qdrop,0); g_va_qdrop = 0; }
+  return sent;
+}
+/* Bench/test entry point: ship one updateViewArea for `index` directly. */
+int mib3shim_viewarea_send(void *session, int index)
+{
+  resolve();
+  return cluster_send_viewarea(session ? session : g_cmd_session, index, 250, "harness");
+}
+/* Bench entry point: fire the completion path by hand (the harness cannot make
+ * libAirplay call it).  `gen` is the generation to stamp: 0 = current. */
+int mib3shim_cmdack_fire(int status, int gen, const char *type)
+{
+  cmd_ack_slot *sl = cmd_ack_take(type ? type : "synthetic", -1);
+  if (gen) sl->gen = (unsigned)gen;
+  cmd_completion(status, 0, sl);
+  return 0;
+}
+
+/* Drain queued appearance updates for the cluster thread. */
+int mib3shim_appear_pump(void *session, int max)
+{
+  int k, sent = 0;
+  void *s = session ? session : g_cmd_session;
+  if (max <= 0) max = 1;
+  for (k = 0; k < max; k++){
+    int r = g_ap_qr, packed;
+    if (r == g_ap_qw) break;
+    packed = g_ap_q[r]; g_ap_qr = (r + 1) % AP_Q;
+    cluster_send_appearance(s, (packed >> 24) & 0xff, (packed >> 12) & 0xfff, packed & 0xfff);
+    sent++;
+  }
+  if (g_ap_qdrop){ logkv("cluster/appear/req","dropped total",(u64)g_ap_qdrop,0); g_ap_qdrop = 0; }
+  return sent;
+}
+/* Bench entry point: parse one control line and run its effect path. */
+int mib3shim_ctl_line(const char *line)
+{
+  int n = 0;
+  resolve();
+  if (!line) return -1;
+  while (line[n]) n++;
+  ctl_handle_line(line, n);
+  return 0;
 }
 
 /* ---- AVCC <-> Annex-B (the refs' proven helpers) ---------------------------
@@ -1964,6 +2566,10 @@ static void *cluster_thread(void *arg){
          * At most 4 per iteration so a burst cannot starve the video path. */
         { int z = mib3shim_zoom_pump(c->session, 4);
           if (z > 0) logkv("cluster/zoom","steps shipped",(u64)(u32)z,0); }
+        /* View-area switches queued by the same inbox (view/next/prev). */
+        mib3shim_viewarea_pump(c->session, 1);
+        /* Appearance updates queued by the same inbox ("a map|ui mode setting"). */
+        mib3shim_appear_pump(c->session, 1);
         /* 128-byte screen header (bodySize u32 LE @0, opcode @4) */
         while (got < 128){ n = read(connfd, hdr + got, 128 - got); if (n <= 0){ logkv("cluster/thread","hdr read ended (0=EOF,1=err)",(u64)(n==0?0:1),0); logkv("cluster/thread","  bytes got",(u64)got,0); stop = 1; break; } got += n; }
         if (stop) break;
@@ -2054,6 +2660,7 @@ static void *cluster_thread(void *arg){
                     cluster_send_showui(c->session, "first-IDR");
                     cluster_send_nightmode(c->session);
                     cluster_send_forcekeyframe(c->session, "first-IDR");
+                    cluster_send_appearance_armed(c->session);   /* no-op unless MIB3_SHIM_APPEARANCE=1 */
                   }
                 }
                 /* The receiver hands us SLICES ONLY -- the parameter sets arrive
@@ -2086,7 +2693,24 @@ static void *cluster_thread(void *arg){
           } else {
             others++;   /* opcodes 2/4/5: keepalive/misc -- previously ignored.
                          * Navigation start drops the whole session, and control
-                         * traffic is the prime suspect, so LOG ALL OF IT. */
+                         * traffic is the prime suspect, so LOG ALL OF IT.
+                         *
+                         * NAMED 2026-10-19 (view-area lane) from the SHIPPED
+                         * binary -- corpus libAirPlay.so decompiled.c
+                         * AirPlayReceiverSessionScreen_ProcessFrames (0x11fbf0):
+                         *   opcode 0 -> video AU (decrypt, ScreenStreamProcessData)
+                         *   opcode 1 -> avcC + SetWidthHeight + SetAVCC
+                         *   opcode 2 -> goto "done" (local_dc = 0) SILENTLY
+                         *   opcode 4 -> same  ((byte)(op-4) < 2)
+                         *   opcode 5 -> same
+                         *   anything else -> "### Unknown screen opcode: %u" + -6727
+                         * So 2/4/5 are INERT BY CONSTRUCTION: the unit's own
+                         * receiver discards them with no error and no state
+                         * change.  They are not a hidden control channel.
+                         * NOTE: requestUI is NOT a screen opcode at all -- it is
+                         * an RTSP /command type on the phone->host direction
+                         * (LIVI stack.rs:1604, PlayPort AirPlaySession.kt:541);
+                         * see the lane doc for why no seam reaches it today. */
             { const char *H = "0123456789abcdef"; int k; char hs[96]; char bh[192];
               unsigned lim = 48, bl = (bs < 64u) ? (unsigned)bs : 64u;
               for (k = 0; k < (int)lim; k++){ unsigned char cc = hdr[k]; hs[k*2] = H[cc>>4]; hs[k*2+1] = H[cc&15]; }
@@ -2095,6 +2719,10 @@ static void *cluster_thread(void *arg){
               bh[bl*2] = 0;
               logkv("cluster/ctl","opcode",(u64)op,0);
               logkv("cluster/ctl","bodySize",(u64)bs,0);
+              if (op == 2)      logline("cluster/ctl/meaning","opcode 2 = stock-ignored keepalive/misc (no error, no state change)");
+              else if (op == 4) logline("cluster/ctl/meaning","opcode 4 = stock-ignored keepalive/misc (no error, no state change)");
+              else if (op == 5) logline("cluster/ctl/meaning","opcode 5 = stock-ignored telemetry/keepalive (no error, no state change)");
+              else              logline("cluster/ctl/meaning","UNKNOWN opcode (stock returns -6727 '### Unknown screen opcode')");
               logline("cluster/ctl/hdr-head", hs);
               logline("cluster/ctl/body-head", bh); } }
         }
@@ -2322,6 +2950,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   c->keylen = keylen; c->cipher = cipher; c->counter = 0;
   c->night = g_night_mode; c->aes_inited = 0;
   g_cmd_session = session;   /* the command target once the stream connects */
+  g_cmd_gen++;               /* invalidate completions from the previous SETUP */
   /* the wheel->CarPlay zoom path (LANE_CLUSTER_ZOOM_2026-10-18): one listener
    * per process, started here so it outlives per-connection cluster threads.
    * It only QUEUES steps; the cluster thread ships them (no session lifetime
@@ -2560,7 +3189,7 @@ static void run_banner(void){
   int  tzh = (int)env_num("MIB3_SHIM_TZ", 12);           /* hours WEST of the unit clock (tuned: unit clock is +4h) */
   long sod = (t - (long)tzh * 3600) % 86400; if (sod < 0) sod += 86400;
   int hh = (int)(sod / 3600), mm = (int)((sod % 3600) / 60), ss = (int)(sod % 60);
-  char mem[512]; buf b = { mem, sizeof(mem)-2, 0 };
+  char mem[768]; buf b = { mem, sizeof(mem)-2, 0 };
   bs(&b,"\n[mib3shim] ================================================================\n");
   bs(&b,"[mib3shim] ====== RUN "); bu64(&b,(u64)(++g_run_no),10,0);
   bs(&b,"  pid="); bu64(&b,(u64)getpid(),10,0);
@@ -2580,6 +3209,13 @@ static void run_banner(void){
   bs(&b,"  SINK="); sink_resolve(); bu64(&b,(u64)(u32)g_sink,10,0);
   bs(&b,"  LOCAL="); bu64(&b,(u64)(u32)g_sink_local,10,0);
   bs(&b,"  ACK="); bu64(&b,(u64)env_on("MIB3_SHIM_LOCAL_ACK",0),10,0);
+  /* view-area / command-completion knobs (2026-10-19) */
+  bs(&b,"  CMDACK="); bu64(&b,(u64)env_on("MIB3_SHIM_CMDACK",1),10,0);
+  bs(&b,"  VIEWAREAS="); bu64(&b,(u64)env_on("MIB3_SHIM_VIEWAREAS",0),10,0);
+  bs(&b,"  VA_COUNT="); bu64(&b,(u64)(u32)va_count(),10,0);
+  bs(&b,"  VA_CMD="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_CMD",1),10,0);
+  bs(&b,"  VA_VISIBLE="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_VISIBLE",0),10,0);
+  bs(&b,"  APPEARANCE="); bu64(&b,(u64)env_on("MIB3_SHIM_APPEARANCE",0),10,0);
   bs(&b," ======\n");
   bs(&b,"[mib3shim] ================================================================\n");
   mem[b.n]=0;
