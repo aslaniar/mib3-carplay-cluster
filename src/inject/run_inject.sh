@@ -24,7 +24,7 @@ STICK="$(cd "$(dirname "$0")" && pwd)"
 # carplay, because the Cinemo bridge executes only in the out-of-process helper
 # (MIB3_SHIM_SINK=helper).  NEVER pin d785b25c (the batched build that caused the two
 # 2026-10-16 resets).  See LANE_CLUSTER_DELIVERY_IMPLEMENT_2026-10-16.md S"pins".
-WANT_MD5=757cfe85032d0b1305e971fc63a4dc1e
+WANT_MD5=d555c59b66f47828e880e801dad29276
 fail(){ echo "[!] $*"; echo "[!] ABORT -- nothing persisted; a reboot is the full undo"; exit 1; }
 
 CP="$(pidof carplay)"

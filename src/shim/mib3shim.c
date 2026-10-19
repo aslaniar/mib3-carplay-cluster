@@ -1878,33 +1878,6 @@ static void cluster_send_forcekeyframe(void *session, const char *why)
   logline("cluster/cmd/idr-why", why);
   if (p_CFRelease) p_CFRelease(p);
 }
-/* ---- storm limiter (stability, 2026-10-18) --------------------------------
- * WHY: the helper link can flap.  v4l2_seq's own comment records the measured
- * case -- "measured at 8 connections and 7 disconnects in one session", and
- * "the 200 ms SO_SNDTIMEO fires, it drops the AU and reconnects ... a storm"
- * (shim/tools/v4l2_seq.c, the THE STORM paragraph).  Every reconnect used to
- * fire a forceKeyFrame at the phone from the receiver thread, i.e. 7 RTSP
- * POSTs into a live session at the exact moment the pipeline was already
- * struggling, each one a blocking dispatch_sync (see ship_cmd's note).
- * A forced IDR is also the most expensive frame the phone can make (1280x480,
- * full intra).  One request per MIB3_SHIM_FKR_MIN seconds (default 5) is plenty:
- * the gate only needs to be reopened, and the phone emits ~1 IDR per stream
- * anyway (2 IDRs in 1761 slices, LANE_CLUSTER_WORKING 2026-10-18 S2).
- * MIB3_SHIM_FKR_MIN=0 disables the limiter. ---------------------------------- */
-static long g_last_fkr_s = 0;
-static void cluster_send_forcekeyframe_limited(void *session, const char *why)
-{
-  extern long time(long *);
-  long min = (long)env_num("MIB3_SHIM_FKR_MIN", 5);
-  long now = time(0);
-  if (min > 0 && g_last_fkr_s != 0 && (now - g_last_fkr_s) < min){
-    logkv("cluster/cmd","forceKeyFrame rate-limited (s since last)",(u64)(now - g_last_fkr_s),0);
-    logline("cluster/cmd/idr-skipped-why", why);
-    return;
-  }
-  g_last_fkr_s = now;
-  cluster_send_forcekeyframe(session, why);
-}
 static void cluster_send_nightmode(void *session)
 {
   if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
@@ -2667,8 +2640,18 @@ static void *cluster_thread(void *arg){
                   sink_feed(rbuf, (unsigned long)pl, 0);
                   /* A freshly (re)connected helper has no reference frames, so
                    * ask the phone for a keyframe and a real IDR will follow. */
-                  if (!was_conn && mib3shim_helper_connected())
-                    cluster_send_forcekeyframe_limited(c->session, "helper-connect"); }
+                  if (!was_conn && mib3shim_helper_connected()){
+                    /* UNCONDITIONAL -- this is the one request that must never be
+                     * rate-limited.  It fires at most once per helper connection
+                     * (guarded by !was_conn), and it is what makes a freshly
+                     * attached decoder start on an IDR instead of mid-GOP.
+                     * The storm limiter added on 2026-10-18 suppressed it whenever
+                     * a stream-start request was <5 s old -- i.e. on every
+                     * reconnect.  Measured 2026-10-19: forceKeyFrame rc=0 at
+                     * stream-start, then "rate-limited (s since last)=1" for
+                     * helper-connect, decoder got 77 P-slices, qdrop=279, frozen.
+                     * The 2026-10-18 working build sent it unconditionally. */
+                    cluster_send_forcekeyframe(c->session, "helper-connect"); } }
               } else logline("cluster/thread","malformed AU (avcc_prepare) -- dropped");
             }
             if ((frames & 0x3f) == 1){
