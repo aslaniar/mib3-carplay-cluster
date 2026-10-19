@@ -26,9 +26,9 @@ FILES="mib3shim.so mib3clusterhelper \
   live_kit/v4l2_run.sh live_kit/v4l2_sweep.sh \
   live_kit/start_mss_log.sh live_kit/patha_deliver.sh live_kit/patha_auto.sh \
   live_kit/start_cluster_helper.sh live_kit/probe.sh \
-  live_kit/wheel_zoom.sh \
+  live_kit/wheel_zoom.sh live_kit/viewarea.sh \
   tools/v4l2_seq tools/mib3egl tools/ausock tools/socktest tools/rgba_feed \
-  tools/mib3wheel"
+  tools/mib3wheel tools/mib3ctl"
 
 # WHY the delivery scripts are listed (they were NOT, and it cost a whole trip
 # on 2026-10-17): start_mss_log.sh is the ORACLE -- MS-S's own log on port 54321.
@@ -54,4 +54,4 @@ done
 # shim in an already-running carplay (a mapped .so cannot be replaced in place).
 cat mib3shim.so | ssh "$HOST" 'cat > /tmp/kit/mib3shim2.so'
 
-ssh "$HOST" 'chmod +x /tmp/kit/*.sh /tmp/kit/*.py /tmp/kit/mib3shim.so /tmp/kit/mib3shim2.so /tmp/kit/v4l2_seq /tmp/kit/mib3egl /tmp/kit/ausock /tmp/kit/socktest /tmp/kit/rgba_feed /tmp/kit/mib3clusterhelper /tmp/kit/mib3wheel 2>/dev/null; echo "--- /tmp/kit ---"; ls -la /tmp/kit'
+ssh "$HOST" 'chmod +x /tmp/kit/*.sh /tmp/kit/*.py /tmp/kit/mib3shim.so /tmp/kit/mib3shim2.so /tmp/kit/v4l2_seq /tmp/kit/mib3egl /tmp/kit/ausock /tmp/kit/socktest /tmp/kit/rgba_feed /tmp/kit/mib3clusterhelper /tmp/kit/mib3wheel /tmp/kit/mib3ctl 2>/dev/null; echo "--- /tmp/kit ---"; ls -la /tmp/kit'
