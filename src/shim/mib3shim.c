@@ -284,6 +284,12 @@ static int helper_connect(void){
  * keeps the fix local to these two writes; it does not touch the process's
  * signal disposition, so nothing else in carplay changes. */
 #define MIB3_MSG_NOSIGNAL 0x4000
+/* Non-blocking send.  Without this, a helper that stops reading (a wedged
+ * decoder, measured 2026-10-19 with nfree=0) makes send() BLOCK inside
+ * carplay's cluster receiver thread -- and the whole CarPlay session stutters
+ * on the main screen.  A dropped AU is recoverable; a stalled receiver thread
+ * is not. */
+#define MIB3_MSG_DONTWAIT 0x40
 
 static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   unsigned char hdr[MIB3_HELP_HDRLEN];
@@ -294,8 +300,15 @@ static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   m32 = MIB3_HELP_MAGIC; for (i=0;i<4;i++) hdr[i]   = (unsigned char)((m32 >> (i*8)) & 0xff);
   m32 = (u32)len;        for (i=0;i<4;i++) hdr[4+i] = (unsigned char)((m32 >> (i*8)) & 0xff);
   m64 = ++hlp_seq;       for (i=0;i<8;i++) hdr[8+i] = (unsigned char)((m64 >> (i*8)) & 0xff);
-  if (send(hlp_fd, hdr, MIB3_HELP_HDRLEN, MIB3_MSG_NOSIGNAL) != (long)MIB3_HELP_HDRLEN){ hlp_drop++; helper_close(); return -1; }
-  if (send(hlp_fd, data, len, MIB3_MSG_NOSIGNAL) != (long)len){ hlp_drop++; helper_close(); return -1; }
+  if (send(hlp_fd, hdr, MIB3_HELP_HDRLEN, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT)
+      != (long)MIB3_HELP_HDRLEN){
+    /* Nothing of the record went out, so the stream is still in sync: drop the
+     * AU but KEEP the socket (a transient full buffer must not cause a reconnect
+     * storm). */
+    hlp_drop++; return -1; }
+  if (send(hlp_fd, data, len, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT) != (long)len){
+    /* Partial record = permanent desync; the helper must reconnect. */
+    hlp_drop++; helper_close(); return -1; }
   hlp_sent++;
   return 0;
 }
