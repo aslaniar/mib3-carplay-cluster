@@ -1103,14 +1103,23 @@ static void va_preset_rect(int i, int cw, int chp, va_rect *r)
     if (sh > chp) sh = chp;
     r->sx = (cw - sw) / 2; r->sy = (chp - sh) / 2; r->sw = sw; r->sh = sh;
   } else if (i == 1){
-    /* dual-gauge layout: the card must sit BETWEEN the dials, so this box is
-     * deliberately BELOW the wide cliff -> centred class. */
-    int sw = wt * 9 / 10, sh = ct * 5 / 4;
+    /* THE TUNED CARD (owner, 2026-10-20, measured on the car): top margin 57,
+     * bottom 55, full platter width.  Measured facts that fix these numbers:
+     *   - the block anchors to the safe box's top and bottom edges, so the
+     *     margins ARE sy and chp-sy-sh -- 40 px clipped the card, 55/57 is right;
+     *   - WIDTH IS A SCALE, not just a box: manoeuvreLayout=topAligned forces
+     *     the centred layout, and a 260 px box shrank the text to one word and
+     *     shrank the ETA too.  So width stays at/above the 300 px clamp ceiling
+     *     (platter = clamp(safeW,165,300)) -- do NOT "narrow it to fit".
+     * Fall back to the derived shape on a panel that is not this size. */
+    int sw = cw * 31 / 100, sh = chp - 112;         /* 397 / 368 on 1280x480 */
+    if (cw == 1280 && chp == 480){ sw = 397; sh = 368; r->sy = 57; }
+    else r->sy = chp * 12 / 100;
     if (sh < 253) sh = 253;
     if (sh > chp - 20) sh = chp - 20;
     if (sw < 165) sw = 165;
     if (sw > cw) sw = cw;
-    r->sx = (cw - sw) / 2; r->sy = (chp - sh) / 2; r->sw = sw; r->sh = sh;
+    r->sx = (cw - sw) / 2; r->sw = sw; r->sh = sh;
   } else {
     /* third layout (unmeasured): WIDE with a real margin, offset left so the
      * wide-side branch is exercised. */
