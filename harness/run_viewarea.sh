@@ -94,6 +94,19 @@ chk ctl_raw_line "$(dry line v3)" "v3"
 rm -rf "$D" 2>/dev/null
 
 echo
+echo "############ PART 0b: the shim pin agrees in all FOUR places ############"
+# A stale pin here has aborted a staging run at the worst moment before.  The
+# binary, run_inject's WANT_MD5, push_kit's SHIM_WANT and STICK_ADDONS must agree.
+md5of(){ if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
+BIN_PIN="$(md5of "$SHIMDIR/mib3shim.so" 2>/dev/null)"
+INJ_PIN="$(grep -oE '^WANT_MD5=[0-9a-f]+' "$REPO/MIB3_RE/shim/inject/run_inject.sh" | cut -d= -f2)"
+PK_PIN="$(grep -oE '^SHIM_WANT=[0-9a-f]+' "$REPO/MIB3_RE/shim/live_kit/push_kit.sh" | cut -d= -f2)"
+SA_PIN="$(grep -oE 'md5 [0-9a-f]{32}' "$REPO/MIB3_RE/shim/live_kit/STICK_ADDONS.txt" | head -n 1 | awk '{print $2}')"
+chk pin_binary_nonempty 1 "$(if [ -n "$BIN_PIN" ]; then echo 1; else echo 0; fi)"
+chk pin_inject_eq_binary "$BIN_PIN" "$INJ_PIN"
+chk pin_pushkit_eq_binary "$BIN_PIN" "$PK_PIN"
+chk pin_stickaddons_eq_binary "$BIN_PIN" "$SA_PIN"
+
 echo "############ build ############"
 [ -f "$SHIMDIR/mib3shim.so" ] || sh "$SHIMDIR/build.sh" >/dev/null 2>&1
 $CC --target=aarch64-linux-gnu -O2 -fPIC -fvisibility=default -nostdlib \
