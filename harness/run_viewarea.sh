@@ -174,6 +174,9 @@ chk  advert_on_class_centred 1 "$(printf '%s' "$AON" | grep -c 'class (0=BLANK 1
 chk  advert_on_class_blank   0 "$(printf '%s' "$AON" | grep -c 'class (0=BLANK 1=centred 2=wide)=0')"
 chk  advert_on_eta_ok        3 "$(printf '%s' "$AON" | grep -c 'etaOk(safeH>202)=1')"
 chk  advert_on_no_cliff      0 "$(printf '%s' "$AON" | grep -c 'nearCliff(<=10%)=1')"
+# which area a session STARTS in: default 1 (the centred card + ETA, owner's
+# choice, verified on the car 2026-10-20), clamped to the declared count
+chk  advert_on_initial_default 1 "$(printf '%s' "$AON" | grep -c 'initialViewArea=1')"
 chkg advert_on_knobs 'VIEWAREAS=1' "$AON"
 # VA_VISIBLE=1 shrinks the VISIBLE frame of areas > 0 too (the rgi-refuted shape)
 chkg advert_vis_visible_shrunk 'cluster/va/rect: visible=441,79,397,321 safe=441,79,397,321' "$AVIS"
