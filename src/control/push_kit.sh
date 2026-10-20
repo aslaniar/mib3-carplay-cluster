@@ -17,6 +17,25 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 SHIM="$(cd "$HERE/.." && pwd)"
 cd "$SHIM" || exit 1
 
+# PRE-FLIGHT: the recommended triad pins (2026-10-19, DEPLOY_READY_2026-10-19.md).
+# Abort BEFORE staging if a tool does not match, so a stale decoder/presenter
+# cannot reach the car (the same discipline run_inject.sh applies to the shim).
+md5of(){ if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
+SHIM_WANT=c2e2804ac77e2755e1b99f664e487a6f
+V4L2_WANT=bff15e2a4e89ecff1afc06d8bc0b928e
+EGL_WANT=7612f74aecc1141c11e715488fb25dea
+checkpin(){ # checkpin <path> <want-md5>
+  local got; got="$(md5of "$1")"
+  if [ "$got" != "$2" ]; then
+    echo "[!] PRE-FLIGHT: $1 md5 $got != want $2 -- rebuild with: sh build.sh && sh tools/build.sh"
+    exit 1
+  fi
+}
+checkpin mib3shim.so        "$SHIM_WANT"
+checkpin tools/v4l2_seq     "$V4L2_WANT"
+checkpin tools/mib3egl      "$EGL_WANT"
+echo "[i] pre-flight pins OK: shim $SHIM_WANT / v4l2_seq $V4L2_WANT / mib3egl $EGL_WANT"
+
 ssh "$HOST" 'mkdir -p /tmp/kit'
 
 FILES="mib3shim.so mib3clusterhelper \
