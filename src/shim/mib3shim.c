@@ -1267,8 +1267,19 @@ static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
   if (env_on("MIB3_SHIM_VIEWAREAS",0)){
     CFMutableArrayRef va2 = va_build(cw, chp);
     if (va2){
+      int n = 0, iv;
       dseto(d, "viewAreas", va2);
-      dseti(d, "initialViewArea", 0);
+      /* WHICH AREA A SESSION STARTS IN.  Default 1 = the centred card with the
+       * ETA underneath -- verified on the car 2026-10-20 and the owner's choice.
+       * Area 0 is the wide class (a 213 px column at the box edge); switch with
+       * viewarea.sh 0 to get that.  The index is CLAMPED to what was actually
+       * declared, so a short VA_COUNT can never declare an out-of-range start. */
+      if (p_CFArrayGetCount) n = (int)p_CFArrayGetCount(va2);
+      iv = (int)env_num("MIB3_SHIM_VA_INITIAL", 1);
+      if (iv < 0 || (n > 0 && iv >= n)) iv = 0;
+      dseti(d, "initialViewArea", (s64)iv);
+      g_va_current = iv;                /* keep the switch state consistent */
+      logkv("cluster/va","initialViewArea",(u64)(u32)iv,0);
       logline("cluster","viewAreas added");
       if (p_CFRelease) p_CFRelease(va2);        /* dict retains it */
     }
@@ -3394,6 +3405,7 @@ static void run_banner(void){
   bs(&b,"  VIEWAREAS="); bu64(&b,(u64)env_on("MIB3_SHIM_VIEWAREAS",0),10,0);
   bs(&b,"  VA_COUNT="); bu64(&b,(u64)(unsigned)va_count(),10,0);
   bs(&b,"  VA_PRESET="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_PRESET",1),10,0);
+  bs(&b,"  VA_INITIAL="); bu64(&b,(u64)(unsigned)env_num("MIB3_SHIM_VA_INITIAL",1),10,0);
   bs(&b,"  VA_COUNT="); bu64(&b,(u64)(u32)va_count(),10,0);
   bs(&b,"  VA_CMD="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_CMD",1),10,0);
   bs(&b,"  VA_VISIBLE="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_VISIBLE",0),10,0);
