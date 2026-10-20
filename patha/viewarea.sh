@@ -98,11 +98,36 @@ on(){
   say "to arm the view-area path, re-inject the shim with these env knobs set"
   say "(target_env.py sets them live, between phone plugs -- no rebuild):"
   say "    MIB3_SHIM_VIEWAREAS=1        declare multiple view areas (default off)"
-  say "    MIB3_SHIM_VA_COUNT=2         how many (default 2)"
-  say "    MIB3_SHIM_VA1=0,0,1280,480,400,40,480,400   visible + safe rect for area 1"
+  say "    MIB3_SHIM_VA_COUNT=3         how many (default 3 = one per cluster layout)"
+  say "    MIB3_SHIM_VA_PRESET=1        derive class-safe boxes (default 1)"
+say "    MIB3_SHIM_VA1=0,0,1280,480,441,79,397,321   explicit visible + safe rect"
   say "    MIB3_SHIM_VA_VISIBLE=0       keep the FULL visible frame (the rgi-proven shape)"
   say "    MIB3_SHIM_CMDACK=1           (default) make the phone's verdict visible"
   say "verify the shim log; the knob banner prints VIEWAREAS/VA_COUNT/VA_CMD."
+}
+
+plan(){
+  say "=== declared view areas, and the class CarPlay will pick for each ==="
+  say "    (one box per cluster layout; class decides WHERE the turn card goes)"
+  awk '
+    /cluster\/va: area index=/ { v=$0; sub(/.*=/,"",v); next }
+    /cluster\/va\/rect:/       { r=$0; sub(/.*rect: /,"",r); next }
+    /class \(0=BLANK/         { c=$0; sub(/.*=/,"",c); next }
+    /safeW=/                    { sw=$0; sub(/.*=/,"",sw); next }
+    /safeH=/                    { sh=$0; sub(/.*=/,"",sh); next }
+    /nearCliff/                 { nc=$0; sub(/.*=/,"",nc);
+      nm = (c=="2") ? "wide     card column at the box edge" :
+           (c=="1") ? "CENTRED  card between the gauges" :
+                      "BLANK    CarPlay draws NOTHING here";
+      printf "    area %s  %s  safeW=%s safeH=%s\n        -> %s%s\n",
+             v, r, sw, sh, nm, (nc=="1") ? "   << near a cliff (<=10% margin)" : "";
+      next }
+  ' "$SHIMLOG" 2>/dev/null
+  say ""
+  say "    thresholds printed by the shim at advert time: wideThrPx / centreThrPx(safeH)."
+  say "    a box below BOTH is layout 0 = blank cluster (no graceful degradation)."
+  say "    Change a box with MIB3_SHIM_VA<i>=x,y,w,h,sx,sy,sw,sh (takes effect at the"
+  say "    NEXT session), or MIB3_SHIM_VA_PRESET=0 to go back to the old defaults."
 }
 
 check(){
@@ -134,7 +159,7 @@ fi
 
 CMD="${1:-status}"
 case "$CMD" in
-  labels|status|idx|on|check) "$CMD" ;;
+  labels|status|idx|on|check|plan) "$CMD" ;;
   view|next|prev|zoom|appear|line)
     [ -x "$CTL" ] || { say "missing $CTL -- run push_kit.sh"; exit 1; }
     shift
@@ -147,7 +172,7 @@ case "$CMD" in
     exec "$CTL" --socket "$SOCK" view "$CMD" ;;
   *)
     cat <<EOF
-usage: sh viewarea.sh {labels|status|idx|on|check|<index>|next|prev|zoom in|out|appear map|ui M S}
+usage: sh viewarea.sh {labels|status|idx|plan|on|check|<index>|next|prev|zoom in|out|appear map|ui M S}
   labels   SMACK rules both ways + chsmack the inbox socket
   status   shim knobs, how many areas were declared, what has been applied/refused
   idx      READ-ONLY: our declared areas + the car's own nav cluster geometry (problem A)
@@ -156,6 +181,9 @@ usage: sh viewarea.sh {labels|status|idx|on|check|<index>|next|prev|zoom in|out|
   next|prev  step the index, wrapping over the declared count
   zoom in|out   mirror a steering-wheel zoom step
   appear map|ui <mode> <setting>   per-surface appearance
+  plan     the declared boxes + the class CarPlay will pick for each
+           (wide = card at the box edge, centred = card between gauges,
+            BLANK = layout 0, nothing drawn)
   check    the acceptance check: did the phone report status 0?
 EOF
     exit 2 ;;
