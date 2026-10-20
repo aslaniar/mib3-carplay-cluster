@@ -41,6 +41,7 @@
 extern int   open(const char *, int, ...);
 extern long  read(int, void *, unsigned long);
 extern long  write(int, const void *, unsigned long);
+extern long  send(int, const void *, unsigned long, int);
 extern int   close(int);
 extern int   ioctl(int, unsigned long, ...);
 extern void  _exit(int);
@@ -210,13 +211,10 @@ static void rgba_connect(void){
   g_rsock = socket(1, 1, 0);
   if (g_rsock < 0) return;
   if (connect(g_rsock, &sa, sizeof(sa)) != 0){ close(g_rsock); g_rsock = -1; return; }
-  /* Bound how long a frame send can block us.  Each frame is w*h*4 = 2.4 MB and
-   * the presenter drains at its own pace; without a timeout the decoder stops
-   * reading the shim's AU socket for >200 ms -- the shim's SO_SNDTIMEO fires,
-   * it drops the AU and reconnects, and the decoder is left decoding a
-   * truncated stream (flat black).  60 ms is comfortably under the shim's
-   * 200 ms, and the presenter resets its reassembly on client-gone, so a
-   * partial frame is harmless -- we just drop that frame. */
+  /* The 60 ms SO_SNDTIMEO below is now INERT (the frame send is non-blocking --
+   * see send_rgba), but it is kept so a future edit that re-introduces a blocking
+   * write cannot stall the decode loop for more than 60 ms.  The 4 MB SO_SNDBUF
+   * is what lets a whole 2.4 MB frame go out in one send(). */
   { struct { long s; long us; } tv; tv.s = 0; tv.us = 60000;
     setsockopt(g_rsock, 1 /*SOL_SOCKET*/, 21 /*SO_SNDTIMEO*/, &tv, sizeof(tv)); }
   /* A 2.4 MB RGBA frame over the default 208 KB socket buffer cannot be written
@@ -245,12 +243,14 @@ static int send_testpat(int w, int h){
     }
   }
   tp += 6;
-  { long total = (long)w*h*4, off = 0;
-    while (off < total){
-      long wr = write(g_rsock, g_rgba+off, (unsigned long)(total-off));
-      if (wr <= 0){ close(g_rsock); g_rsock = -1; g_rdrop++; return -1; }
-      off += wr;
-    } }
+  /* Same non-blocking, whole-frame discipline as send_rgba: the test pattern is
+   * a diagnostic, but it must not introduce a blocking write loop either. */
+  { long total = (long)w*h*4; long t0 = now_ms();
+    { int q = 0;
+      if (ioctl(g_rsock, 0x5411UL /*SIOCOUTQ*/, &q) == 0 && q > 0){ g_rdrop++; return -1; } }
+    { long wr = send(g_rsock, g_rgba, (unsigned long)total, 0x40 /*MSG_DONTWAIT*/ | 0x4000 /*MSG_NOSIGNAL*/);
+      if (wr != total){ close(g_rsock); g_rsock = -1; g_rdrop++; g_send_ms = now_ms()-t0; return -1; }
+      g_send_ms = now_ms()-t0; } }
   return 0;
 }
 
@@ -294,11 +294,32 @@ static int send_rgba(const unsigned char *nv12, int w, int h){
       }
     }
   }
-  { long total = (long)w*h*4, off = 0; long t0 = now_ms();
-    while (off < total){
-      long wr = write(g_rsock, g_rgba+off, (unsigned long)(total-off));
-      if (wr <= 0){ close(g_rsock); g_rsock = -1; g_send_ms = now_ms()-t0; return -1; }
-      off += wr;
+  { long total = (long)w*h*4; long t0 = now_ms();
+    /* DROP-IF-BEHIND, THEN NON-BLOCKING WHOLE-FRAME.
+     *
+     * SIOCOUTQ pre-check: only send when the presenter has drained the previous
+     * frame (nothing queued).  That makes a PARTIAL frame IMPOSSIBLE -- with an
+     * empty queue a full 2.4 MB frame fits in one send(), so we never write half
+     * a frame for the presenter to (mis)reassemble.  A skipped frame is stale on
+     * screen, never black, and never a torn frame.
+     *
+     * The non-blocking send() is the belt: even if the ioctl ever lied, a full
+     * buffer makes send() return short/EAGAIN (never block), and we drop the
+     * whole frame and close so the presenter resets its reassembly.
+     *
+     * WHY THIS MATTERS (2026-10-19): the OLD blocking write() stalled the decode
+     * loop up to 60 ms/frame when the presenter fell behind (measured 198-400 ms
+     * on the car).  While blocked, the loop stops reading the shim's AU socket,
+     * the shim's 200 ms SO_SNDTIMEO fires, AUs are dropped, the P-chain breaks
+     * and the cluster garbles.  A skipped frame is stale; a stalled decoder is a
+     * dead pipeline.  MSG_NOSIGNAL keeps a dead presenter from raising SIGPIPE
+     * (the decoder is its own process, but the belt is free). */
+    { int q = 0;
+      if (ioctl(g_rsock, 0x5411UL /*SIOCOUTQ*/, &q) == 0 && q > 0){
+        g_rdrop++; g_send_ms = 0; return -1; } }
+    long wr = send(g_rsock, g_rgba, (unsigned long)total, 0x40 /*MSG_DONTWAIT*/ | 0x4000 /*MSG_NOSIGNAL*/);
+    if (wr != total){
+      close(g_rsock); g_rsock = -1; g_rdrop++; g_send_ms = now_ms()-t0; return -1;
     }
     g_send_ms = now_ms()-t0; }
   return 0;
