@@ -1112,14 +1112,30 @@ static void va_preset_rect(int i, int cw, int chp, va_rect *r)
      *     shrank the ETA too.  So width stays at/above the 300 px clamp ceiling
      *     (platter = clamp(safeW,165,300)) -- do NOT "narrow it to fit".
      * Fall back to the derived shape on a panel that is not this size. */
-    int sw = cw * 31 / 100, sh = chp - 112;         /* 397 / 368 on 1280x480 */
-    if (cw == 1280 && chp == 480){ sw = 397; sh = 368; r->sy = 57; }
-    else r->sy = chp * 12 / 100;
+    int sw = cw * 31 / 100, sh = chp - 105;         /* 397 / 375 on 1280x480 */
+    int centred = 1;
+    if (cw == 1280 && chp == 480){
+      /* THE FINAL CARD, owner-locked 2026-10-20 after tuning on the car:
+       *   x=439 (2 px left of dead centre)  y=50  w=397 (-> 300 px platter)
+       *   h=375  =>  bottom margin 480-(50+375) = 55, the value called perfect.
+       * Why these, so nobody re-derives it:
+       *   - bottom margin = 480-(sy+sh) and it is the ONE predictable knob;
+       *   - the top edge follows the card's HEIGHT, and sh acts near-linearly
+       *     as a zoom (366 -> 420 went from "a bit clipped" to "half clipped"),
+       *     so small steps only;
+       *   - width is a SIZE CLASS at 300 px, not a real width: below 300 iOS
+       *     shrinks the type and clips words, so safeW stays >= 300 (397 here);
+       *   - sx moves the card 1 px at a time; sub-pixel is impossible, the
+       *     safe-area fields are integer pixels at 1x.
+       * Everything except sy/sx is left to the derived fallback on other panels. */
+      sw = 397; sh = 375; r->sx = 439; r->sy = 50; centred = 0;
+    }
     if (sh < 253) sh = 253;
     if (sh > chp - 20) sh = chp - 20;
     if (sw < 165) sw = 165;
     if (sw > cw) sw = cw;
-    r->sx = (cw - sw) / 2; r->sw = sw; r->sh = sh;
+    if (centred) r->sx = (cw - sw) / 2;
+    r->sw = sw; r->sh = sh;
   } else {
     /* third layout (unmeasured): WIDE with a real margin, offset left so the
      * wide-side branch is exercised. */

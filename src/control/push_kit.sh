@@ -21,7 +21,7 @@ cd "$SHIM" || exit 1
 # Abort BEFORE staging if a tool does not match, so a stale decoder/presenter
 # cannot reach the car (the same discipline run_inject.sh applies to the shim).
 md5of(){ if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
-SHIM_WANT=1468a16a810d128ca33c1d6eeaafac6f
+SHIM_WANT=9c02768a61c779c18c496c9ce05b5af0
 V4L2_WANT=bff15e2a4e89ecff1afc06d8bc0b928e
 EGL_WANT=7612f74aecc1141c11e715488fb25dea
 checkpin(){ # checkpin <path> <want-md5>
