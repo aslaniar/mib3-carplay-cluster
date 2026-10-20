@@ -265,17 +265,6 @@ static int send_rgba(const unsigned char *nv12, int w, int h){
   if (g_rsock < 0) rgba_connect();
   if (g_rsock < 0) return -1;
   if (!g_rgba){ g_rgba = (unsigned char*)malloc((unsigned long)w*h*4); if (!g_rgba) return -1; }
-  /* BACKPRESSURE, decided BEFORE converting: if the presenter has not drained
-   * the socket, skip this WHOLE frame.  Measured 2026-10-19: the presenter fell
-   * behind, write() blocked up to its 60 ms timeout per frame (send=203 ms),
-   * which stalled the decode loop, backed up the AU socket and made the shim
-   * drop 70% of AUs (qdrop=1029) -- the cluster then showed a frozen, artifacted
-   * picture.  Dropping whole frames keeps the AU path drained; a skipped frame
-   * is invisible, a stalled decoder is not.
-   * TIOCOUTQ = 0x5411: bytes still queued in the socket. */
-  { int q = 0; extern int ioctl(int, unsigned long, ...);
-    if (ioctl(g_rsock, 0x5411UL, &q) == 0 && q > (int)(w * h * 2)){
-      g_rdrop++; g_send_ms = 0; return -1; } }
   /* FAST PATH: two pixels per chroma sample, packed 32-bit stores.
    * The original per-pixel version cost ~32 ms/frame (measured 2026-10-18),
    * which throttled the whole pipeline to ~4 fps. */
