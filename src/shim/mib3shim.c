@@ -2323,16 +2323,28 @@ static void *zoom_listen_thread(void *arg)
         if (cl[j].fd < 0) continue;
         r = read(cl[j].fd, buf, sizeof(buf));
         if (r <= 0){
+          /* Peer gone: flush the last UNTERMINATED line once, then close.  A
+           * line that never got its '\n' must still be acted on, but exactly
+           * once -- not re-flushed on a later read. */
+          if (cl[j].ln > 0){ ctl_handle_line(cl[j].lb, cl[j].ln); cl[j].ln = 0; }
           logline("cluster/zoom","peer gone");
           close(cl[j].fd); cl[j].fd = -1; cl[j].ln = 0;
           continue;
         }
         for (k = 0; k < r; k++){
           char c = buf[k];
-          if (c == '\n' || c == '\r'){ ctl_handle_line(cl[j].lb, cl[j].ln); cl[j].ln = 0; continue; }
+          if (c == '\n' || c == '\r'){
+            if (cl[j].ln > 0){ ctl_handle_line(cl[j].lb, cl[j].ln); cl[j].ln = 0; }
+            continue;
+          }
           if (cl[j].ln < (int)sizeof(cl[j].lb) - 1) cl[j].lb[cl[j].ln++] = c;
+          else { ctl_handle_line(cl[j].lb, cl[j].ln); cl[j].ln = 0; }  /* full: flush, keep going */
         }
-        ctl_handle_line(cl[j].lb, cl[j].ln);
+        /* NO end-of-read flush.  It is what made a token split across two reads
+         * ("next" then "\n", which mib3ctl sends as TWO write()s) dispatch TWICE:
+         * once as a partial at end-of-read, once when the terminator arrived.
+         * Newline-only (plus flush-on-disconnect and flush-on-full) is the
+         * correct, single-dispatch contract. */
       }
     }
   }
