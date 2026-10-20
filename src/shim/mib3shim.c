@@ -250,7 +250,20 @@ extern int *__errno_location(void);
 #define SO_SNDTIMEO_ 21
 static int hlp_fd = -1;
 static unsigned long hlp_seq = 0, hlp_sent = 0, hlp_drop = 0, hlp_conns = 0;
-static void helper_close(void){ if (hlp_fd >= 0){ close(hlp_fd); hlp_fd = -1; } }
+/* BOUNDED EAGAIN RECOVERY (2026-10-19).  A helper whose peer is gone (one-way:
+ * nobody reading) makes every send() return EAGAIN with MSG_DONTWAIT.  The old
+ * "keep the socket on EAGAIN" rule then held it FOREVER: every AU dropped, the
+ * cluster frozen on an old frame while the shim kept logging "receiving video".
+ * Track consecutive EAGAIN failures and the wall-clock of the last successful
+ * send; close (and therefore reconnect on the next AU) once either bound trips.
+ * A slow-but-alive helper resets the counter on every success and never trips it,
+ * so only a truly wedged/one-way peer is torn down. */
+static int  hlp_eagain = 0;          /* consecutive EAGAINs since the last success */
+static long hlp_last_ok = 0;         /* time(0) of the last fully-sent record */
+static void helper_close(void){
+  if (hlp_fd >= 0){ close(hlp_fd); hlp_fd = -1; }
+  hlp_eagain = 0;                    /* a fresh socket starts with a clean slate */
+}
 static const char *helper_path(void){
   char *v = getenv("MIB3_SHIM_HELPER"); return (v && v[0]) ? v : MIB3_HELP_SOCK_DEFAULT;
 }
@@ -291,6 +304,9 @@ static int helper_connect(void){
  * is not. */
 #define MIB3_MSG_DONTWAIT 0x40
 
+extern long time(long *);                       /* used by the backoff + EAGAIN bound */
+static u64 env_num(const char *name, u64 dflt); /* defined after the CF section */
+
 static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   unsigned char hdr[MIB3_HELP_HDRLEN];
   u32 m32; u64 m64; int i;
@@ -311,21 +327,37 @@ static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   m32 = MIB3_HELP_MAGIC; for (i=0;i<4;i++) hdr[i]   = (unsigned char)((m32 >> (i*8)) & 0xff);
   m32 = (u32)len;        for (i=0;i<4;i++) hdr[4+i] = (unsigned char)((m32 >> (i*8)) & 0xff);
   m64 = ++hlp_seq;       for (i=0;i<8;i++) hdr[8+i] = (unsigned char)((m64 >> (i*8)) & 0xff);
-  if (send(hlp_fd, hdr, MIB3_HELP_HDRLEN, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT)
-      != (long)MIB3_HELP_HDRLEN){
-    /* Nothing of the record went out, so the stream is still in sync.  Keep the
-     * socket ONLY if the failure was EAGAIN/EWOULDBLOCK (11) -- a transient full
-     * buffer must not churn the link.  Anything else (EPIPE after the helper
-     * died, ECONNRESET, ...) must CLOSE it, or the shim keeps a stale fd to an
-     * unlinked socket and never reconnects: measured 2026-10-19, the shim logged
-     * 'helper connected' while the decoder never saw a connection, and the
-     * cluster stayed on its fallback colour forever. */
-    hlp_drop++;
-    if (SHIM_ERRNO != 11) helper_close();
-    return -1; }
-  if (send(hlp_fd, data, len, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT) != (long)len){
-    /* Partial record = permanent desync; the helper must reconnect. */
-    hlp_drop++; helper_close(); return -1; }
+  { long r = send(hlp_fd, hdr, MIB3_HELP_HDRLEN, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT);
+    if (r != (long)MIB3_HELP_HDRLEN){
+      hlp_drop++;
+      /* Distinguish "nothing written because the buffer is full" (EAGAIN) from
+       * every other outcome.  EAGAIN leaves the stream in sync and MAY be kept
+       * -- but only BOUNDED (see the recovery note at hlp_eagain).  A short
+       * positive write (r>=0 but != HDRLEN) or a fatal errno (EPIPE after the
+       * helper died, ECONNRESET, ...) MUST close: the record is half-gone and a
+       * stale fd to an unlinked socket otherwise never reconnects (measured
+       * 2026-10-19: "helper connected" while the decoder never saw one). */
+      if (r < 0 && SHIM_ERRNO == 11 /*EAGAIN*/){
+        long now = time(0);
+        long emax = (long)env_num("MIB3_SHIM_HLP_EAGAIN", 8);
+        long stall = (long)env_num("MIB3_SHIM_HLP_STALL", 2);
+        hlp_eagain++;
+        if (hlp_eagain >= emax ||
+            (hlp_last_ok && now - hlp_last_ok > stall)){
+          logkv("sink","helper EAGAIN bound tripped -- closing",(u64)(u32)hlp_eagain,0);
+          helper_close();
+        }
+      } else {
+        helper_close();
+      }
+      return -1; }
+  }
+  { long r = send(hlp_fd, data, len, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT);
+    if (r != (long)len){
+      /* Partial record = permanent desync; the helper must reconnect. */
+      hlp_drop++; helper_close(); return -1; } }
+  hlp_eagain = 0;                 /* a complete record went out: reset the bound */
+  hlp_last_ok = time(0);
   hlp_sent++;
   return 0;
 }
