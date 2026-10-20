@@ -480,8 +480,31 @@ static int step(int dir){
 
 /* ---- renderers tap state ---------------------------------------------- */
 #define MAXR 8
-static struct { char name[48]; char uri[80]; s64 dpp; int have; } g_r[MAXR];
+static struct { char name[48]; char uri[80]; s64 dpp; int have; int auto_mode; } g_r[MAXR];
 static int g_nr;
+
+/* The renderer tap's decision, kept pure so the selftest can pin it without a
+ * socket.  Returns 1 when the change is a wheel step (*dir: +1 in, -1 out),
+ * 0 when it must be ignored:
+ *   - the first sample (no baseline);
+ *   - a zoomMode EDGE (auto<->manual).  MEASURED 2026-10-19: the first wheel
+ *     roll flips the car's kombi renderer auto -> manual AND jumps
+ *     distancePerPixel 3.838 -> 26.312 at once.  That jump is manual mode
+ *     starting at its own scale, not one step, so adopting it as a baseline is
+ *     the only honest reading -- the direction is simply not in the number.
+ *   - a change below the 15% threshold (rescale noise);
+ *   - any change while zoomMode is auto (that is speed, not the wheel). */
+static int dpp_decide(s64 prev, int prev_auto, s64 now, int now_auto, int *dir){
+  s64 hi, lo;
+  if (dir) *dir = 0;
+  if (prev <= 0 || now <= 0) return 0;
+  if (prev_auto != now_auto) return 0;
+  hi = prev * 115 / 100; lo = prev * 100 / 115;
+  if (now <= hi && now >= lo) return 0;
+  if (now_auto) return 0;
+  if (dir) *dir = (now < prev) ? 1 : -1;      /* smaller m/px = zoomed in */
+  return 1;
+}
 
 static int renderer_slot(const char *name, const char *uri){
   int i;
@@ -551,8 +574,81 @@ static int selftest(void){
     ck("selftest.obj1", (o1 && get_str(o1, "name", nm, sizeof(nm)) && streq(nm, "kombi")) ? 1 : 0, 1);
     ck("selftest.obj1_len", (int)l1, 27); }
 
-  if (!g_fail) P(2, "TOTAL: PASS=14 FAIL=0\n");
+  /* the poll-path decision (added 2026-10-19): the car's kombi renderer flipped
+   * auto -> manual with a 6.9x jump when the wheel was first rolled, so the EDGE
+   * must be adopted silently, and only manual-mode deltas are steps. */
+  { int d = 0;
+    ck("selftest.decide_edge_auto_to_manual", dpp_decide(3838, 1, 26312, 0, &d), 0);
+    ck("selftest.decide_edge_no_dir", d, 0);
+    ck("selftest.decide_manual_out", dpp_decide(26312, 0, 40000, 0, &d) ? d : 0, -1);
+    ck("selftest.decide_manual_in", dpp_decide(26312, 0, 12000, 0, &d) ? d : 0, 1);
+    ck("selftest.decide_below_threshold", dpp_decide(26312, 0, 27000, 0, &d), 0);
+    ck("selftest.decide_auto_ignored", dpp_decide(3000, 1, 6000, 1, &d), 0); }
+
+  if (!g_fail) P(2, "TOTAL: PASS=19 FAIL=0\n");
   return g_fail ? 1 : 0;
+}
+
+/* One renderer element -> at most one zoom step.  Used by BOTH the WS event
+ * path and the poll path (they can race harmlessly: whoever sees the new
+ * distancePerPixel first emits and moves the baseline, the other sees no
+ * change). */
+static int tapb_element(const char *obj, int invert, int *accepted, int *steps){
+  char nm[48] = ""; char zom[24] = "";
+  s64 dpp = 0; int slot, auto_mode, emit_dir = 0, s;
+  if (!obj || !get_str(obj, "name", nm, sizeof(nm))) return 0;
+  slot = renderer_slot(nm, "");
+  if (slot < 0) return 0;
+  get_str(obj, "zoomMode", zom, sizeof(zom));
+  auto_mode = streq(zom, "auto");
+  if (!get_float_milli(obj, "distancePerPixel", &dpp)) return 0;
+  if (!g_r[slot].have){
+    g_r[slot].dpp = dpp; g_r[slot].auto_mode = auto_mode; g_r[slot].have = 1;
+    return 0;
+  }
+  if (g_r[slot].auto_mode != auto_mode){
+    P(2, "[wheel] tapB zoomMode edge ");
+    P(2, g_r[slot].auto_mode ? "auto->manual" : "manual->auto");
+    P(2, " renderer="); P(2, g_r[slot].name);
+    LV(" baseline_milli", dpp);
+    g_r[slot].dpp = dpp; g_r[slot].auto_mode = auto_mode;
+    return 0;
+  }
+  if (dpp_decide(g_r[slot].dpp, g_r[slot].auto_mode, dpp, auto_mode, &emit_dir)){
+    int dir = emit_dir;
+    if (invert) dir = -dir;
+    P(2, "[wheel] tapB renderer="); P(2, g_r[slot].name); LV(" dpp_milli", dpp);
+    if (accepted) (*accepted)++;
+    g_r[slot].dpp = dpp;
+    s = step(dir);
+    if (steps) *steps += s;
+    return 1;
+  }
+  if (auto_mode){
+    s64 hi = g_r[slot].dpp * 115 / 100, lo = g_r[slot].dpp * 100 / 115;
+    if (dpp > hi || dpp < lo) L("tapB", "dpp moved under zoomMode=auto -> ignored (speed zoom, not the wheel)");
+  }
+  g_r[slot].dpp = dpp;
+  return 0;
+}
+
+/* ---- renderer POLL (added 2026-10-19, after measuring the car) ----------
+ * WHY: on the unit, RSI answers GET for /maprenderer/renderers but does NOT
+ * push these changes over the WS subscription.  Measured: the owner rolled the
+ * wheel, the car's own `kombi` renderer went distancePerPixel 3.838 -> 26.312
+ * and zoomMode auto -> manual, and mib3wheel logged NOTHING.  The subscription
+ * is therefore the wrong instrument; a GET diff is the reliable one.  The WS
+ * taps stay (they cost nothing and may push on another build). */
+static int poll_renderers(const char *host, int port, int invert, int *accepted, int *steps){
+  static char buf[65536]; usize bl = 0; const char *arr; int k, handled = 0;
+  if (http_get(host, port, "/maprenderer/renderers", buf, sizeof(buf), &bl) != 200 || !bl) return 0;
+  arr = find_key(buf, "data");
+  for (k = 0; k < MAXR; k++){
+    usize ol = 0; const char *o = json_array_object(arr, k, &ol);
+    if (!o) break;
+    handled += tapb_element(o, invert, accepted, steps);
+  }
+  return handled;
 }
 
 /* ---- probe ------------------------------------------------------------- */
@@ -624,9 +720,10 @@ extern int poll(void *, unsigned long, int);
 struct tag { const char *path; int kind; int fd; s64 last_try_ms; };   /* kind 0 = discreteInputs, 1 = renderers */
 #define WATCH_MAX 4
 
-static int main_watch(const char *host, int port, int use_renderers, int dump, int invert, int once)
+static int main_watch(const char *host, int port, int use_renderers, int dump, int invert, int once, int poll_ms)
 {
   struct tag w[WATCH_MAX]; int nw = 0, i, steps = 0, accepted = 0;
+  s64 next_poll = 0;
   static char payload[65536];
   w[nw].path = "/maprenderer/discreteInputs"; w[nw].kind = 0; w[nw].fd = -1; w[nw].last_try_ms = 0; nw++;
   if (use_renderers){ w[nw].path = "/maprenderer/renderers"; w[nw].kind = 1; w[nw].fd = -1; w[nw].last_try_ms = 0; nw++; }
@@ -676,29 +773,18 @@ static int main_watch(const char *host, int port, int use_renderers, int dump, i
           if (once && accepted >= once) goto done;
         }
       } else {
-        char nm[48] = ""; char zom[24] = ""; s64 dpp = 0;
-        if (get_str(payload, "name", nm, sizeof(nm))){
-          int slot = renderer_slot(nm, "");
-          get_str(payload, "zoomMode", zom, sizeof(zom));
-          if (slot >= 0 && get_float_milli(payload, "distancePerPixel", &dpp)){
-            if (!g_r[slot].have){ g_r[slot].dpp = dpp; g_r[slot].have = 1; }
-            else if (dpp != g_r[slot].dpp){
-              s64 ratio_hi = g_r[slot].dpp * 115 / 100, ratio_lo = g_r[slot].dpp * 100 / 115;
-              int autoZoom = streq(zom, "auto");
-              int big = (dpp > ratio_hi) || (dpp < ratio_lo);
-              if (autoZoom && big) L("tapB", "dpp moved under zoomMode=auto -> ignored (speed zoom, not the wheel)");
-              if (big && !autoZoom){
-                int dir = (dpp < g_r[slot].dpp) ? 1 : -1;   /* smaller m/px = zoomed in */
-                if (invert) dir = -dir;
-                P(2, "[wheel] tapB renderer="); P(2, g_r[slot].name);
-                LV(" dpp_milli", dpp);
-                accepted++;
-                steps += step(dir);
-                if (once && accepted >= once) goto done;
-              }
-              g_r[slot].dpp = dpp;
-            }
-          }
+        if (tapb_element(payload, invert, &accepted, &steps)){
+          if (once && accepted >= once) goto done;
+        }
+      }
+    }
+    { /* poll the renderers: RSI does not push these changes (measured on the car
+       * 2026-10-19 -- the wheel turned, the renderer changed, nothing arrived). */
+      s64 t = now_ms();
+      if (use_renderers && poll_ms > 0 && t >= next_poll){
+        next_poll = t + poll_ms;
+        if (poll_renderers(host, port, invert, &accepted, &steps)){
+          if (once && accepted >= once) goto done;
         }
       }
     }
@@ -753,6 +839,7 @@ void _start(void){
 int tool_main(int argc, char **argv){
   const char *host = "127.0.0.1";
   int port = 49500, probe = 0, probe_all = 0, dump = 0, invert = 0, once = 0, use_renderers = 1;
+  int poll_ms = 250;
   int i, selftest_mode = 0;
   for (i = 1; i < argc; i++){
     const char *a = argv[i];
@@ -761,6 +848,8 @@ int tool_main(int argc, char **argv){
     else if (streq(a, "--dump")) dump = 1;
     else if (streq(a, "--invert")) invert = 1;
     else if (streq(a, "--no-renderers")) use_renderers = 0;
+    else if (streq(a, "--no-poll")) poll_ms = 0;
+    else if (streq(a, "--poll-ms") && i + 1 < argc) poll_ms = my_atoi(argv[++i]);
     else if (streq(a, "--selftest")) selftest_mode = 1;
     else if (streq(a, "--quiet")) g_quiet = 1;
     else if (streq(a, "--host") && i + 1 < argc) host = argv[++i];
@@ -771,9 +860,10 @@ int tool_main(int argc, char **argv){
     else if (streq(a, "--help") || streq(a, "-h")){
       P(1, "mib3wheel [--probe|--probe-all] [--host H] [--port N] [--socket PATH]\n"
            "          [--dump] [--invert] [--min-gap-ms N] [--no-renderers] [--once N]\n"
-           "          [--selftest] [--quiet]\n"
+           "          [--poll-ms N | --no-poll] [--selftest] [--quiet]\n"
            "watches the unit's maprenderer RSI for steering-wheel zoom steps and\n"
-           "forwards them to the shim's inbox so CarPlay's cluster map zooms.\n");
+           "forwards them to the shim's inbox so CarPlay's cluster map zooms.\n"
+           "The renderer state is POLLED (default 250 ms) because RSI does not push it.\n");
       return 0; }
     else { P(2, "[wheel] unknown arg: "); P(2, a); P(2, "\n"); return 2; }
   }
@@ -781,5 +871,5 @@ int tool_main(int argc, char **argv){
   P(2, "[wheel] mib3wheel 1.0 rsi="); P(2, host); P(2, ":"); PN(2, port);
   P(2, " socket="); P(2, g_sockpath ? g_sockpath : "(none)"); P(2, "\n");
   if (probe) return do_probe(host, port, probe_all);
-  return main_watch(host, port, use_renderers, dump, invert, once);
+  return main_watch(host, port, use_renderers, dump, invert, once, poll_ms);
 }
