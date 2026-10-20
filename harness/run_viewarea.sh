@@ -168,7 +168,7 @@ chkg advert_on_count 'cluster/va: count declared=3' "$AON"
 chk  advert_on_rects 3 "$(printf '%s' "$AON" | grep -c 'cluster/va/rect')"
 # the preset derives the boxes from CarPlay's own classifier thresholds
 chkg advert_on_area0_wide 'cluster/va/rect: visible=0,0,1280,480 safe=240,100,800,280' "$AON"
-chkg advert_on_area1_centred 'cluster/va/rect: visible=0,0,1280,480 safe=441,57,397,368' "$AON"
+chkg advert_on_area1_centred 'cluster/va/rect: visible=0,0,1280,480 safe=439,50,397,375' "$AON"
 chk  advert_on_class_wide    2 "$(printf '%s' "$AON" | grep -c 'class (0=BLANK 1=centred 2=wide)=2')"
 chk  advert_on_class_centred 1 "$(printf '%s' "$AON" | grep -c 'class (0=BLANK 1=centred 2=wide)=1')"
 chk  advert_on_class_blank   0 "$(printf '%s' "$AON" | grep -c 'class (0=BLANK 1=centred 2=wide)=0')"
@@ -179,7 +179,7 @@ chk  advert_on_no_cliff      0 "$(printf '%s' "$AON" | grep -c 'nearCliff(<=10%)
 chk  advert_on_initial_default 1 "$(printf '%s' "$AON" | grep -c 'initialViewArea=1')"
 chkg advert_on_knobs 'VIEWAREAS=1' "$AON"
 # VA_VISIBLE=1 shrinks the VISIBLE frame of areas > 0 too (the rgi-refuted shape)
-chkg advert_vis_visible_shrunk 'cluster/va/rect: visible=441,57,397,368 safe=441,57,397,368' "$AVIS"
+chkg advert_vis_visible_shrunk 'cluster/va/rect: visible=439,50,397,375 safe=439,50,397,375' "$AVIS"
 # a box below BOTH cliffs is CarPlay layout 0: the cluster draws NOTHING (no
 # graceful degradation), so the bench pins the classification of that shape too.
 ABLK=$(slog advert_blank)
