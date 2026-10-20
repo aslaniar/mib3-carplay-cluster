@@ -983,11 +983,15 @@ static s64 dgeti64k(CFDictionaryRef d, const char *key, s64 dflt){
  * the visible frame full avoided that.  Our default follows that proven shape,
  * with MIB3_SHIM_VA_VISIBLE=1 as the deliberate experiment for the trip.
  *
- * KNOBS (all default OFF: the shipped default advert is the single full-panel
- * area, byte-for-byte what it is today):
- *   MIB3_SHIM_VIEWAREAS=1        declare multiple view areas (default: off)
- *   MIB3_SHIM_VA_COUNT=n         how many (default 2)
- *   MIB3_SHIM_VA<i>="x,y,w,h[,sx,sy,sw,sh]"  explicit rects for area i
+ * KNOBS:
+ *   MIB3_SHIM_VIEWAREAS=1        declare multiple view areas (default: off ->
+ *                                the single full-panel area, unchanged)
+ *   MIB3_SHIM_VA_COUNT=n         how many (default 3: this car has three layouts)
+ *   MIB3_SHIM_VA_PRESET=1        derive class-safe boxes from CarPlay's own
+ *                                classifier (default ON; see the CLASSIFIER block).
+ *                                VA_PRESET=0 restores the old full-panel/guess.
+ *   MIB3_SHIM_VA<i>="x,y,w,h[,sx,sy,sw,sh]"  explicit rects for area i (wins over
+ *                                the preset)
  *   MIB3_SHIM_VA_VISIBLE=1       also shrink the *visible* frame of areas >0 to
  *                                their safe rect (the rgi-refuted shape)
  *   MIB3_SHIM_VA_NOOUTSIDE=1     omit drawUIOutsideSafeArea from safeArea
@@ -995,9 +999,9 @@ static s64 dgeti64k(CFDictionaryRef d, const char *key, s64 dflt){
  * ========================================================================*/
 typedef struct { int x, y, w, h; int sx, sy, sw, sh; } va_rect;
 
-/* Provisional safe rect for the gauge layout on the 1280x480 panel.
- * THIS IS A GUESS AND IS LABELLED AS ONE -- see the lane doc.  It is centred:
- * (1280-480)/2 = 400 and (480-400)/2 = 40, and 480 px wide so that CarPlay's
+/* LEGACY safe rect for the gauge layout (VA_PRESET=0 only; the preset derives a
+ * class-safe box from CarPlay's classifier instead).  This one was a GUESS: it
+ * is centred -- (1280-480)/2 = 400 and (480-400)/2 = 40 -- and 480 px wide so that CarPlay's
  * CPSInstrumentClusterCardLayout does not classify it "narrow" -- rgi measured
  * that threshold at ~498 px on a 1440 px panel = 34.6% of the width, and 34.6%
  * of 1280 is 443, so 480 clears it.  400 px tall clears rgi's other limit
@@ -1022,10 +1026,101 @@ static int va_parse_rect(const char *s, va_rect *r)
 }
 static int va_count(void)
 {
-  long n = (long)env_num("MIB3_SHIM_VA_COUNT", 2);
+  /* 3 by default: this car's cluster cycles through THREE layouts, and one view
+   * area per layout is the whole point of the multi-area path (MIB3_SHIM_VA_COUNT
+   * overrides; the single-area path used by the proven config is untouched). */
+  long n = (long)env_num("MIB3_SHIM_VA_COUNT", 3);
   if (n < 1) n = 1;
   if (n > 8) n = 8;
   return (int)n;
+}
+/* ==========================================================================
+ * THE CLASSIFIER CarPlay applies to our safe box (desk reconstruction,
+ * 2026-10-19, from rgi's decompile of
+ * -[CPSInstrumentClusterCardViewController initWithSafeAreaFrame:…physicalPixelWidth:]
+ * plus the DashBoard scene path).
+ *
+ * A safe box is NOT a crop and NOT a scale -- it is a CLASSIFICATION INPUT.  The
+ * phone picks one of three card designs from its width and height:
+ *
+ *   scale   = 0.153 mm / (physicalWidthMm / pixelWidth)
+ *   wide    : safeW >= 660*scale   -> 213 px card column at the box's L/R edge
+ *   centred : safeH >  383*scale   -> centred platter (width clamped 165..300)
+ *   else    : LAYOUT 0, "will not show cluster content" -- a BLANK cluster, ETA
+ *             included.  There is no graceful degradation.
+ *   and, independently: ETA is dropped unless safeH > 202 px.
+ *
+ * For this panel (1280 px at the advertised 292 mm) scale = 0.670, so
+ * wide >= 443 px and centred needs safeH > 257 px.  BOTH cliffs move with the
+ * advertised mm (a true 278 mm panel puts wide at >= 465 px), so a preset box
+ * keeps a margin rather than sitting on a threshold.
+ * ========================================================================*/
+static int va_scale_milli(int cw, int phy_mm){
+  if (phy_mm < 50 || phy_mm > 2000) phy_mm = 292;   /* absurd -> the default */
+  if (cw < 100) cw = 1280;
+  return (int)((153L * (long)cw) / (long)phy_mm);
+}
+static int va_wide_px(int cw, int phy_mm){ return (int)((660L * (long)va_scale_milli(cw, phy_mm)) / 1000L); }
+static int va_centre_px(int cw, int phy_mm){ return (int)((383L * (long)va_scale_milli(cw, phy_mm)) / 1000L) + 1; }
+/* 0 = undefined (blank), 1 = centred, 2 = wide.  Which SIDE a wide column takes
+ * is the phone's choice (safe-area mid vs display mid), so it is not modelled. */
+static int va_class_of(int sw, int sh, int cw, int phy_mm){
+  if (sw <= 0 || sh <= 0) return 0;
+  if (sw >= va_wide_px(cw, phy_mm)) return 2;
+  if (sh >  va_centre_px(cw, phy_mm)) return 1;
+  return 0;
+}
+/* 1 when the box clears its cliff by <= 10% -- i.e. do not trust it on the car. */
+static int va_class_near_cliff(int sw, int sh, int cw, int phy_mm){
+  int cls = va_class_of(sw, sh, cw, phy_mm);
+  if (cls == 2 && sw < va_wide_px(cw, phy_mm) * 110 / 100) return 1;
+  if (cls == 1 && sh < va_centre_px(cw, phy_mm) * 110 / 100) return 1;
+  return 0;
+}
+/* Class-safe boxes for the THREE cluster layouts, DERIVED from the classifier
+ * rather than invented: each box is placed well inside the class it must land
+ * in, with margin against the mm error that moves the cliffs.
+ *
+ * These are PLACEHOLDERS in POSITION only -- the CLASS is deliberate, the
+ * COORDINATES still have to be measured against the car's own clear window
+ * (MIB3_RE/LANE_CLUSTER_LAYOUTS_2026-10-19.md, calibration grid).  Override any
+ * of them with MIB3_SHIM_VA<i>="x,y,w,h,sx,sy,sw,sh"; MIB3_SHIM_VA_PRESET=0
+ * restores the old full-panel/guess behaviour. */
+static void va_preset_rect(int i, int cw, int chp, va_rect *r)
+{
+  int phy = (int)env_num("MIB3_SHIM_CWPHY", 292);
+  int wt  = va_wide_px(cw, phy);
+  int ct  = va_centre_px(cw, phy);
+  /* The visible frame stays the FULL panel: reducing it got the 111 stream
+   * rejected at activation (rgi, measured). */
+  r->x = 0; r->y = 0; r->w = cw; r->h = chp;
+  if (i == 0){
+    /* full-map layout: WIDE, centred, generous margins */
+    int sw = cw * 5 / 8, sh = chp * 7 / 12;
+    if (sw < wt + wt / 3) sw = wt + wt / 3;
+    if (sh < 242) sh = 242;                     /* ETA floor + margin */
+    if (sw > cw) sw = cw;
+    if (sh > chp) sh = chp;
+    r->sx = (cw - sw) / 2; r->sy = (chp - sh) / 2; r->sw = sw; r->sh = sh;
+  } else if (i == 1){
+    /* dual-gauge layout: the card must sit BETWEEN the dials, so this box is
+     * deliberately BELOW the wide cliff -> centred class. */
+    int sw = wt * 9 / 10, sh = ct * 5 / 4;
+    if (sh < 253) sh = 253;
+    if (sh > chp - 20) sh = chp - 20;
+    if (sw < 165) sw = 165;
+    if (sw > cw) sw = cw;
+    r->sx = (cw - sw) / 2; r->sy = (chp - sh) / 2; r->sw = sw; r->sh = sh;
+  } else {
+    /* third layout (unmeasured): WIDE with a real margin, offset left so the
+     * wide-side branch is exercised. */
+    int sw = cw * 47 / 100, sh = chp * 62 / 100;
+    if (sw < wt + wt / 3) sw = wt + wt / 3;
+    if (sh < 242) sh = 242;
+    if (sw > cw) sw = cw;
+    if (sh > chp) sh = chp;
+    r->sx = cw / 20; r->sy = (chp - sh) / 2; r->sw = sw; r->sh = sh;
+  }
 }
 /* Fill rect i (1-based env name suffix: area 0 -> MIB3_SHIM_VA0). */
 static int va_rect_at(int i, int cw, int chp, va_rect *r)
@@ -1034,6 +1129,7 @@ static int va_rect_at(int i, int cw, int chp, va_rect *r)
   while (*p && j < (int)sizeof(nm) - 3) nm[j++] = *p++;
   nm[j++] = (char)('0' + (i % 10)); nm[j] = 0;
   { const char *s = getenv(nm); if (s && s[0] && va_parse_rect(s, r)) return 1; }
+  if (env_on("MIB3_SHIM_VA_PRESET",1)){ va_preset_rect(i, cw, chp, r); return 1; }
   if (i == 0){                                     /* area 0 = the full panel */
     r->x = 0; r->y = 0; r->w = cw; r->h = chp;
     r->sx = 0; r->sy = 0; r->sw = cw; r->sh = chp;
@@ -1080,8 +1176,9 @@ static CFMutableDictionaryRef va_build_one(const va_rect *r)
   if (p_CFRelease) p_CFRelease(safe);
   return area;
 }
-/* one "visible=x,y,w,h safe=x,y,w,h" line, no allocation */
-static void va_log_rect(int i, const va_rect *r)
+/* one "visible=x,y,w,h safe=x,y,w,h" line, no allocation, then the CLASSIFIER
+ * verdict for this box (see the CLASSIFIER block: 0 = blank cluster). */
+static void va_log_rect(int i, const va_rect *r, int cw)
 {
   char b[160]; int k = 0; int v[8]; int q, j;
   v[0]=r->x; v[1]=r->y; v[2]=r->w; v[3]=r->h;
@@ -1101,6 +1198,17 @@ static void va_log_rect(int i, const va_rect *r)
   b[k] = 0;
   logkv("cluster/va","area index",(u64)(u32)i,0);
   logline("cluster/va/rect", b);
+  /* the phone's own verdict on this box, computed BEFORE the session so the car
+   * tells us what it will draw instead of us guessing from the picture */
+  { int phy = (int)env_num("MIB3_SHIM_CWPHY", 292);
+    int cls = va_class_of(r->sw, r->sh, cw, phy);
+    logkv("cluster/va","class (0=BLANK 1=centred 2=wide)",(u64)(u32)cls,0);
+    logkv("cluster/va","  safeW",(u64)(u32)r->sw,0);
+    logkv("cluster/va","  safeH",(u64)(u32)r->sh,0);
+    logkv("cluster/va","  wideThrPx",(u64)(u32)va_wide_px(cw, phy),0);
+    logkv("cluster/va","  centreThrPx(safeH)",(u64)(u32)va_centre_px(cw, phy),0);
+    logkv("cluster/va","  etaOk(safeH>202)",(u64)(unsigned)(r->sh > 202),0);
+    logkv("cluster/va","  nearCliff(<=10%)",(u64)(unsigned)va_class_near_cliff(r->sw, r->sh, cw, phy),0); }
 }
 
 /* The multi-area `viewAreas` array.  Returns +1 owned by the caller.  Logs one
@@ -1127,7 +1235,7 @@ static CFMutableArrayRef va_build(int cw, int chp)
     if (!a) continue;
     p_CFArrayAppendValue(va, a);       /* array retains */
     if (p_CFRelease) p_CFRelease(a);
-    va_log_rect(i, &r);
+    va_log_rect(i, &r, cw);
   }
   logkv("cluster/va","count declared",(u64)(unsigned)p_CFArrayGetCount(va),0);
   return va;
@@ -3284,6 +3392,8 @@ static void run_banner(void){
   /* view-area / command-completion knobs (2026-10-19) */
   bs(&b,"  CMDACK="); bu64(&b,(u64)env_on("MIB3_SHIM_CMDACK",1),10,0);
   bs(&b,"  VIEWAREAS="); bu64(&b,(u64)env_on("MIB3_SHIM_VIEWAREAS",0),10,0);
+  bs(&b,"  VA_COUNT="); bu64(&b,(u64)(unsigned)va_count(),10,0);
+  bs(&b,"  VA_PRESET="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_PRESET",1),10,0);
   bs(&b,"  VA_COUNT="); bu64(&b,(u64)(u32)va_count(),10,0);
   bs(&b,"  VA_CMD="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_CMD",1),10,0);
   bs(&b,"  VA_VISIBLE="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_VISIBLE",0),10,0);
