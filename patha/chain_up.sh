@@ -23,7 +23,13 @@ rm -f "$SOCK" "$RGBA" /tmp/egl.log /tmp/dec.log
 
 # 1) the presenter FIRST: it must own ivi 3000 with a committed buffer before
 #    deliver_ctl.sh registers the element (the order is load-bearing).
-nohup /tmp/kit/mib3egl 3000 1280 480 3600 00ff00 --persist --fps "$FPS" \
+#    THE 4th ARG IS SECONDS, NOT A BUFFER SIZE.  `0` = persistent; anything else
+#    is a bounded run and the presenter EXITS when it elapses (logged
+#    "done (bounded run)") -- `--persist` does NOT override it.  This line used
+#    to pass 3600, so the cluster froze on a stale frame after exactly one hour
+#    (hit on the car 2026-10-19; the picture stopped and nothing looked broken
+#    because the decoder kept decoding).  Keep it 0 unless you want a timed run.
+nohup /tmp/kit/mib3egl 3000 1280 480 0 00ff00 --persist --fps "$FPS" \
       --rgba-sock "$RGBA" > /tmp/egl.log 2>&1 &
 sleep 3
 
