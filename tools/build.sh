@@ -98,6 +98,14 @@ build_egl mib3egl.c     mib3egl
 # wheel zoom steps to the shim's inbox (/dev/shm/mib3zoom.sock), where the shim
 # turns them into changeMapZoomLevel for the CarPlay cluster map.  libc only.
 [ -f mib3wheel.c ] && build_libc mib3wheel.c mib3wheel
+# mib3night: the DAY/NIGHT watcher (2026-10-26, LANE_GEN_FIX_2026-10-26).  A
+# read-only RSI client: it polls the unit's own hmiintegration dayNight element
+# (port 49570) and, on every day/night change, writes 'a map <mode> <setting>'
+# to the SAME inbox, which the shim turns into mapAppearanceUpdate -- so the
+# cluster map follows the car's theme like the centre screen does (the rule is
+# read from the STOCK carplay binary: night <=> the collection has an element
+# named "nightmode").  libc only.
+[ -f mib3night.c ] && build_libc mib3night.c mib3night
 # mib3ctl: the ONE-SHOT control-inbox button (2026-10-19).  The wheel watcher is
 # a long-lived RSI subscriber; this is the thing you press to flip a cluster
 # view area (view/next/prev), mirror a wheel zoom, or set an appearance, by
@@ -112,18 +120,21 @@ if [ -f wl_trace.c ]; then
   echo "  -> wl_trace.so ($(wc -c < wl_trace.so) bytes)"
 fi
 
-# Route-B RTP/MPEG-TS sender.  NOTE: mib3clusterstream.c is a normal HOSTED program
-# (it #includes <stdio.h>/<sys/socket.h>), so it needs an aarch64 *libc sysroot*
-# (-isysroot / --sysroot) which is NOT in this repo.  We build it only if one is
-# supplied; otherwise reuse the committed binary (data/DELIVERY_20261016/
-# mib3clusterstream.unit == the aarch64 build that ran on the unit).
-if [ -n "${AARCH64_SYSROOT:-}" ] && [ -f mib3clusterstream.c ]; then
-  $CC --target=aarch64-linux-gnu -O2 --sysroot="$AARCH64_SYSROOT" -fuse-ld=$LLD \
-      -Wl,-e,_start -o mib3clusterstream mib3clusterstream.c "$LIBC" "$LIBDL"
+# Route-B RTP/MPEG-TS sender.
+#
+# HISTORY (corrected 2026-10-27): this comment used to say mib3clusterstream.c is a
+# "normal HOSTED program" needing an aarch64 libc sysroot, and skipped the build
+# without AARCH64_SYSROOT set.  That is wrong.  The file has a freestanding branch
+# (-DMIB3_UNIT_AARCH64) that declares the handful of libc prototypes it uses and
+# links the unit's own libc.so.6, so it needs NO headers and NO sysroot.  The
+# field session rebuilt it exactly this way.  A build that silently skips the one
+# binary the takeover runs is how a stale sender gets pushed to the car.
+if [ -f mib3clusterstream.c ]; then
+  $CC --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
+      -fuse-ld=$LLD -pie -Wl,-e,_start -o mib3clusterstream mib3clusterstream.c "$LIBC"
   echo "  -> mib3clusterstream ($(wc -c < mib3clusterstream) bytes)"
 else
-  echo "  -- mib3clusterstream: SKIPPED (hosted source; needs AARCH64_SYSROOT)."
-  echo "     reuse the committed data/DELIVERY_20261016/mib3clusterstream.unit"
+  echo "  !! mib3clusterstream.c missing -- the Path B sender was NOT built"
 fi
 
 echo
@@ -144,7 +155,7 @@ echo "  measured; verified 2026-10-18: mib3egl 7612f74a (the upright fix),"
 echo "  v4l2_seq f6abd36c (BLOCKING -- superseded 2026-10-19 by bff15e2a, the"
 echo "  non-blocking whole-frame drop), mib3surface aaff6555, mib3egl2 beabf11a,"
 echo "  rgba_feed a056eabc.  (actual, this build:)"
-for b in mib3surface mib3egl mib3egl2 rgba_feed v4l2_seq ausock socktest omx_decode mib3wheel mib3ctl mib3clusterstream; do
+for b in mib3surface mib3egl mib3egl2 rgba_feed v4l2_seq ausock socktest omx_decode mib3wheel mib3night mib3ctl mib3clusterstream; do
   [ -f "$b" ] && printf '  %-20s %s\n' "$b" "$(MD5SUM "$b")"
 done
 exit 0

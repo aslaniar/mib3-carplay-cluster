@@ -64,18 +64,191 @@ if STICK="$(stick_path)"; then
 else
   BCF="${MIB3_DLV_RAM:-/dev/shm}/deliver.bc"; MSSLOG="${MIB3_DLV_RAM:-/dev/shm}/mss.log"; SAVE="${MIB3_DLV_RAM:-/dev/shm}/deliver_nav.json"; LOCK="${MIB3_DLV_RAM:-/dev/shm}/deliver.lock"; OPID="${MIB3_DLV_RAM:-/dev/shm}/oracle.pid"
 fi
+# the oracle's own liveness record (size + timestamp of the previous invocation);
+# see oracle_ensure.  Kept next to the pid so a rotation/restart resets both.
+OSTATE="$OPID.state"
 
 bc() { printf '[%s] %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$*" >> "$BCF" 2>/dev/null; sync 2>/dev/null; \
        printf '[bc] %s\n' "$*"; }
 say() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
+# ---------------------------------------------------------------------------
+# TIME, and the SUB-SECOND WAIT (2026-10-20, LANE_SWITCH_EVENTS).
+#
+# Every gate below used to poll once a second, so a decision MS-S had already
+# taken was noticed up to 1000 ms late.  MS-S samples at ~1 Hz, but its *log*
+# is a stream: the line is there the instant the decision is.  So the waits now
+# poll at OPOLL (100 ms) and return the moment the line appears, and each one
+# reports how long it actually took -- the numbers land in the log instead of
+# being guessed from a stopwatch.  (`MIB3_DLV_OPOLL=1` restores the old cadence.)
+#
+# *** BASE 10, ALWAYS (2026-10-21, PLAN_SWITCH_LATENCY V3). ***
+# /proc/uptime prints e.g. `2289.08`.  The fraction was truncated to two digits
+# and added to the seconds with $(( )) -- and `08` / `09` are NOT valid octal, so
+# the whole arithmetic aborts ("value too great for base") and now_ms returned
+# the EMPTY STRING.  That is ~20 % of seconds, and it is not cosmetic: every
+# elapsed-time subtraction then reads `$(( now - "" ))` -> 0 or a crash, and the
+# field log carries 10 empty timings.  `10#` is a bashism that busybox ash does
+# not implement, so the portable cure is to STRIP the leading zeros -- the value
+# is then a plain decimal literal in every shell (ash, dash, bash).  Three strips
+# are enough because the fraction is truncated to three digits first.
+# MIB3_DLV_UPTIME exists so the desk bench can assert the 08/09 cases.
+now_ms() {
+  _uf="${MIB3_DLV_UPTIME:-/proc/uptime}"
+  if [ -r "$_uf" ]; then
+    _u="$(cut -d' ' -f1 "$_uf" 2>/dev/null)"
+    _s="${_u%%.*}"; case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
+    case "$_u" in *.*) _f="${_u#*.}" ;; *) _f="" ;; esac
+    _f="${_f}000"; _f="${_f%"${_f#???}"}"      # exactly the first three digits
+    _f="${_f#0}"; _f="${_f#0}"; _f="${_f#0}"   # 08/09 -> 8/9, 000 -> empty
+    printf '%s' "$(( _s * 1000 + ${_f:-0} ))"
+    return 0
+  fi
+  _n="$(date +%s%N 2>/dev/null)"
+  case "$_n" in
+    ''|*[!0-9]*) printf '%s' "$(( $(date +%s) * 1000 ))" ;;
+    *) if [ ${#_n} -ge 13 ]; then printf '%s' "$(( _n / 1000000 ))"; else printf '%s' "$(( _n * 1000 ))"; fi ;;
+  esac
+}
+# nap <seconds>, fractional when the platform's sleep supports it (the unit's is
+# busybox; the probe costs at most a second, once, and its verdict is printed).
+NAP_F=""
+nap_probe() {
+  [ -n "$NAP_F" ] && return 0
+  # 4 x 0.25 s = 1.0 s nominal.  Judge it in MILLISECONDS (now_ms is exact on the
+  # unit via /proc/uptime, and on the desk via date +%s%N): comparing whole seconds
+  # made the verdict a coin flip (a 0.5 s probe only crosses a second boundary half
+  # the time), and a wrong verdict costs exactly the one second this exists to save.
+  _a="$(now_ms)"; _i=0
+  while [ "$_i" -lt 4 ]; do sleep 0.25 2>/dev/null; _i=$((_i+1)); done
+  _b="$(now_ms)"
+  if [ $(( _b - _a )) -ge 900 ]; then NAP_F=f; else NAP_F=i; fi
+  say "wait cadence: sleep is $([ "$NAP_F" = f ] && echo 'fractional (poll 100 ms)' || echo 'INTEGER-ONLY (poll 1 s)')"
+  return 0
+}
+nap() {
+  _sec="${1:-0}"
+  nap_probe
+  if [ "$NAP_F" = "f" ]; then sleep "$_sec" 2>/dev/null; return 0; fi
+  case "$_sec" in
+    ''|0|0.0*) sleep 1 ;;
+    0.*)       # busybox `sleep` is INTEGER-ONLY on this unit, so `nap 0.1` used to
+               # burn a full second -- every gate poll, every retry, the fps join.
+               # busybox HAS a usleep applet and it is accurate (measured 110 ms
+               # for 100 ms).  This is the difference between a 1 s poll and a
+               # 100 ms poll on every MS-S gate.
+               _us="$(awk -v s="$_sec" 'BEGIN{printf "%d", s*1000000}' 2>/dev/null)"
+               if [ -n "$_us" ]; then busybox usleep "$_us" 2>/dev/null || sleep 1
+               else sleep 1; fi ;;
+    *)         sleep "$_sec" ;;
+  esac
+}
+OPOLL="${MIB3_DLV_OPOLL:-0.1}"        # oracle poll interval (s)
+# wait until the wall clock is in a NEW second: the streamParameters resync verb
+# is timestamp-latched at 1 s resolution, so a flip inside one second can be a
+# silent no-op (session 6 hit exactly that).  Waiting for the second to turn is
+# what makes the 0->1 transition a real one -- and it costs at most 1 s.
+nap_next_second() {
+  _s="$(date +%s)"
+  _i=0
+  while [ "$(date +%s)" = "$_s" ] && [ "$_i" -lt 40 ]; do nap 0.05; _i=$((_i+1)); done
+}
+# per-step timing.  Each step measures from the END of the previous one (tmark),
+# so the printed parts ADD UP to the total -- chasing a stopwatch across three
+# shared variables got this wrong once already, and a breakdown that does not sum
+# is worse than no breakdown.
+TIMING=""; T_MARK=0; T_SUM=0; T_LAST=0
+tmark() { T_MARK="$(now_ms)"; }
+tstep() {
+  _now2="$(now_ms)"
+  _d=$(( _now2 - ${T_MARK:-_now2} )); [ "$_d" -lt 0 ] && _d=0
+  TIMING="$TIMING $1=${_d}ms"; T_SUM=$(( T_SUM + _d )); T_LAST="$_d"
+  say "  timing: $1=${_d}ms"
+  T_MARK="$_now2"
+}
+
+# ---------------------------------------------------------------------------
+# PHASE 0 SUB-TIMERS (2026-10-21) -- PASSIVE: they only add log fields.
+#
+# WHY: `tstep mutations` reported ~3 s in the field for a DELETE and a POST that
+# each cost 20-30 ms (HANDOFF_2026-10-21 S4).  That span was never just two
+# curls.  It also carried a `wc -c` over a file that reaches hundreds of MB
+# (oracle_mark), TWO breadcrumbs that each do a `sync` (a sync behind the
+# decoder's dirty pages can stall), three list GETs at its head and, in `back`, a
+# 2 MB `tail | grep`.  Guessing which of those is the 3 s is exactly what
+# Phase 4 must not do, so each one is timed on its own and the printed parts SUM
+# to the step:
+#     del get post sync mark grep lists   (+ other = precisely the remainder)
+# Nothing here reads a value, changes an order, a budget or a wire call: every
+# timer is a pair of now_ms() calls around a call that was already there.
+# `other` is COMPUTED (step - parts), never estimated, so the sum stays exact
+# even when a future edit adds an untimed statement -- a breakdown that does not
+# add up is worse than none, and a previous version of this line exceeded its own
+# total without anyone noticing.
+# COST: two now_ms() per timed call.  now_ms is a fork on the unit (~1-3 ms at
+# load 50), so this adds a few tens of ms to a 12 s switch.  That is stated here
+# because it is the one way Phase 0 is not free.
+# ---------------------------------------------------------------------------
+SUBL=0; SUBM=0; SUBS=0; SUBD=0; SUBG=0; SUBP=0; SUBR=0; SUB_T0=0
+sub_reset() { SUBL=0; SUBM=0; SUBS=0; SUBD=0; SUBG=0; SUBP=0; SUBR=0; SUB_T0=0; }
+sub0() { SUB_T0="$(now_ms)"; }
+sub_add() {   # sub_add <lists|mark|sync|del|get|post|grep>
+  _sd=$(( $(now_ms) - ${SUB_T0:-0} )); [ "$_sd" -lt 0 ] && _sd=0
+  case "$1" in
+    lists) SUBL=$(( SUBL + _sd )) ;;
+    mark)  SUBM=$(( SUBM + _sd )) ;;
+    sync)  SUBS=$(( SUBS + _sd )) ;;
+    del)   SUBD=$(( SUBD + _sd )) ;;
+    get)   SUBG=$(( SUBG + _sd )) ;;
+    post)  SUBP=$(( SUBP + _sd )) ;;
+    grep)  SUBR=$(( SUBR + _sd )) ;;
+  esac
+}
+sub_str() {   # sub_str <step-total-ms> -> " mut_del=..ms ... mut_other=..ms"
+  _st=$(( SUBL + SUBM + SUBS + SUBD + SUBG + SUBP + SUBR ))
+  _so=$(( ${1:-0} - _st )); [ "$_so" -lt 0 ] && _so=0
+  printf ' mut_del=%sms mut_get=%sms mut_post=%sms mut_sync=%sms mut_mark=%sms mut_grep=%sms mut_lists=%sms mut_other=%sms' \
+         "$SUBD" "$SUBG" "$SUBP" "$SUBS" "$SUBM" "$SUBR" "$SUBL" "$_so"
+}
+# tline <stage> <total-ms> [suffix] -- ONE printer for the breakdown, so every
+# exit path prints the same field set (and a field session greps ONE shape):
+#   stage=.. total=.. sum=.. <steps..> mut_*=.. flush=.. reqs=METHOD:ms/rc,..
+MUTSUB=""; EXTRA=""
+tline() {
+  _r="${REQ%,}"
+  say "HANDOVER TIMING stage=$1 total=$2ms sum=${T_SUM}ms$TIMING$MUTSUB$EXTRA${_r:+ reqs=$_r}${3:-}"
+}
+# the same per-request record for the verbs that print no breakdown
+rsi_report() { [ -n "${REQ:-}" ] && say "  rsi: ${REQ%,}"; return 0; }
+
+
 # --- lockfile (busybox has no flock; mkdir is atomic) --------------------------
 acquire() {
   if mkdir "$LOCK" 2>/dev/null; then echo "$$" > "$LOCK/pid"; trap 'release' EXIT INT TERM; return 0; fi
   _p="$(cat "$LOCK/pid" 2>/dev/null)"
+  # A pid is NOT proof of a live deliver_ctl: pids are recycled, so a dead
+  # holder's number can belong to an unrelated process and the lock then looks
+  # held FOREVER (measured 2026-10-20: pid 12008, absent from `ps`, blocked every
+  # switch and froze the cluster on the previous surface).  Check the cmdline too.
+  # A ZOMBIE answers kill -0 with an EMPTY cmdline (2026-10-26): that is a dead
+  # holder as well, not a refusal reason.  NO /proc (the desk bench): kill -0
+  # is all there is -- a live pid is treated as held (the old behaviour).
   if [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null; then
-    say "ABORT: another deliver_ctl is running (pid $_p). Refusing to double-apply."
-    return 1
+    if [ -r "/proc/$_p/cmdline" ]; then
+      _cmd="$(tr "\0" " " < /proc/$_p/cmdline 2>/dev/null)"
+      case "$_cmd" in
+        *deliver_ctl*)
+          say "ABORT: another deliver_ctl is running (pid $_p, cmd: $(printf '%s' "$_cmd" | cut -c1-100)). Refusing to double-apply."
+          return 1 ;;
+        "")
+          say "stale lock: pid $_p is a zombie (alive to kill -0, cmdline empty) -- reclaiming" ;;
+        *)
+          say "stale lock: pid $_p is alive but is NOT a deliver_ctl -- reclaiming" ;;
+      esac
+    else
+      say "ABORT: another deliver_ctl is running (pid $_p; /proc unreadable -- kill -0 only). Refusing to double-apply."
+      return 1
+    fi
   fi
   say "stale lock (pid '${_p:-?}' gone) -- reclaiming"
   rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null && { echo "$$" > "$LOCK/pid"; trap 'release' EXIT INT TERM; return 0; }
@@ -83,12 +256,36 @@ acquire() {
 }
 release() { [ -n "${LOCK:-}" ] && [ -f "$LOCK/pid" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK" 2>/dev/null; }
 
+# --- oracle lookups are bounded ------------------------------------------------
+# The oracle log grows ~8 MB/min and is never rotated, so a FULL grep costs
+# seconds: `deliver_ctl.sh status` measured 17.3 s, and ~3.9 s of the switch's
+# wall time was one such grep inside do_verify (reported total 4040 ms vs the
+# controller's 7969 ms).  Every one of these lookups only wants RECENT history.
+# MIB3_DLV_ORACLE_TAIL bytes (default 2 MB) is minutes of it.
+otail() { tail -c "${MIB3_DLV_ORACLE_TAIL:-2000000}" "$MSSLOG" 2>/dev/null; }
+ogrep() { otail | grep -aq "$1" 2>/dev/null; }
+
 # --- tiny RSI helpers ----------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 pids_of() { if have pidof; then pidof "$1" 2>/dev/null; elif have pgrep; then pgrep -x "$1" 2>/dev/null; fi; }
+# h <method> <url> [body] -- ONE RSI request.
+# It used to discard the two things the switch's 3 s actually needed: how long
+# the request took, and whether it SUCCEEDED.  Every request carries
+# `--max-time 8`, so an expiry (curl rc 28) was indistinguishable from a success
+# -- and hypothesis H3 ("the 11 s run was one curl expiry") is unanswerable
+# without the status.  So the cost and the rc are recorded and reported as
+# `reqs=` on the HANDOVER TIMING line.  NOTHING ELSE CHANGES: same timeout, same
+# single attempt, no retries, the body still goes to stdout (every caller
+# discards or reads it) and the function still returns curl's own status.
+H_RC=0; H_MS=0; REQ=""
 h() { _hm="$1"; _hu="$2"; _hb="${3:-}"
+  _h0="$(now_ms)"
   if [ -n "$_hb" ]; then curl -sS --max-time 8 -X "$_hm" -H 'Content-Type: application/json' --data "$_hb" "$_hu"
-  else curl -sS --max-time 8 -X "$_hm" "$_hu"; fi; }
+  else curl -sS --max-time 8 -X "$_hm" "$_hu"; fi
+  H_RC=$?
+  H_MS=$(( $(now_ms) - _h0 )); [ "$H_MS" -lt 0 ] && H_MS=0
+  REQ="$REQ$_hm:${H_MS}ms/rc${H_RC},"
+  return $H_RC; }
 de() { tr -d '\\'; }
 line_of() { printf '%s' "$1" | sed 's/},{/}\
 {/g' | grep "\"name\":\"$2\"" | head -n1; }
@@ -104,34 +301,121 @@ valid_uri() { case "$1" in /displaymanagement/renderingSurfaces/*|/displaymanage
 # earlier via `oracle start` / start_mss_log.sh. It is IDEMPOTENT and APPEND-only:
 # pre-starting it is safe, and `apply` no longer truncates it (a pre-started capture
 # used to be wiped by apply -- fixed 2026-10-16).
+#
+# *** HYGIENE (2026-10-21, PLAN_SWITCH_LATENCY V11 / Phase 1c) ***
+# The capture is ONE `curl -sN --max-time 3600` writing to tmpfs at ~8 MB/min, and
+# it is the eyes of every gate.  It used to be trusted on two things that are not
+# proof: "the file is non-empty" and "the pid is alive".  Both fail silently:
+#   * curl dies (MS-S restart, socket reset, the 3600 s cap, the unit's own OOM)
+#     -> the file stays non-empty, every later gate waits out its whole budget and
+#     reports a switch failure that never happened;
+#   * the pid is RECYCLED -> `oracle_off` kills an innocent process while the real
+#     capture keeps growing the file (the delivery lock learned this exact lesson:
+#     a pid in a file is not proof of the process you think it is).
+# So: the pid must match OUR curl's cmdline; liveness is GROWTH (measured against
+# the size/time recorded by the previous invocation, so the check costs nothing on
+# the hot path); and the file rotates at a size cap so an all-day drive cannot fill
+# tmpfs.  Rotation is a single atomic rename and it happens only in oracle_on,
+# BEFORE any gate mark is taken -- see the note in oracle_rotate.
+ORACLE_KEEP="${MIB3_DLV_ORACLE_KEEP:-4194304}"     # bytes kept when rotating (minutes of log)
+ORACLE_MAX="${MIB3_DLV_ORACLE_MAX:-67108864}"      # rotate above this (64 MB ~ 8 min at 8 MB/min)
+ORACLE_STALE_MS="${MIB3_DLV_ORACLE_STALE_MS:-8000}" # no growth for this long = dead capture
+
+cmdline_of() {   # /proc on the unit, ps on the desk (macOS has no /proc)
+  if [ -r "/proc/$1/cmdline" ]; then tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null
+  else ps -o command= -p "$1" 2>/dev/null; fi
+}
 oracle_pid() {
   [ -f "$OPID" ] || return 1
   _p="$(cat "$OPID" 2>/dev/null)"
-  [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null && { printf '%s' "$_p"; return 0; }
+  case "$_p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$_p" 2>/dev/null || return 1
+  # alive is not enough -- it must be OUR curl, on OUR log port
+  case "$(cmdline_of "$_p")" in
+    *curl*"$RSI:$LOGPORT"*) printf '%s' "$_p"; return 0 ;;
+  esac
   return 1
 }
-oracle_on() {
-  P="$(oracle_pid)"
-  if [ -n "$P" ]; then say "oracle already live (pid $P) -> $MSSLOG"; return 0; fi
+# rotate at the cap.  ATOMIC: the kept tail is written to a sibling and renamed
+# over the log, so a reader (oracle_since / otail) sees either the old file or the
+# new one, never a half-written one.  It runs ONLY from oracle_on, i.e. before the
+# invocation has taken a byte mark -- and only one deliver_ctl runs at a time (the
+# lock), so no gate can be mid-flight.  A mark taken BEFORE a rotation is larger
+# than the new size, and oracle_since already treats that as "rotated/re-created:
+# start over" (it reads from 0), which is exactly right: the retained tail is new
+# history, not a stale hit.
+oracle_rotate() {
+  _sz="$(oracle_mark)"
+  [ "${_sz:-0}" -ge "$ORACLE_MAX" ] || return 0
+  say "oracle: ${_sz} B is over the cap -- rotating (keep the last ${ORACLE_KEEP} B)"
+  tail -c "$ORACLE_KEEP" "$MSSLOG" > "$MSSLOG.rot" 2>/dev/null || { rm -f "$MSSLOG.rot"; return 0; }
+  mv -f "$MSSLOG.rot" "$MSSLOG" 2>/dev/null || { rm -f "$MSSLOG.rot"; return 0; }
+  say "oracle: rotated, now $(oracle_mark) B"
+  return 0
+}
+oracle_start() {
   mkdir -p "$(dirname "$MSSLOG")" 2>/dev/null
+  _s0="$(oracle_mark)"
   # curl writes the file itself, so $! is the curl pid (killable) and the harness'
   # pkill pattern ("curl -sN --max-time 3600 http://127.0.0.1:$LOGPORT") still matches.
   nohup curl -sN --max-time 3600 "http://$RSI:$LOGPORT/" >> "$MSSLOG" 2>/dev/null &
   echo $! > "$OPID" 2>/dev/null
-  sleep 2
-  if [ -s "$MSSLOG" ]; then say "oracle live (pid $(cat "$OPID" 2>/dev/null)) -> $MSSLOG"
+  # readiness is an EVENT (a line ARRIVING), not a fixed 2 s sleep -- and it is
+  # growth, not size: after a rotation the file is non-empty before curl starts.
+  _i=0
+  while [ "$_i" -lt 20 ]; do
+    [ "$(oracle_mark)" -gt "${_s0:-0}" ] && break
+    nap 0.1; _i=$((_i+1))
+  done
+  if [ "$(oracle_mark)" -gt "${_s0:-0}" ]; then say "oracle live (pid $(cat "$OPID" 2>/dev/null)) -> $MSSLOG"
   else say "WARN: oracle produced nothing yet (port $LOGPORT closed?)"; fi
+  return 0
+}
+oracle_on() {
+  P="$(oracle_pid)"
+  if [ -n "$P" ]; then say "oracle already live (pid $P) -> $MSSLOG"; return 0; fi
+  oracle_rotate
+  oracle_start
+  return 0
+}
+# oracle_ensure -- the start-of-run check: restart a capture that is dead, and
+# detect a capture that is alive but NOT DELIVERING (growth, not size).
+oracle_ensure() {
+  if ! P="$(oracle_pid)"; then
+    _old="$(cat "$OPID" 2>/dev/null)"
+    [ -n "${_old:-}" ] && say "oracle: pid '$_old' is gone or is not our curl -- starting a fresh capture"
+    rm -f "$OPID" 2>/dev/null
+    oracle_rotate
+    oracle_start
+    return 0
+  fi
+  _sz="$(oracle_mark)"
+  _psz=""; _pt=""
+  if [ -f "$OSTATE" ]; then
+    read -r _psz _pt < "$OSTATE" 2>/dev/null || { _psz=""; _pt=""; }
+  fi
+  case "$_psz" in ''|*[!0-9]*) _psz="" ;; esac
+  case "$_pt"  in ''|*[!0-9]*) _pt="" ;; esac
+  if [ -n "$_psz" ] && [ -n "$_pt" ] && [ "$_sz" = "$_psz" ] \
+     && [ $(( $(now_ms) - _pt )) -ge "$ORACLE_STALE_MS" ]; then
+    say "oracle: capture pid $P has NOT grown in $(( $(now_ms) - _pt ))ms -- restarting it"
+    oracle_off
+    oracle_rotate
+    oracle_start
+    return 0
+  fi
+  printf '%s %s\n' "$_sz" "$(now_ms)" > "$OSTATE" 2>/dev/null
   return 0
 }
 oracle_off() {
   P="$(oracle_pid)"
   if [ -n "$P" ]; then kill "$P" 2>/dev/null && say "oracle stopped (pid $P)"; else say "oracle not running"; fi
-  rm -f "$OPID" 2>/dev/null
+  rm -f "$OPID" "$OSTATE" 2>/dev/null
   return 0
 }
 oracle_tail() {
   echo "--- MS-S log (share/stream decisions) ---"
-  grep -aiE "STREAMING|RESYNC|startShare|stopShare|configure|input_caps|surface_state|surfaceId|does not exist|framerate" "$MSSLOG" 2>/dev/null \
+  otail | grep -aiE "STREAMING|RESYNC|startShare|stopShare|configure|input_caps|surface_state|surfaceId|does not exist|framerate" 2>/dev/null \
     | sed 's/^.*\]//' | grep -avE "avg time" | tail -n 24
   echo "--- (end) ---"
 }
@@ -250,7 +534,7 @@ do_verify() {
   _ok=1
   R="$(uris)"; GOT="$(id_of "$R" $OURNAME)"; [ "$GOT" = "$OURID" ] || { say "VERIFY FAIL: our element id='$GOT' (want $OURID)"; _ok=0; }
   [ -n "$(pids_of multi-screen-server)" ] || { say "VERIFY FAIL: multi-screen-server not running"; _ok=0; }
-  grep -aq "startShare \[id = $OURID\]" "$MSSLOG" 2>/dev/null && say "VERIFY OK: MS-S did startShare [id = $OURID]" || say "VERIFY ?: no 'startShare [id = $OURID]' in the oracle yet"
+  ogrep "startShare \[id = $OURID\]" && say "VERIFY OK: MS-S did startShare [id = $OURID]" || say "VERIFY ?: no 'startShare [id = $OURID]' in the oracle yet"
   _f="$(msf_fds)"; [ "${_f:-0}" -ge 10 ] && say "VERIFY OK: MS-S fds=$_f (streaming)" || say "VERIFY ?: MS-S fds=$_f (6=parked, 11=streaming)"
   [ "$_ok" = "1" ] && say "verify: PASS (element owned)" || say "verify: FAIL"
   [ "$_ok" = "1" ]
@@ -276,22 +560,39 @@ do_verify() {
 # ============================================================================
 
 oracle_lines() { if [ -f "$MSSLOG" ]; then wc -l < "$MSSLOG" 2>/dev/null | tr -d ' '; else echo 0; fi; }
-# wait_oracle <ERE> <secs> [from_line]  -> 0 if a NEW line (after from_line) matched
-wait_oracle() {
-  _re="$1"; _n="${2:-20}"; _from="${3:-0}"; _i=0
-  while [ "$_i" -lt "$_n" ]; do
-    if [ -f "$MSSLOG" ]; then
-      sed -n "$((_from + 1)),\$p" "$MSSLOG" 2>/dev/null | grep -aqE "$_re" && return 0
-    fi
-    _i=$((_i + 1)); sleep 1
-  done
-  return 1
+# A MARK is a BYTE OFFSET, not a line number.  The oracle grows at ~8 MB/min on the
+# unit, so "sed -n 'N,$p'" (the old gate) read the whole file on every pass -- fine at
+# 1 Hz, unusable at 10 Hz.  tail -c from the mark reads only what is new.
+oracle_mark() { if [ -f "$MSSLOG" ]; then wc -c < "$MSSLOG" 2>/dev/null | tr -d ' '; else echo 0; fi; }
+oracle_since() {  # oracle_since <byte-offset>
+  _off="${1:-0}"
+  _sz="$(oracle_mark)"
+  [ "${_sz:-0}" -lt "${_off:-0}" ] && _off=0     # rotated/re-created: start over
+  tail -c "+$(( _off + 1 ))" "$MSSLOG" 2>/dev/null
 }
-oracle_since() { sed -n "$1,\$p" "$MSSLOG" 2>/dev/null; }
+# wait_oracle_ms <ERE> <budget-ms> [byte-mark]  -> 0 if a NEW line matched.
+# Sub-second polling, millisecond budget, and it reports how long the gate took.
+wait_oracle_ms() {
+  wo_re="$1"; wo_budget="${2:-20000}"; wo_from="${3:-0}"
+  wo_t0="$(now_ms)"
+  while :; do
+    if [ -f "$MSSLOG" ]; then
+      if oracle_since "$wo_from" | grep -aqE "$wo_re"; then
+        LAST_WAIT=$(( $(now_ms) - wo_t0 )); return 0
+      fi
+    fi
+    if [ $(( $(now_ms) - wo_t0 )) -ge "$wo_budget" ]; then
+      LAST_WAIT=$(( $(now_ms) - wo_t0 )); return 1
+    fi
+    nap "$OPOLL"
+  done
+}
+wait_oracle() { wait_oracle_ms "$1" "$(( ${2:-20} * 1000 ))" "${3:-0}"; }
+
 # the last surface id MS-S built an encoder for = what the cluster is (or is not)
 # actually showing.  Empty when the oracle has said nothing yet.
 oracle_last_share() {
-  grep -ao "share_surface_id = [0-9]*" "$MSSLOG" 2>/dev/null | tail -n 1 | sed 's/.*= *//'
+  otail | grep -ao "share_surface_id = [0-9]*" 2>/dev/null | tail -n 1 | sed 's/.*= *//'
 }
 oracle_live() { [ -s "$MSSLOG" ] 2>/dev/null; }
 
@@ -308,19 +609,21 @@ handover_check() {
 
 handover_park() {
   R="$(uris)"; NAVU="$(uri_of "$R" $NAVNAME)"
-  _mk="$(oracle_lines)"
-  if [ -n "$NAVU" ]; then
-    bc "handover:park $NAVU"; h DELETE "http://$RSI:$DMP$NAVU" >/dev/null; echo
-  else
+  _mk="$(oracle_mark)"
+  if [ -z "$NAVU" ]; then
     say "nav element already absent (parked)"
+    say "HANDOVER PARK: nav was already absent; no stop expected"
+    return 0
   fi
+  bc "handover:park $NAVU"; h DELETE "http://$RSI:$DMP$NAVU" >/dev/null; echo
   if [ "${NOOR:-0}" = "1" ]; then
     sleep 3; say "HANDOVER PARK: DEGRADED (no oracle) -- slept 3s instead of waiting for STOP STREAMING"
     return 0
   fi
   # WAIT for MS-S to say it stopped -- this is the (ip,port) being freed
-  if wait_oracle "STOP STREAMING|stopShare \[" 20 "$_mk"; then
-    say "HANDOVER PARK OK: MS-S logged STOP STREAMING (nav TransportStream destroyed)"
+  _park_t="${MIB3_DLV_PARK_T:-8}"
+  if wait_oracle "STOP STREAMING|stopShare \[" "$_park_t" "$_mk"; then
+    say "HANDOVER PARK OK: MS-S logged STOP STREAMING (nav TransportStream destroyed) after ${LAST_WAIT}ms"
     return 0
   fi
   # if the nav was already gone before we started, there is nothing to stop
@@ -328,7 +631,7 @@ handover_park() {
     say "HANDOVER PARK: nav was already absent; no stop expected"
     return 0
   fi
-  say "HANDOVER PARK WARN: no STOP STREAMING within 20s -- MS-S may not have observed the park"
+  say "HANDOVER PARK WARN: no STOP STREAMING within ${_park_t}s -- MS-S may not have observed the park"
   say "  (this is exactly the state that makes our start fail silently with"
   say "   'Failed to create transportStream'; do NOT attach yet)"
   return 1
@@ -339,11 +642,11 @@ handover_attach() {
   DISP="$(uri_of "$D" navi-kombi-display)"; SP="$(uri_of "$S" $SPNAME)"
   valid_uri "$DISP" || { say "HANDOVER NO-GO: bad display uri '$DISP'"; return 1; }
   valid_uri "$SP"   || { say "HANDOVER NO-GO: bad sp uri '$SP'"; return 1; }
-  _mk="$(oracle_lines)"           # marked BEFORE any POST (h() clobbers _m, not _mk)
+  _mk="$(oracle_mark)"           # marked BEFORE any POST (h() clobbers _m, not _mk)
   EXIST="$(id_of "$R" $OURNAME)"
   if [ "$EXIST" = "$OURID" ]; then
     say "our element already registered (internalIdentifier=$OURID)"
-    if grep -aq "startShare \[id = $OURID\]" "$MSSLOG" 2>/dev/null; then
+    if ogrep "startShare \[id = $OURID\]"; then
       say "HANDOVER ATTACH OK: already shared (startShare [id = $OURID] in the oracle)"
       return 0
     fi
@@ -354,8 +657,14 @@ handover_attach() {
   bc "handover:attach"
   h POST "http://$RSI:$DMP/displaymanagement/renderingSurfaces" \
     "{\"name\":\"$OURNAME\",\"display\":\"$DISP\",\"streamParameters\":\"$SP\",\"topLeftX\":0,\"topLeftY\":0,\"width\":1280,\"height\":480}" >/dev/null; echo
-  sleep 1
-  GOT="$(id_of "$(uris)" "$OURNAME")"
+  # wait for the ELEMENT to appear (an event), not a blind `sleep 1`: the id is
+  # assigned by the server at create, so the read-back is the only honest gate.
+  _i=0
+  while [ "$_i" -lt 30 ]; do
+    GOT="$(id_of "$(uris)" "$OURNAME")"
+    [ "$GOT" = "$OURID" ] && break
+    nap 0.1; _i=$((_i+1))
+  done
   [ "$GOT" = "$OURID" ] || { say "HANDOVER NO-GO: element id='$GOT' (want $OURID)"; oracle_tail; return 1; }
   if [ "${NOOR:-0}" = "1" ]; then
     sleep 2; say "HANDOVER ATTACH: DEGRADED (no oracle) -- element created; cannot verify startShare"
@@ -379,33 +688,259 @@ handover_attach() {
 handover_arm() {
   S="$(sps)"; SP="$(uri_of "$S" $SPNAME)"
   valid_uri "$SP" || { say "HANDOVER NO-GO: bad sp uri '$SP'"; return 1; }
-  _mk="$(oracle_lines)"
+  _mk="$(oracle_mark)"
+  tmark
   bc "handover:arm (resync 0->1)"
   # resync is TIMESTAMP-GATED in updateStreamParametersElement @0x131a30: it fires only
   # on resync==true AND a changed timestamp.  Re-POSTing true after it was latched true
-  # is a NO-OP (session 6 hit exactly this), so drive a real 0 -> 1 transition.
+  # is a NO-OP (session 6 hit exactly this), so drive a real 0 -> 1 transition.  The
+  # timestamp resolves to ONE SECOND, so the `true` must land in a later second than the
+  # `false` -- waiting for the second to turn is what makes it a real transition (and it
+  # costs at most 1 s, instead of a flat `sleep 1` that is only *usually* enough).
   if [ "${MIB3_DLV_RESYNC_FLIP:-1}" = "1" ]; then
     h POST "http://$RSI:$DMP$SP" '{"resync":false}' >/dev/null 2>&1; echo
-    sleep 1
+    nap_next_second
   fi
   h POST "http://$RSI:$DMP$SP" '{"resync":true}' >/dev/null; echo
   if [ "${NOOR:-0}" = "1" ]; then
     sleep 4; say "HANDOVER ARM: DEGRADED (no oracle) -- resync sent; cannot verify share_surface_id"
     return 0
   fi
-  _i=0
-  while [ "$_i" -lt 15 ]; do
-    wait_oracle "share_surface_id = $OURID" 1 "$_mk" \
-      && { say "HANDOVER ARM OK: encoder built for $OURID (share_surface_id = $OURID)"; return 0; }
-    wait_oracle "Specified surface \(ID:$OURID\) does not exist" 1 "$_mk" \
-      && { say "HANDOVER ARM FAIL: Weston says ivi $OURID does not exist -- the presenter is not committing"; return 1; }
-    _i=$((_i + 1))
+  # ONE budget for the whole gate (it used to be 15 x (1 s + 1 s) = up to 30 s), and
+  # both lines are looked for on every pass instead of alternating.
+  _deadline=$(( $(now_ms) + ${MIB3_DLV_ARM_T:-8} * 1000 ))
+  while :; do
+    if wait_oracle_ms "share_surface_id = $OURID" 200 "$_mk"; then
+      tstep arm
+      say "HANDOVER ARM OK: encoder built for $OURID (share_surface_id = $OURID) after ${LAST_WAIT}ms"
+      return 0
+    fi
+    if wait_oracle_ms "Specified surface \(ID:$OURID\) does not exist" 200 "$_mk"; then
+      say "HANDOVER ARM FAIL: Weston says ivi $OURID does not exist -- the presenter is not committing"
+      return 1
+    fi
+    [ "$(now_ms)" -ge "$_deadline" ] && break
   done
-  say "HANDOVER ARM FAIL: no 'share_surface_id = $OURID' within 30s"; oracle_tail; return 1
+  say "HANDOVER ARM FAIL: no 'share_surface_id = $OURID' within ${MIB3_DLV_ARM_T:-8}s"; oracle_tail; return 1
 }
 
 # ----------------------------------------------------------------------------
-# handover back [secs] -- the REVERSE switch: hand the cluster back to the car's
+# handover switch [fps] -- THE UP DIRECTION, event driven (2026-10-20).
+#
+# WHY IT EXISTS: the field measured 65 s and 71 s from the phone's cluster stream
+# starting to our map appearing.  The old flow was park -> attach -> arm as three
+# separate LOCKED invocations, each with its own gate, so MS-S needed three of its
+# ~1 Hz samples; worse, `park` waited up to 20 s for `STOP STREAMING` before it
+# would even try to attach, and a failure left the nav element deleted (no stream
+# at all).  Three facts make one pass enough:
+#
+#   * MS-S applies a DIFF of the element list, REMOVALS FIRST.  A nav delete and
+#     our create that land in the same sample window are therefore applied in one
+#     pass: stopShare(nav) frees (ip,port) and startShare(3000) takes it.  So the
+#     two mutations are issued back-to-back and the two waits collapse into one.
+#   * MS-S's own words identify each failure the moment it happens, so a gate can
+#     end early instead of sitting out a timeout: `Failed to create
+#     transportStream` (the (ip,port) dedup = the re-created-nav trap) and
+#     `startShareInternal status = N` (holder wedged) both mean "resync", and
+#     `Specified surface (ID:3000) does not exist` means "the presenter is not
+#     committing" (hopeless, stop now).
+#   * a resync is the only thing that clears either wedge -- so it is the rescue,
+#     run at most ONCE, and its result is gated the same way.
+#
+# ON TOTAL FAILURE IT ROLLS BACK: the nav element is re-created and a resync is
+# issued, so the car's map is streaming again and the controller's "the nav is
+# still up; nothing of ours is on screen" is TRUE rather than assumed.
+#
+# ORDER THAT REMAINS LOAD-BEARING (learned on the car 2026-10-20): the framerate
+# is written AFTER the element churn (which resets the field) and BEFORE the
+# resync/arm (which is when MS-S builds the stream), never on a live stream --
+# that makes MS-S treat the share as a new stream identity and the ECU ends up
+# with two encoders interleaved.  The write runs in the BACKGROUND during the
+# gate wait here, and is joined before the resync, so the order is unchanged and
+# most of its cost is hidden.
+# ----------------------------------------------------------------------------
+switch_gate() {   # switch_gate <byte-mark> <budget-ms> -> 0 ok | 1 wedge | 2 absent | 3 timeout
+  sg_mark="$1"; sg_budget="$2"
+  sg_deadline=$(( $(now_ms) + sg_budget ))
+  while :; do
+    wait_oracle_ms "share_surface_id = $OURID" 120 "$sg_mark" && { GATE_WAIT="$LAST_WAIT"; return 0; }
+    wait_oracle_ms "Failed to create transportStream" 60 "$sg_mark" && { GATE_WAIT="$LAST_WAIT"; return 1; }
+    wait_oracle_ms "startShareInternal status = " 60 "$sg_mark"     && { GATE_WAIT="$LAST_WAIT"; return 1; }
+    wait_oracle_ms "Specified surface \(ID:$OURID\) does not exist" 60 "$sg_mark" && { GATE_WAIT="$LAST_WAIT"; return 2; }
+    [ "$(now_ms)" -ge "$sg_deadline" ] && { GATE_WAIT=$(( $(now_ms) - sg_deadline + sg_budget )); return 3; }
+  done
+}
+fps_helper() {
+  for f in "${MIB3_DLV_FPSH:-}" "$(dirname "$0")/stream_fps.sh" /tmp/kit/stream_fps.sh; do
+    [ -n "$f" ] && [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+handover_switch() {
+  _fps="${1:-}"
+  hs_all="$(now_ms)"; TIMING=""; T_SUM=0; tmark
+  MUTSUB=""; EXTRA=""; REQ=""; FLUSH=""
+  handover_check || { say "HANDOVER SWITCH: NO-GO (see above)"; return 1; }
+  tstep precheck
+  sub_reset
+  sub0; R="$(uris)"; D="$(disps)"; S="$(sps)"; sub_add lists
+  DISP="$(uri_of "$D" navi-kombi-display)"; SP="$(uri_of "$S" $SPNAME)"
+  NAVU="$(uri_of "$R" $NAVNAME)"
+  valid_uri "$DISP" || { say "HANDOVER SWITCH NO-GO: bad display uri '$DISP'"; return 1; }
+  valid_uri "$SP"   || { say "HANDOVER SWITCH NO-GO: bad sp uri '$SP'"; return 1; }
+  [ -n "$SP" ] || { say "HANDOVER SWITCH NO-GO: no streamParameters uri"; return 1; }
+  sub0; _mk="$(oracle_mark)"; sub_add mark
+
+  # ---- [1] the two list mutations, back to back: ONE MS-S sample window ------
+  if [ -n "$NAVU" ]; then
+    sub0; bc "switch:park $NAVU"; sub_add sync      # bc does a write+sync
+    sub0; h DELETE "http://$RSI:$DMP$NAVU" >/dev/null; sub_add del; echo
+  else
+    say "HANDOVER SWITCH: nav element already absent (parked)"
+  fi
+  # The element list is re-read HERE, deliberately: the park above has already
+  # been issued, so a cached list could take the other branch -- reusing the
+  # precheck's list would be a BEHAVIOUR change, and Phase 0 may not make one.
+  # Hoisting the GET into a variable keeps the request count identical (one) and
+  # makes it timeable.
+  sub0; _elu="$(uris)"; sub_add get
+  if [ "$OURID" != "$(id_of "$_elu" $OURNAME)" ]; then
+    sub0; bc "switch:attach"; sub_add sync
+    sub0; h POST "http://$RSI:$DMP/displaymanagement/renderingSurfaces" \
+      "{\"name\":\"$OURNAME\",\"display\":\"$DISP\",\"streamParameters\":\"$SP\",\"topLeftX\":0,\"topLeftY\":0,\"width\":1280,\"height\":480}" >/dev/null; sub_add post; echo
+  else
+    say "HANDOVER SWITCH: our element already registered (internalIdentifier=$OURID)"
+  fi
+  tstep mutations
+  MUTSUB="$(sub_str "$T_LAST")"
+  _t_last_mut="$T_MARK"     # the moment the last mutation returned (step end)
+
+  # ---- the optional framerate write: right place in the order, off the path --
+  _fpslog="$(dirname "$BCF")/switch_fps.log"   # /dev/shm on the unit, the state dir on the desk
+  _fpsbg=""
+  if [ -n "$_fps" ] && [ "$_fps" != "0" ]; then
+    # cheap read first: the element is usually already at the wanted value
+    # (bring_up.sh sets it once), and a write that changes nothing still costs a
+    # read-back verify -- i.e. ~1.3 s on the critical path, for nothing.
+    _cur="$(curl -sS --max-time 8 "http://$RSI:$DMP/displaymanagement/streamParameters" 2>/dev/null \
+            | sed -n 's/.*"framerate":\([0-9][0-9]*\).*/\1/p' | head -n1)"
+    if [ "$_cur" = "$_fps" ]; then
+      say "HANDOVER SWITCH: framerate already $_fps -- no write, no delay"
+    elif FPSH="$(fps_helper)"; then
+      ( sh "$FPSH" set "$_fps" ) > "$_fpslog" 2>&1 & _fpsbg=$!
+      say "HANDOVER SWITCH: framerate ${_cur:-?} -> $_fps being set (background, joined before the resync)"
+    else
+      say "HANDOVER SWITCH: stream_fps.sh not found -- framerate left at the shipped value"
+    fi
+  fi
+
+  # ---- [2] ONE gate, whichever of MS-S's answers comes first -----------------
+  _win=$(( ${MIB3_DLV_SWITCH_T:-6} * 1000 ))
+  switch_gate "$_mk" "$_win"; _g="$?"
+  tstep gate
+  # H5 (is the gate mostly log-stream flush?): the number that decides it is the
+  # gap between "the last mutation returned" and "MS-S's matching line appeared".
+  # Both are already known -- the first from the end of the mutations step, the
+  # second from the moment the gate returned -- so this costs one now_ms().
+  [ "$_g" = "0" ] && {
+    FLUSH=$(( $(now_ms) - _t_last_mut )); [ "$FLUSH" -lt 0 ] && FLUSH=0
+    EXTRA="$EXTRA flush=${FLUSH}ms"
+  }
+  case "$_g" in
+    0) say "HANDOVER SWITCH OK: encoder built for $OURID in ${GATE_WAIT}ms (single pass, no resync yet)" ;;
+    2) say "HANDOVER SWITCH FAIL: Weston says ivi $OURID does not exist -- the presenter is not committing"
+       hand_back_to_nav_rollback "$DISP" "$SP" || true; return 1 ;;
+    1) say "HANDOVER SWITCH: MS-S refused the share (dedup/holder) -> resync rescue" ;;
+    *) say "HANDOVER SWITCH: no share within ${MIB3_DLV_SWITCH_T:-6}s -> resync rescue" ;;
+  esac
+
+  # join the framerate write BEFORE the resync (the order is load-bearing)
+  if [ -n "$_fpsbg" ]; then
+    _i=0; while [ "$_i" -lt 80 ] && kill -0 "$_fpsbg" 2>/dev/null; do nap 0.1; _i=$((_i+1)); done
+    kill -9 "$_fpsbg" 2>/dev/null
+    if [ -f "$_fpslog" ]; then grep -aE "VERIFIED|already|NOT VERIFIED" "$_fpslog" 2>/dev/null | sed 's/^/  /'; fi
+    tstep fps
+  fi
+
+  # ---- [3] the resync: the trigger the ECU re-acquires on --------------------
+  # It is also the rescue for the two wedges above, so it runs when the gate did
+  # not already prove a built encoder.
+  tmark
+  if [ "$_g" != "0" ]; then
+    # the trap needs the nav element GONE before the resync, or the resync hands
+    # (ip,port) straight back to it (removals-then-additions, element list order)
+    _nu="$(uri_of "$(uris)" $NAVNAME)"
+    if [ -n "$_nu" ]; then
+      say "HANDOVER SWITCH: re-created nav element found during the rescue -- deleting it first"
+      bc "switch:rescue-park $_nu"; h DELETE "http://$RSI:$DMP$_nu" >/dev/null; echo
+    fi
+  fi
+  _mk2="$(oracle_mark)"
+  bc "switch:arm (resync 0->1)"
+  if [ "${MIB3_DLV_RESYNC_FLIP:-1}" = "1" ]; then
+    h POST "http://$RSI:$DMP$SP" '{"resync":false}' >/dev/null 2>&1; echo
+    nap_next_second
+  fi
+  h POST "http://$RSI:$DMP$SP" '{"resync":true}' >/dev/null; echo
+  _t_resync="$(now_ms)"        # the last wire call of this switch returned here
+  if [ "${NOOR:-0}" = "1" ]; then
+    say "HANDOVER SWITCH: DEGRADED (no oracle) -- mutations sent, resync sent, cannot verify"
+    hs_all=$(( $(now_ms) - hs_all ))
+    tline switch "$hs_all" " (DEGRADED: no oracle, no flush)"
+    return 0
+  fi
+  switch_gate "$_mk2" "$_win"; _g2="$?"
+  tstep resync
+  [ "$_g2" = "0" ] && {
+    FLUSH2=$(( $(now_ms) - _t_resync )); [ "$FLUSH2" -lt 0 ] && FLUSH2=0
+    EXTRA="$EXTRA flush2=${FLUSH2}ms"
+  }
+  if [ "$_g2" = "0" ]; then
+    say "HANDOVER SWITCH OK: share_surface_id = $OURID after the resync (${GATE_WAIT}ms)"
+    hs_all=$(( $(now_ms) - hs_all ))
+    tline switch "$hs_all"
+    do_verify
+    return 0
+  fi
+  say "HANDOVER SWITCH FAIL: no encoder for $OURID after the resync (gate=$_g2)"
+  oracle_tail
+  hand_back_to_nav_rollback "$DISP" "$SP" || true
+  return 2
+}
+# put the car's map back after a failed switch.  Not a "back" (nothing of ours was
+# ever on screen): just make sure a TransportStream exists and belongs to the nav,
+# so the cluster is not left with no stream at all while we report failure.
+hand_back_to_nav_rollback() {
+  _disp="$1"; _sp="$2"
+  say "HANDOVER SWITCH: ROLLBACK -- restoring the car's nav element so the cluster keeps its own map"
+  bc "switch:rollback"
+  # OUR element must go FIRST: while it is registered it keeps asking for ivi 3000,
+  # and MS-S would grab it (and fail) instead of the nav on the resync -- that is
+  # the same (ip,port) dedup that created this situation.
+  _ou="$(uri_of "$(uris)" $OURNAME)"
+  if [ -n "$_ou" ]; then
+    bc "switch:rollback:delete-ours $_ou"
+    h DELETE "http://$RSI:$DMP$_ou" >/dev/null; echo
+  fi
+  if [ -z "$(uri_of "$(uris)" $NAVNAME)" ]; then
+    h POST "http://$RSI:$DMP/displaymanagement/renderingSurfaces" \
+      "{\"name\":\"$NAVNAME\",\"display\":\"$_disp\",\"streamParameters\":\"$_sp\",\"topLeftX\":0,\"topLeftY\":0,\"width\":1280,\"height\":480}" >/dev/null; echo
+  fi
+  if [ "${NOOR:-0}" != "1" ]; then
+    _mk3="$(oracle_mark)"
+    h POST "http://$RSI:$DMP$_sp" '{"resync":false}' >/dev/null 2>&1; echo; nap_next_second
+    h POST "http://$RSI:$DMP$_sp" '{"resync":true}' >/dev/null 2>&1; echo
+    if wait_oracle_ms "share_surface_id = $NAVID" $(( ${MIB3_DLV_ROLLBACK_T:-6} * 1000 )) "$_mk3"; then
+      say "HANDOVER SWITCH: rollback OK -- the car's map is streaming again"
+      return 0
+    fi
+    say "HANDOVER SWITCH: rollback FAILED -- the car's map is not streaming; the cluster keeps its last frame"
+    return 1
+  fi
+  return 0
+}
+
+
 # own map (ivi 33).  Used by transition_ctl.sh's SHUTDOWN/FALLBACK path.
 #
 # WHY IT IS NOT JUST `restore`: it is gated on MS-S's own decisions, and it knows
@@ -421,16 +956,45 @@ handover_arm() {
 #   (stop+recreate), so step 5 below retries through one.  [STATIC]+[EXEC]
 # ----------------------------------------------------------------------------
 handover_back() {
-  _to="${1:-20}"
-  R="$(uris)"; D="$(disps)"; S="$(sps)"
+  _to="${1:-20}"                       # the SLOW budget (rescue path)
+  _fast=$(( ${MIB3_DLV_BACK_T:-3} * 1000 ))   # the FAST budget: one sample + encoder
+  hb_t0="$(now_ms)"; TIMING=""; T_SUM=0; tmark
+  MUTSUB=""; EXTRA=""; REQ=""; FLUSH=""
+  sub_reset
+  sub0; R="$(uris)"; D="$(disps)"; S="$(sps)"; sub_add lists
   DISP="$(uri_of "$D" navi-kombi-display)"; SP="$(uri_of "$S" $SPNAME)"
   OURU="$(uri_of "$R" $OURNAME)"; NAVU="$(uri_of "$R" $NAVNAME)"
   valid_uri "$DISP" || { say "HANDOVER BACK NO-GO: bad display uri '$DISP'"; return 1; }
-  _mk="$(oracle_lines)"
+  sub0; _mk="$(oracle_mark)"; sub_add mark
 
-  # [1] drop our element -- this is what makes MS-S stop sharing ivi $OURID
+  # ---- TRAP PREDICTION (cheap, and it saves the whole fast gate) -------------
+  # THE RE-CREATED-NAV TRAP: if the nav engine re-created its own element during
+  # our session, MS-S already sampled identity (33, ip, port) -- it tried to
+  # startShare it, the (ip,port) dedup refused (`Failed to create transportStream`)
+  # and it will NOT try again, because the identity never leaves its stream list.
+  # So the plain "delete ours, the nav comes back" cannot work, and only a resync
+  # fixes it.  Two independent tells, either is enough:
+  #   (a) the nav element EXISTS while our session is live (the engine put it back);
+  #   (b) the oracle has said `Failed to create transportStream` since our share.
+  # Neither tell is required: the fast gate below still catches the trap, it just
+  # costs its budget first -- so the prediction is an accelerator, not the proof.
+  # This 2 MB `tail | grep` sits inside the `mutations` span, which is why it is
+  # timed separately: on a loaded unit it is a plausible share of the 3 s.
+  _trap=0
+  [ -n "$NAVU" ] && _trap=1
+  if [ "$_trap" = "0" ] && [ -f "$MSSLOG" ]; then
+    sub0
+    otail | grep -aqE "Failed to create transportStream" 2>/dev/null && _trap=1
+    sub_add grep
+  fi
+
+  # [1] BOTH mutations in one sample window.  MS-S applies removals first, so a
+  #     single pass does stopShare(ours) -> (ip,port) freed -> startShare(33).
+  #     Waiting for `STOP STREAMING` first (the old step 2) cost a whole extra
+  #     MS-S sample for no gain: nothing here depends on it.
   if [ -n "$OURU" ]; then
-    bc "handover:back:delete-ours $OURU"; h DELETE "http://$RSI:$DMP$OURU" >/dev/null; echo
+    sub0; bc "handover:back:delete-ours $OURU"; sub_add sync
+    sub0; h DELETE "http://$RSI:$DMP$OURU" >/dev/null; sub_add del; echo
   else
     # NOTHING OF OURS IS ATTACHED.  MS-S can only be pointing at ivi $OURID
     # through OUR element, so there is nothing to take down -- but that does NOT
@@ -444,60 +1008,56 @@ handover_back() {
     fi
     say "HANDOVER BACK: nothing of ours was attached (MS-S last share='${_last:-?}')"
   fi
-
-  # [2] wait for MS-S to stop OUR stream ((ip,port) freed).  Only meaningful if
-  #     we had an element: MS-S logs "stopShare status = 0. Returning.." and no
-  #     STOP STREAMING when nothing was shared, which is not a failure.
-  if [ "${NOOR:-0}" = "1" ]; then
-    say "HANDOVER BACK: DEGRADED (no oracle) -- slept 3s instead of waiting for STOP STREAMING"
-    sleep 3
-  elif [ -n "$OURU" ]; then
-    if wait_oracle "STOP STREAMING|stopShare \[" "$_to" "$_mk"; then
-      say "HANDOVER BACK: MS-S stopped our stream"
-    else
-      say "HANDOVER BACK WARN: no STOP STREAMING within ${_to}s -- continuing; the resync retry below covers it"
-    fi
-  fi
-
-  # [3] re-create the car's own element if the nav engine has not already
-  if [ -z "$(uri_of "$(uris)" $NAVNAME)" ]; then
+  if [ -z "$NAVU" ]; then
     [ -n "$SP" ] || { say "HANDOVER BACK NO-GO: no streamParameters uri"; return 1; }
-    bc "handover:back:create-nav"
-    h POST "http://$RSI:$DMP/displaymanagement/renderingSurfaces" \
-      "{\"name\":\"$NAVNAME\",\"display\":\"$DISP\",\"streamParameters\":\"$SP\",\"topLeftX\":0,\"topLeftY\":0,\"width\":1280,\"height\":480}" >/dev/null; echo
-    sleep 1
-    NAVU="$(uri_of "$(uris)" $NAVNAME)"
+    sub0; bc "handover:back:create-nav"; sub_add sync
+    sub0; h POST "http://$RSI:$DMP/displaymanagement/renderingSurfaces" \
+      "{\"name\":\"$NAVNAME\",\"display\":\"$DISP\",\"streamParameters\":\"$SP\",\"topLeftX\":0,\"topLeftY\":0,\"width\":1280,\"height\":480}" >/dev/null; sub_add post; echo
   else
-    say "HANDOVER BACK: the nav element is already present"
+    say "HANDOVER BACK: the nav element is already present (trap predicted: no startShare will come without a resync)"
   fi
-  [ -n "$NAVU" ] || { say "HANDOVER BACK FAIL: the nav element could not be registered"; return 1; }
-
-  # [4] gate on the nav's encoder
   if [ "${NOOR:-0}" = "1" ]; then
-    sleep 3; say "HANDOVER BACK: DEGRADED (no oracle) -- nav element re-registered; cannot verify the encoder"
+    say "HANDOVER BACK: DEGRADED (no oracle) -- mutations sent; cannot verify the encoder"
+    nap 3
     return 0
   fi
-  # THE GATE IS `share_surface_id`, NOT `startShare`.  A `startShare [id = 33]` is
-  # logged even when Weston has no ivi 33 (the absent case: MS-S grabs, gets
-  # "does not exist", sets holder=3 and builds NO encoder) -- so gating on
-  # startShare alone would report success while the cluster shows nothing.
-  # Only `share_surface_id = 33` means the encoder was actually built.  [STATIC]
-  if wait_oracle "share_surface_id = $NAVID" "$_to" "$_mk"; then
-    say "HANDOVER BACK OK: encoder built for the car's map ($NAVID)"
-    return 0
+  tstep mutations
+  MUTSUB="$(sub_str "$T_LAST")"
+  _t_last_mut="$T_MARK"     # the moment the last mutation returned (step end)
+
+  # [2] FAST gate: `share_surface_id = 33`, one MS-S sample + the encoder build.
+  # THE GATE IS `share_surface_id`, NOT `startShare`: a `startShare [id = 33]` is
+  # logged even when Weston has no ivi 33 (MS-S grabs, gets "does not exist", sets
+  # holder=3 and builds NO encoder), so gating on startShare would report success
+  # while the cluster shows nothing.  [STATIC]+[EXEC]
+  if [ "$_trap" = "0" ]; then
+    if wait_oracle_ms "share_surface_id = $NAVID" "$_fast" "$_mk"; then
+      tstep gate
+      # H5 again: last mutation -> MS-S's line visible (see handover_switch)
+      FLUSH=$(( $(now_ms) - _t_last_mut )); [ "$FLUSH" -lt 0 ] && FLUSH=0
+      EXTRA="$EXTRA flush=${FLUSH}ms"
+      say "HANDOVER BACK OK: encoder built for the car's map ($NAVID) after ${LAST_WAIT}ms"
+      tline back "$(( $(now_ms) - hb_t0 ))"
+      return 0
+    fi
+    say "HANDOVER BACK: no nav share within ${MIB3_DLV_BACK_T:-3}s"
   fi
 
-  # [5] THE RESCUE -- the re-created-nav trap: identity 33 never left MS-S's
-  #     stream list, so no startShare was issued.  Only a resync forces one.
+  # [3] THE RESCUE -- forced (predicted) or earned (the fast gate timed out).
   say "HANDOVER BACK: no nav share yet -- forcing a resync (re-created-nav trap)"
   bc "handover:back:resync"
-  _mk2="$(oracle_lines)"
+  _mk2="$(oracle_mark)"
   if [ "${MIB3_DLV_RESYNC_FLIP:-1}" = "1" ]; then
-    h POST "http://$RSI:$DMP$SP" '{"resync":false}' >/dev/null 2>&1; echo; sleep 1
+    h POST "http://$RSI:$DMP$SP" '{"resync":false}' >/dev/null 2>&1; echo; nap_next_second
   fi
   h POST "http://$RSI:$DMP$SP" '{"resync":true}' >/dev/null 2>&1; echo
-  if wait_oracle "share_surface_id = $NAVID" "$_to" "$_mk2"; then
+  _t_resync="$(now_ms)"
+  if wait_oracle_ms "share_surface_id = $NAVID" $(( _to * 1000 )) "$_mk2"; then
+    tstep rescue
+    FLUSH2=$(( $(now_ms) - _t_resync )); [ "$FLUSH2" -lt 0 ] && FLUSH2=0
+    EXTRA="$EXTRA flush2=${FLUSH2}ms"
     say "HANDOVER BACK OK (after resync): encoder built for $NAVID"
+    tline back "$(( $(now_ms) - hb_t0 ))"
     return 0
   fi
   say "HANDOVER BACK FAIL: the car's map is not being shared again (no 'share_surface_id = $NAVID')"
@@ -509,24 +1069,30 @@ do_handover() {
   _st="${1:-full}"
   _to="${2:-}"
   bc "handover:start stage=$_st"
-  oracle_on
+  oracle_ensure          # restart a dead/not-delivering capture before any gate uses it
   if oracle_live; then NOOR=0; else
     NOOR=1
     say "HANDOVER WARN: the MS-S oracle is silent (port $LOGPORT closed?) -- gates DEGRADE to"
     say "  fixed waits and the pass/fail verdicts become unverifiable. Read the dash + MS-S fds."
   fi
   export NOOR
+  # Every verb reports what its RSI requests cost and what curl returned.  The
+  # switch/back verbs already put this on their HANDOVER TIMING line; the single
+  # steps (park/attach/arm/full) print it here, so a `--max-time 8` expiry is
+  # visible in EVERY path and not only in the timed ones.
   case "$_st" in
-    check)  handover_check; return $? ;;
-    park)   handover_park; return $? ;;
-    attach) handover_attach; return $? ;;
-    arm)    handover_arm; return $? ;;
+    check)  handover_check;  _rc=$?; rsi_report; return $_rc ;;
+    park)   handover_park;   _rc=$?; rsi_report; return $_rc ;;
+    attach) handover_attach; _rc=$?; rsi_report; return $_rc ;;
+    arm)    handover_arm;    _rc=$?; rsi_report; return $_rc ;;
     back)   handover_back "${_to:-20}"; return $? ;;
+    switch) handover_switch "${_to:-}"; return $? ;;
   esac
   handover_check || return 1
   handover_park  || { say "STOP: park not observed -- not attaching (run again when MS-S logs STOP STREAMING)"; return 1; }
   handover_attach || return $?
   handover_arm    || return $?
+  rsi_report
   do_verify
   bc "handover:done stage=$_st"
   say "HANDOVER COMPLETE: look at the cluster. If blank: sh patha_deliver.sh toggle (ECU lever)"
@@ -559,5 +1125,5 @@ case "${1:-}" in
              tail)  oracle_tail ;;
              *) echo "usage: $0 oracle {start|stop|tail}"; exit 2 ;;
            esac ;;
-  *) echo "usage: $0 {status|apply|handover [check|park|attach|arm|back [secs]|full]|verify|restore|watch [secs]|oracle {start|stop|tail}}"; exit 2 ;;
+  *) echo "usage: $0 {status|apply|handover [check|park|attach|arm|switch [fps]|back [secs]|full]|verify|restore|watch [secs]|oracle {start|stop|tail}}"; exit 2 ;;
 esac

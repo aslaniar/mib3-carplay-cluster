@@ -50,6 +50,7 @@ typedef unsigned char      u8;
 typedef unsigned int       u32;
 typedef unsigned long      u64;
 typedef long               s64;
+static u64 mono_ms(void);          /* defined below; used by the lossless AU hop */
 typedef long               ssize_t_;
 
 /* CF types (opaque) */
@@ -72,6 +73,10 @@ extern char  *getenv(const char *name);
 extern int    open(const char *path, int flags, ...);
 extern long   write(int fd, const void *buf, unsigned long n);
 extern int    close(int fd);
+extern void  *memset(void *dst, int c, unsigned long n);
+extern void  *memcpy(void *dst, const void *src, unsigned long n);
+extern int    strcmp(const char *a, const char *b);
+extern int    strncmp(const char *a, const char *b, unsigned long n);
 
 #define RTLD_NEXT    ((void *)-1L)
 #define RTLD_DEFAULT ((void *)0)
@@ -106,7 +111,6 @@ static void *R(const char *name)
 #define O_APPEND 02000
 
 /* ---- minimal string/format helpers (no libc stdio) ----------------------- */
-static unsigned long slen_(const char *s){ unsigned long n=0; while(s && s[n]) n++; return n; }
 
 typedef struct { char *p; unsigned long cap, n; } buf;
 /* NB: n must never exceed cap, or logline()'s write(fd,mem,n) would read past
@@ -121,13 +125,94 @@ static void bu64(buf *b, u64 v, int base, int minw){
   while (k<minw) t[k++]='0';
   while (k--) bch(b, t[k]);
 }
-static void bs64(buf *b, s64 v){ if(v<0){ bch(b,'-'); bu64(b,(u64)(-v),10,0);} else bu64(b,(u64)v,10,0); }
 static void bhex(buf *b, u64 v){ bs(b,"0x"); bu64(b,v,16,0); }
 
 /* ---- logging ------------------------------------------------------------- */
 static int logfd = -1;
 static void log_open(void){
   if (logfd < 0) logfd = open("/tmp/mib3shim.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+}
+/* ---- opcode-5: the SENDER'S OWN TELEMETRY, not a keepalive (2026-10-20) -----
+ * The body is a binary plist of the PHONE's counters: encoderCurrentFPS,
+ * sinkOverflowDropFPS, rttAvg, txUsageAvg.  We used to log 64 bytes of it and
+ * call it "keepalive" -- which threw away the only in-band evidence of WHY the
+ * phone encodes ~15 fps when it is allowed 30: its own content rate control, a
+ * thermal clamp (iOS DBThermalMonitor level 1 == exactly 15), or the sender
+ * DROPPING frames because its queue backed up past 67 ms -- i.e. because we
+ * drain too slowly.  `sinkOverflowDropFPS` is the number that separates them.
+ *
+ *   MIB3_SHIM_CTL5_DUMP=/dev/shm/cl_ctl5.bin   destination (this is now the DEFAULT)
+ *   MIB3_SHIM_CTL5_DUMP=off                    disable
+ *   MIB3_SHIM_CTL5_MAX=8388608                 hard size cap, then it stops
+ * Record format: <u32 LE length><body>, so a reader can split them.
+ * THE LABEL TRAP: never pre-create that file as root -- a root-created file is
+ * common::bin and carplay::app cannot write it.  Let the shim create it.
+ *
+ * 2026-10-27: this knob used to be opt-in and, unset, it said NOTHING -- so a
+ * session ran with MIB3_SHIM_CTL5_DUMP "set with a good readback", 1156 opcode-5
+ * telemetry records arrived, and no file appeared, with no line anywhere saying
+ * why (the getenv had not reached the target).  The file is the only in-band
+ * source of the phone's own encoderCurrentFPS, which is now the leading open
+ * question, so: default ON to /dev/shm (RAM only, capped), state the decision in
+ * the RUN banner as CTL5=, and log the reason the first time a record arrives.
+ * A knob that silently does nothing is worse than no knob.
+ */
+static int ctl5_fd = -2;                 /* -2 undecided, -1 disabled */
+static int ctl5_want = -1;               /* -1 unknown, 0 off, 1 on */
+static const char *ctl5_path = "";       /* destination while enabled */
+static const char *ctl5_why = "";        /* why it is off, for the log */
+static void logkv(const char *tag, const char *key, u64 v, int hex);   /* defined below */
+static void logline(const char *tag, const char *msg);                 /* defined below */
+static unsigned long ctl5_written = 0;
+
+static void ctl5_resolve(void)
+{
+  const char *p;
+  if (ctl5_want >= 0) return;
+  p = getenv("MIB3_SHIM_CTL5_DUMP");
+  if (p && (!p[0] || !strcmp(p, "off") || !strcmp(p, "0"))) {
+    ctl5_want = 0; ctl5_why = "MIB3_SHIM_CTL5_DUMP=off"; return;
+  }
+  if (!p || !p[0]) p = "/dev/shm/cl_ctl5.bin";
+  ctl5_want = 1; ctl5_path = p; ctl5_why = "";   /* opened lazily, ONCE */
+}
+
+static void ctl5_dump(const unsigned char *body, unsigned long n)
+{
+  unsigned long cap = 8388608UL;
+  ctl5_resolve();
+  if (n == 0 || n > (64UL << 10)) return;          /* sanity: a plist is small */
+  if (ctl5_want <= 0){
+    if (ctl5_fd == -2){
+      ctl5_fd = -1;
+      logline("cluster/ctl5","telemetry dump OFF -- ");
+      logline("cluster/ctl5", ctl5_why);
+    }
+    return;
+  }
+  if (ctl5_fd == -2){
+    ctl5_fd = open(ctl5_path, O_WRONLY|O_CREAT|O_APPEND, 0644);
+    if (ctl5_fd >= 0){ logline("cluster/ctl5","dump enabled -> "); logline("cluster/ctl5", ctl5_path); }
+    else { ctl5_fd = -1;
+      logline("cluster/ctl5","dump OFF -- open failed. NEVER pre-create this file as root: "
+                             "a root-created file is common::bin and carplay::app cannot write it.");
+      return; }
+  }
+  if (ctl5_fd < 0) return;
+  { const char *ms = getenv("MIB3_SHIM_CTL5_MAX");
+    if (ms && ms[0]){ unsigned long v = 0; int i = 0;
+      while (ms[i] >= '0' && ms[i] <= '9'){ v = v*10 + (unsigned long)(ms[i]-'0'); i++; }
+      if (v) cap = v; } }
+  if (ctl5_written >= cap){ close(ctl5_fd); ctl5_fd = -1;
+    logkv("cluster/ctl5","dump complete bytes",(u64)ctl5_written,0); return; }
+  { unsigned char hdr[4];
+    hdr[0]=(unsigned char)(n); hdr[1]=(unsigned char)(n >> 8);
+    hdr[2]=(unsigned char)(n >> 16); hdr[3]=(unsigned char)(n >> 24);
+    if (write(ctl5_fd, hdr, 4) != 4 || write(ctl5_fd, body, (long)n) != (long)n){
+      close(ctl5_fd); ctl5_fd = -1; logline("cluster/ctl5","write failed -> disabled"); return; }
+    ctl5_written += 4UL + n; }
+  { static unsigned long seen = 0;
+    if ((++seen % 200) == 1) logkv("cluster/ctl5","records bytes",(u64)ctl5_written,0); }
 }
 static void logline(const char *tag, const char *msg){
   char mem[2048]; buf b = { mem, sizeof(mem)-2, 0 };
@@ -242,14 +327,23 @@ static void bc(const char *step){
 extern int socket(int, int, int);
 extern int connect(int, const void*, unsigned int);
 extern int setsockopt(int, int, int, const void*, unsigned int);
+extern int getsockopt(int, int, int, void *, unsigned int *);
 extern long send(int, const void*, unsigned long, int);
 extern int *__errno_location(void);
+extern long time(long *);
+static u64 env_num(const char *name, u64 dflt); /* defined after the CF section */
 #define SHIM_ERRNO (*__errno_location())
 #define O_NONBLOCK_ 04000
 #define SOL_SOCKET_ 1
 #define SO_SNDTIMEO_ 21
+#define SO_SNDBUF_  7
 static int hlp_fd = -1;
 static unsigned long hlp_seq = 0, hlp_sent = 0, hlp_drop = 0, hlp_conns = 0;
+/* the granted SO_SNDBUF of the live helper socket (0 = unknown).  This hop is
+ * the ONE unmeasured link in the chain (see the 2026-10-26 note at the top of
+ * helper_connect) and the send-side buffer is what decides whether a decoder
+ * that pauses ~100 ms turns into a dropped AU. */
+static int hlp_sndbuf = 0;
 /* BOUNDED EAGAIN RECOVERY (2026-10-19).  A helper whose peer is gone (one-way:
  * nobody reading) makes every send() return EAGAIN with MSG_DONTWAIT.  The old
  * "keep the socket on EAGAIN" rule then held it FOREVER: every AU dropped, the
@@ -263,6 +357,7 @@ static long hlp_last_ok = 0;         /* time(0) of the last fully-sent record */
 static void helper_close(void){
   if (hlp_fd >= 0){ close(hlp_fd); hlp_fd = -1; }
   hlp_eagain = 0;                    /* a fresh socket starts with a clean slate */
+  hlp_sndbuf = 0;
 }
 static const char *helper_path(void){
   char *v = getenv("MIB3_SHIM_HELPER"); return (v && v[0]) ? v : MIB3_HELP_SOCK_DEFAULT;
@@ -272,7 +367,7 @@ static int helper_connect(void){
   int fd, i;
   if (hlp_fd >= 0) return 0;
   { const char *p = helper_path();
-    for (i = 0; i < 108; i++) sa.path[i] = 0;
+    memset(sa.path, 0, 108);
     for (i = 0; i < 107 && p[i]; i++) sa.path[i] = p[i]; }
   sa.fam = 1 /*AF_UNIX*/;
   fd = socket(1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
@@ -284,7 +379,49 @@ static int helper_connect(void){
   }
   { struct { long s; long us; } tv; tv.s = 0; tv.us = 200000;
     setsockopt(fd, SOL_SOCKET_, SO_SNDTIMEO_, &tv, sizeof(tv)); }
+  /* *** SIZE THE HELPER SOCKET FOR REAL AUs (2026-10-26) ***
+   *
+   * The 2026-10-25 session ended with the picture artifacted and NO counter
+   * anywhere explaining it: the decoder read qdrop=0 kdrop=0 awt=6, and the
+   * RGBA send read drop=0 -- because every one of those counters measures a
+   * DIFFERENT hop.  THIS hop (shim -> decoder, the AF_UNIX socket below) is the
+   * one nobody measures: helper_feed drops a record on EVERY EAGAIN (the
+   * MSG_DONTWAIT send returning "buffer full"), and hlp_drop was only ever
+   * readable through the probe export -- the log said nothing.
+   *
+   * Why EAGAIN happens here at all: the decoder's loop can legitimately pause
+   * reading for ~100 ms (the bounded short-write retry in send_rgba, an output
+   * buffer hold, the first-connection renegotiate).  A DEFAULT AF_UNIX send
+   * buffer is 208 KB on this image -- TWO of the measured 142 KB guidance
+   * AUs (amax=141999, 2026-10-24) -- so a ~200 ms decoder pause makes every
+   * send return EAGAIN and the AU is DROPPED, silently, on the one hop with no
+   * counter.  A dropped AU is unrecoverable damage on a stream with ~1 keyframe
+   * per 88 s: exactly "blocky flat areas, wrong tints, text stays sharp"
+   * (the fresh intra content decodes, the predicted content conceals).
+   *
+   * So: (a) ask for a send buffer that holds several seconds of big AUs
+   * (default 4 MB, ~28 max-size AUs, ~2 s at 15 fps), and READ IT BACK -- the
+   * kernel clamps SO_SNDBUF to 2*net.core.wmem_max, so on a unit where
+   * bring_up.sh has not run (wmem_max 208 KB) the request silently clamps and
+   * the log must SAY so instead of letting the failure hide in a counter
+   * nobody reads; (b) count every drop in the log too (helper_feed).
+   * This changes NO drop policy, NO timeout, NO thread: sends stay
+   * non-blocking, the receiver thread can never stall on this socket. */
+  { long want = (long)env_num("MIB3_SHIM_HLP_SNDBUF", (u64)(4u<<20));
+    if (want > 0){
+      int sb = (int)(want > (64u<<20) ? (64u<<20) : want);
+      setsockopt(fd, SOL_SOCKET_, SO_SNDBUF_, &sb, sizeof(sb));
+    }
+    { int got = 0; unsigned int gl = (unsigned int)sizeof(got);
+      if (getsockopt(fd, SOL_SOCKET_, SO_SNDBUF_, &got, &gl) == 0){
+        hlp_sndbuf = got;
+        logkv("sink","helper sndbuf granted",(u64)(u32)got,0);
+        if (got < 425984) /* 2*208KB: the pre-bring_up ceiling */
+          logline("sink","helper sndbuf CLAMPED -- raise net.core.wmem_max (bring_up.sh does it) or AUs will drop here");
+      } }
+  }
   hlp_fd = fd; hlp_conns++;
+  logkv("sink","helper connect #",(u64)hlp_conns,0);
   return 0;
 }
 /* MSG_NOSIGNAL: a write to a socket whose peer is gone raises SIGPIPE as well as
@@ -304,8 +441,70 @@ static int helper_connect(void){
  * is not. */
 #define MIB3_MSG_DONTWAIT 0x40
 
-extern long time(long *);                       /* used by the backoff + EAGAIN bound */
-static u64 env_num(const char *name, u64 dflt); /* defined after the CF section */
+/* (time() and env_num() are declared at the top of the sink block.) */
+
+/* *** EVERY DROP ON THIS HOP IS NOW IN THE LOG (2026-10-26) ***
+ * hlp_drop used to be readable only through the probe export; the log said
+ * nothing while AUs were being dropped -- and a dropped AU is unrecoverable
+ * damage on a ~1-keyframe-per-88 s stream (the 2026-10-25 artifact session
+ * ended with no counter anywhere explaining the picture).  One line, rate
+ * limited to 1/s (the same idiom as the connect gate), with the running
+ * totals so the shim's log and the decoder's qdrop/kdrop/awt can be diffed
+ * per window: the GAP between them is the number of phone frames that were
+ * lost between the two processes. */
+static void hlp_drop_log(const char *why){
+  static long last_log = 0;
+  long now = time(0);
+  if (now == last_log) return;
+  last_log = now;
+  logline("sink/drop/why", why ? why : "?");
+  logkv("sink","helper dropped total",(u64)hlp_drop,0);
+  logkv("sink","helper sent total",(u64)hlp_sent,0);
+  logkv("sink","helper sndbuf",(u64)(u32)hlp_sndbuf,0);
+}
+
+/* LOSSY-BY-DESIGN IS WRONG ON THIS HOP (2026-10-27, measured).
+ *
+ * helper_feed() used to send with MSG_DONTWAIT and, on EAGAIN, simply DROP the
+ * record ("hdr send EAGAIN (decoder not reading / sndbuf full)").  That is the
+ * right policy for a live decoder that must never stall carplay -- and it is
+ * catastrophic for the Path B re-muxer, because the phone's H.264 stream has ONE
+ * keyframe per 78 s (measured: 2 in 2077 AUs).  A single dropped AU breaks the
+ * predictive chain until the phone happens to send another IDR, i.e. for the rest
+ * of the session.
+ *
+ * Measured in the 2026-10-27 field run: `helper dropped total=3691` against
+ * `helper sent total=36659` -- 9 % of the picture was being thrown away on the
+ * ONE hop in the chain that has no recovery.  Every synthetic test (file -> sender,
+ * no socket) held the picture for the full duration at 10, 30 and 60 fps, with one
+ * keyframe, with gaps, with the phone's exact High/full-range SPS -- because none
+ * of them goes through this function.  The wire was never the problem.
+ *
+ * So: WAIT (bounded) for the consumer instead of discarding.  The wait is capped
+ * by MIB3_SHIM_HLP_WAIT ms (default 250) so a dead consumer still cannot hold the
+ * receiver thread forever -- and if the wait is exhausted the AU is dropped and
+ * logged as before.  With that cap the record stays all-or-nothing: a partial
+ * body still closes the socket, exactly as before. */
+static long send_all(int fd, const void *p, unsigned long n, int wait_ms)
+{
+  const unsigned char *b = (const unsigned char *)p;
+  unsigned long off = 0;
+  u64 deadline = mono_ms() + (u64)(wait_ms > 0 ? wait_ms : 0);
+  while (off < n){
+    long r = send(fd, b + off, n - off, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT);
+    if (r > 0){ off += (unsigned long)r; continue; }
+    if (r < 0 && SHIM_ERRNO == 11 /*EAGAIN*/){
+      struct pollfd { int fd; short ev; short rev; } pf;
+      extern int poll(void*, unsigned long, int);
+      if (mono_ms() >= deadline) return -1;
+      pf.fd = fd; pf.ev = 4 /*POLLOUT*/; pf.rev = 0;
+      poll(&pf, 1, 20);
+      continue;
+    }
+    return -1;
+  }
+  return (long)n;
+}
 
 static int helper_feed(const void *data, unsigned long len, unsigned long ts){
   unsigned char hdr[MIB3_HELP_HDRLEN];
@@ -321,13 +520,14 @@ static int helper_feed(const void *data, unsigned long len, unsigned long ts){
     long now = time(0);
     if (now != last_try){
       last_try = now;
-      if (helper_connect() != 0){ hlp_drop++; return -1; }
-    } else { hlp_drop++; return -1; }
+      if (helper_connect() != 0){ hlp_drop++; hlp_drop_log("no decoder attached (helper absent)"); return -1; }
+    } else { hlp_drop++; hlp_drop_log("no decoder attached (1/s connect gate)"); return -1; }
   }
   m32 = MIB3_HELP_MAGIC; for (i=0;i<4;i++) hdr[i]   = (unsigned char)((m32 >> (i*8)) & 0xff);
   m32 = (u32)len;        for (i=0;i<4;i++) hdr[4+i] = (unsigned char)((m32 >> (i*8)) & 0xff);
   m64 = ++hlp_seq;       for (i=0;i<8;i++) hdr[8+i] = (unsigned char)((m64 >> (i*8)) & 0xff);
-  { long r = send(hlp_fd, hdr, MIB3_HELP_HDRLEN, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT);
+  { long r = send_all(hlp_fd, hdr, MIB3_HELP_HDRLEN,
+                      (int)env_num("MIB3_SHIM_HLP_WAIT", 250));
     if (r != (long)MIB3_HELP_HDRLEN){
       hlp_drop++;
       /* Distinguish "nothing written because the buffer is full" (EAGAIN) from
@@ -339,23 +539,26 @@ static int helper_feed(const void *data, unsigned long len, unsigned long ts){
        * 2026-10-19: "helper connected" while the decoder never saw one). */
       if (r < 0 && SHIM_ERRNO == 11 /*EAGAIN*/){
         long now = time(0);
-        long emax = (long)env_num("MIB3_SHIM_HLP_EAGAIN", 8);
+        long emax = (long)env_num("MIB3_SHIM_HLP_EAGAIN", 32);
         long stall = (long)env_num("MIB3_SHIM_HLP_STALL", 2);
         hlp_eagain++;
+        hlp_drop_log("hdr send EAGAIN (decoder not reading / sndbuf full)");
         if (hlp_eagain >= emax ||
             (hlp_last_ok && now - hlp_last_ok > stall)){
           logkv("sink","helper EAGAIN bound tripped -- closing",(u64)(u32)hlp_eagain,0);
           helper_close();
         }
       } else {
+        hlp_drop_log("hdr send failed (fatal errno / partial)");
         helper_close();
       }
       return -1; }
   }
-  { long r = send(hlp_fd, data, len, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT);
+  { long r = send_all(hlp_fd, data, len,
+                      (int)env_num("MIB3_SHIM_HLP_WAIT", 250));
     if (r != (long)len){
       /* Partial record = permanent desync; the helper must reconnect. */
-      hlp_drop++; helper_close(); return -1; } }
+      hlp_drop++; helper_close(); hlp_drop_log("body send short/partial (desync)"); return -1; } }
   hlp_eagain = 0;                 /* a complete record went out: reset the bound */
   hlp_last_ok = time(0);
   hlp_sent++;
@@ -524,7 +727,6 @@ static fn_CFTypeGetTypeID           p_CFStringGetTypeID;
 static fn_CFTypeGetTypeID           p_CFNumberGetTypeID;
 static fn_CFTypeGetTypeID           p_CFBooleanGetTypeID;
 static fn_CFDictionaryGetCount      p_CFDictionaryGetCount;
-static fn_CFDictionaryCopyKeys      p_CFDictionaryCopyKeys;
 static fn_CFGetInt64                p_CFGetInt64;
 static void *p_kCFTypeArrayCallBacks;
 static void *p_kCFLDictKeyCB;
@@ -533,20 +735,6 @@ static void *p_kCFLBooleanTrue;
 static void *p_kCFLBooleanFalse;
 
 /* cluster-stream (type 111) helpers + libAirPlay base (for RVA calls) */
-static fn_ServerSocketOpen  p_ServerSocketOpen;
-static fn_NetSocketCreate   p_NetSocketCreate;
-static fn_NetSocketNative   p_NetSocketNative;
-static fn_SocketAccept      p_SocketAccept;
-static fn_SocketSetQoS      p_SocketSetQoS;
-static fn_ScreenCreate      p_ScreenCreate;
-static fn_ScreenSetup       p_ScreenSetup;
-static fn_ScreenStart       p_ScreenStart;
-static fn_ScreenStop        p_ScreenStop;
-static fn_ScreenDelete      p_ScreenDelete;
-static fn_ScreenProcFrames  p_ScreenProcFrames;
-static fn_ScreenSetSec      p_ScreenSetSec;
-static fn_ScreenSetChaCha   p_ScreenSetChaCha;
-static fn_ScreenSetTS       p_ScreenSetTS;
 static fn_DeriveAES         p_DeriveAES;
 static fn_cx_init           p_cx_init;
 static fn_cx_aad            p_cx_aad;
@@ -556,6 +744,9 @@ static fn_ctr_init          p_ctr_init;
 static fn_ctr_upd           p_ctr_upd;
 static fn_pthreadCreate     p_pthreadCreate;
 static fn_close             p_close;
+typedef long (*fn_syscall)(long, ...);
+static fn_syscall           p_syscall;
+static long (*p_clock_gettime)(int, void*);
 static void *(*p_malloc)(unsigned long);
 static void  (*p_free)(void*);
 static fn_SetSurface        p_realSetSurface;
@@ -569,8 +760,6 @@ static fn_CinemoCreateStr  p_CinemoCreateWindow;
 static fn_CinemoCreateStr  p_CinemoCreateProjection;
 /* Cinemo logging (libNmeBaseClasses): turn it on from inside the helper so the
  * device's own decisions ("using %s swap-chain") become visible. */
-static int (*p_NmeLogSetLevel)(int);
-static int (*p_NmeLogSetTarget)(int,const char*,void*,void*);
 static void               *p_opt_video_device_id;   /* &CINEMO_OPTION_VIDEO_DEVICE_ID */
 static void               *p_iid_cinemo_option;     /* &ICinemoOption::iid */
 /* The playback ICinemoOption keys the framework sets in screenSetup() (2026-10-17). */
@@ -579,17 +768,11 @@ static void               *p_opt_aspect, *p_opt_max_res, *p_opt_frame_drop, *p_o
 
 /* route-B graphics symbols (resolved lazily in resolve_gfx) */
 static fn_wl_connect          p_wl_display_connect;
-static fn_wl_disp_void        p_wl_display_disconnect;
-static fn_wl_disp_int         p_wl_display_get_fd;
 static fn_wl_disp_int         p_wl_display_roundtrip;
-static fn_wl_disp_int         p_wl_display_dispatch_pending;
-static fn_wl_disp_int         p_wl_display_flush;
 static fn_wl_pmc              p_wl_pmc;
 static fn_wl_pmcv             p_wl_pmcv;
 static fn_wl_add_listener     p_wl_proxy_add_listener;
-static fn_wl_destroy          p_wl_proxy_destroy;
 static fn_wl_eglwin_create    p_wl_egl_window_create;
-static fn_wl_eglwin_destroy   p_wl_egl_window_destroy;
 static fn_eglGetDisplay       p_eglGetDisplay;
 static fn_eglInitialize       p_eglInitialize;
 static fn_eglBindAPI          p_eglBindAPI;
@@ -763,23 +946,8 @@ static void resolve(void){
   p_CFNumberGetTypeID         = (fn_CFTypeGetTypeID)          R("CFNumberGetTypeID");
   p_CFBooleanGetTypeID        = (fn_CFTypeGetTypeID)          R("CFBooleanGetTypeID");
   p_CFDictionaryGetCount      = (fn_CFDictionaryGetCount)     R("CFDictionaryGetCount");
-  p_CFDictionaryCopyKeys      = (fn_CFDictionaryCopyKeys)     R("CFDictionaryCopyKeys");
   p_CFGetInt64                = (fn_CFGetInt64)               R("CFGetInt64");
   /* cluster-stream helpers (libAirPlay / libCoreUtils exports) */
-  p_ServerSocketOpen  = (fn_ServerSocketOpen) R("ServerSocketOpen");
-  p_NetSocketCreate   = (fn_NetSocketCreate)  R("NetSocket_CreateWithNative");
-  p_NetSocketNative   = (fn_NetSocketNative)  R("NetSocket_GetNative");
-  p_SocketAccept      = (fn_SocketAccept)     R("SocketAccept");
-  p_SocketSetQoS      = (fn_SocketSetQoS)     R("SocketSetQoS");
-  p_ScreenCreate      = (fn_ScreenCreate)     R("AirPlayReceiverSessionScreen_Create");
-  p_ScreenSetup       = (fn_ScreenSetup)      R("AirPlayReceiverSessionScreen_Setup");
-  p_ScreenStart       = (fn_ScreenStart)      R("AirPlayReceiverSessionScreen_StartSession");
-  p_ScreenStop        = (fn_ScreenStop)       R("AirPlayReceiverSessionScreen_StopSession");
-  p_ScreenDelete      = (fn_ScreenDelete)     R("AirPlayReceiverSessionScreen_Delete");
-  p_ScreenProcFrames  = (fn_ScreenProcFrames) R("AirPlayReceiverSessionScreen_ProcessFrames");
-  p_ScreenSetSec      = (fn_ScreenSetSec)     R("AirPlayReceiverSessionScreen_SetSecurityInfo");
-  p_ScreenSetChaCha   = (fn_ScreenSetChaCha)  R("AirPlayReceiverSessionScreen_SetChaChaSecurityInfo");
-  p_ScreenSetTS       = (fn_ScreenSetTS)      R("AirPlayReceiverSessionScreen_SetTimeSynchronizer");
   p_DeriveAES         = (fn_DeriveAES)        R("AirPlay_DeriveAESKeySHA512ForScreen");
   p_cx_init           = (fn_cx_init)          R("chacha20_poly1305_init_64x64");
   p_cx_aad            = (fn_cx_aad)           R("chacha20_poly1305_add_aad");
@@ -791,6 +959,8 @@ static void resolve(void){
   p_close             = (fn_close)            R("close");
   p_malloc            = (void*(*)(unsigned long)) R("malloc");
   p_free              = (void(*)(void*))          R("free");
+  p_syscall           = (long(*)(long,...))       R("syscall");
+  p_clock_gettime     = (long(*)(int,void*))      R("clock_gettime");
   p_realSetSurface    = (fn_SetSurface)       R("_Z29CarPlayAppFrameworkSetSurfaceP26CarPlayAppFrameworkPrivatePvj");
   /* the framework's per-stream frame entry -- the interception seam (see below).
    * On the unit this is libCarPlayMediaFramework.so; on the desk bench it is the
@@ -957,6 +1127,88 @@ static s64 dgeti64k(CFDictionaryRef d, const char *key, s64 dflt){
 }
 
 /* ==========================================================================
+ * CLUSTER GEOMETRY -- ONE resolver for the cluster's pixel size, its advertised
+ * PHYSICAL size (mm), and the relation between them (2026-10-20, the 2x lane).
+ *
+ * WHY THIS EXISTS.  Before it, the display seam and the view-area preset each
+ * read MIB3_SHIM_W/H on their own, and `va_preset_rect()` carried a hand-tuned
+ * special case for exactly 1280x480 whose "other panel" branch **never set
+ * originYPixels at all** -- the field inherited the previous area's value
+ * (measured on the desk inside the unit's own CFLite: sy=200 at 2560x960,
+ * sy=150 at 1920x720, because area 0 wrote those into the same stack slot).
+ * The result at 2x was a safe area ending 95 px BELOW the frame:
+ *
+ *     2560x960:  area1 safe = 883,200,793,855   -> 200+855 = 1055 > 960
+ *     1920x720:  area1 safe = 662,150,595,615   -> 150+615 =  765 > 720
+ *     1280x480:  area1 safe = 439, 50,397,375   ->  50+375 =  425 <= 480  (ok)
+ *
+ * An advert like that is invalid -- CarKit validates view areas (rgi's own RE
+ * names `CRDisplayScaleInfo.minAcceptableViewAreaSize*` /
+ * `isViewAreaPixelSizeAcceptable`, and `_CRSizeFromAirPlayDictionary` checks
+ * "area within limit") -- and because ONE unparseable `displays` entry costs the
+ * WHOLE array, the phone tears the session down: exactly the field symptom
+ * (centre screen black, connect/disconnect storm, the 111 port never dialled).
+ * The log did not show it because `va_log_rect()` clamped negatives to 0 and 200
+ * looks like a plausible top margin.
+ *
+ * KNOBS (every default reproduces the shipped behaviour byte for byte):
+ *   MIB3_SHIM_W / MIB3_SHIM_H   cluster pixel size (default 1280x480)
+ *   MIB3_SHIM_SCALE=<pct>       multiply the pixel size (100 = off, default).
+ *                               Rounded UP to a multiple of 8 both ways so the
+ *                               encoder and the decoder never see a ragged size.
+ *                               100 / 150 / 200 -> 1280x480 / 1920x720 / 2560x960.
+ *   MIB3_SHIM_CWPHY / CHPHY     advertised physical size in mm (292x110).  When
+ *                               CHPHY is not set it is DERIVED from CWPHY and the
+ *                               pixel aspect (round(CWPHY*h/w) = 110 at 1x, i.e.
+ *                               unchanged), so the advertised mm can never
+ *                               contradict the advertised pixels.
+ *   MIB3_SHIM_SCALE_PHY=1       scale the physical size WITH the pixels so the
+ *                               advertised DENSITY (px per mm) does not change:
+ *                               2x then reads as a 584x219 mm panel at the same
+ *                               111 dpi.  This is the RATIO/density hypothesis's
+ *                               test knob; default 0 keeps the real panel size
+ *                               and lets the density rise (2x = 222 dpi), which
+ *                               is what a genuinely supersampled stream is.
+ * ========================================================================*/
+typedef struct { int w, h; int phy_w, phy_h; } geom_t;
+static int geom_round8(int v){ if (v < 8) return 8; return (v + 7) & ~7; }
+static void cluster_geom(geom_t *g)
+{
+  const char *sph = getenv("MIB3_SHIM_CHPHY");
+  long sc = (long)env_num("MIB3_SHIM_SCALE", 100);
+  long w  = (long)env_num("MIB3_SHIM_W", 1280);
+  long h  = (long)env_num("MIB3_SHIM_H", 480);
+  long pw, ph;
+  if (sc <= 0) sc = 100;
+  if (sc < 25) sc = 25;
+  if (sc > 400) sc = 400;
+  if (sc != 100){ w = w * sc / 100; h = h * sc / 100; }
+  g->w = geom_round8((int)w);
+  g->h = geom_round8((int)h);
+  if (g->w > 8192) g->w = 8192;
+  if (g->h > 8192) g->h = 8192;
+  pw = (long)env_num("MIB3_SHIM_CWPHY", 292);
+  ph = (sph && sph[0]) ? (long)env_num("MIB3_SHIM_CHPHY", 110) : 0;
+  if (env_on("MIB3_SHIM_SCALE_PHY", 0)){
+    pw = pw * sc / 100;
+    if (sph && sph[0]) ph = ph * sc / 100;
+  }
+  if (pw < 10) pw = 10;
+  if (pw > 4000) pw = 4000;
+  /* aspect-honest height when the operator did not pin one: 292*480/1280 = 110 */
+  if (!(sph && sph[0])) ph = (pw * (long)g->h + (long)g->w / 2) / (long)g->w;
+  if (ph < 10) ph = 10;
+  if (ph > 4000) ph = 4000;
+  g->phy_w = (int)pw;
+  g->phy_h = (int)ph;
+}
+/* px per mm in thousandths: the density the PHONE sees.  Logged at every advert
+ * so a density change is a number in the record instead of an inference. */
+static int geom_density_milli(const geom_t *g){
+  return (g && g->phy_w > 0) ? (int)((1000L * (long)g->w) / (long)g->phy_w) : 0;
+}
+
+/* ==========================================================================
  * VIEW AREAS (2026-10-19, view-area lane).
  *
  * WHY.  The instrument cluster has a VIEW button that cycles its layout: one
@@ -1062,6 +1314,11 @@ static int va_scale_milli(int cw, int phy_mm){
 }
 static int va_wide_px(int cw, int phy_mm){ return (int)((660L * (long)va_scale_milli(cw, phy_mm)) / 1000L); }
 static int va_centre_px(int cw, int phy_mm){ return (int)((383L * (long)va_scale_milli(cw, phy_mm)) / 1000L) + 1; }
+/* The ETA threshold is 202 PIXELS AT 1x, i.e. a fixed number of POINTS, so it
+ * scales with the advertised density like the other two cliffs.  202 px at
+ * 1280 px / 292 mm == 202 * scale/670 px at any other geometry, which is
+ * unchanged at 1x (the shipped behaviour) and 404 px at 2x with the real mm. */
+static int va_eta_px(int cw, int phy_mm){ return (int)((202L * (long)va_scale_milli(cw, phy_mm)) / 670L); }
 /* 0 = undefined (blank), 1 = centred, 2 = wide.  Which SIDE a wide column takes
  * is the phone's choice (safe-area mid vs display mid), so it is not modelled. */
 static int va_class_of(int sw, int sh, int cw, int phy_mm){
@@ -1077,6 +1334,45 @@ static int va_class_near_cliff(int sw, int sh, int cw, int phy_mm){
   if (cls == 1 && sh < va_centre_px(cw, phy_mm) * 110 / 100) return 1;
   return 0;
 }
+/* Clamp a rect into its own frame.  Returns a bitmask of what had to move
+ * (1 = the visible frame, 4 = the nested safe area) so the caller can WARN.
+ *
+ * WHY A CLAMP AND NOT A REFUSAL.  A safe area that leaves the display is an
+ * invalid advert, and an invalid advert costs the whole CarPlay session.  The
+ * frame is the hard limit and the class/position are the operator's intent, so
+ * the safe box gets pulled back inside and the event is LOGGED.  Before this,
+ * every panel size other than 1280x480 shipped such a box silently (see the
+ * CLUSTER GEOMETRY block: sy+sh = 1055 on a 960-px-tall frame). */
+static int va_fit(va_rect *r, int cw, int chp)
+{
+  int bad = 0;
+  if (!r) return 0;
+  if (r->w <= 0 || r->w > cw){ r->w = cw; bad |= 1; }
+  if (r->h <= 0 || r->h > chp){ r->h = chp; bad |= 1; }
+  if (r->x < 0 || r->x + r->w > cw){ r->x = 0; r->w = cw; bad |= 1; }
+  if (r->y < 0 || r->y + r->h > chp){ r->y = 0; r->h = chp; bad |= 1; }
+  if (r->sw <= 0) { r->sw = r->w; bad |= 4; }
+  if (r->sh <= 0) { r->sh = r->h; bad |= 4; }
+  if (r->sx < 0)  { r->sx = r->x; bad |= 4; }
+  if (r->sy < 0)  { r->sy = r->y; bad |= 4; }
+  if (r->sx < r->x) r->sx = r->x;
+  if (r->sy < r->y) r->sy = r->y;
+  if (r->sx + r->sw > r->x + r->w){ r->sw = r->x + r->w - r->sx; bad |= 4; }
+  if (r->sy + r->sh > r->y + r->h){ r->sh = r->y + r->h - r->sy; bad |= 4; }
+  if (r->sw < 8){ r->sw = 8; bad |= 4; }
+  if (r->sh < 8){ r->sh = 8; bad |= 4; }
+  return bad;
+}
+/* 1 iff the safe area really is inside the (visible) frame.  This is the
+ * invariant the phone checks; the bench asserts it at EVERY scale. */
+static int va_in_frame(const va_rect *r)
+{
+  return r && r->sw > 0 && r->sh > 0 &&
+         r->sx >= r->x && r->sy >= r->y &&
+         r->sx + r->sw <= r->x + r->w &&
+         r->sy + r->sh <= r->y + r->h;
+}
+
 /* Class-safe boxes for the THREE cluster layouts, DERIVED from the classifier
  * rather than invented: each box is placed well inside the class it must land
  * in, with margin against the mm error that moves the cliffs.
@@ -1088,9 +1384,12 @@ static int va_class_near_cliff(int sw, int sh, int cw, int phy_mm){
  * restores the old full-panel/guess behaviour. */
 static void va_preset_rect(int i, int cw, int chp, va_rect *r)
 {
-  int phy = (int)env_num("MIB3_SHIM_CWPHY", 292);
-  int wt  = va_wide_px(cw, phy);
-  int ct  = va_centre_px(cw, phy);
+  geom_t g;
+  int wt, ct;
+  cluster_geom(&g);
+  wt = va_wide_px(cw, g.phy_w);
+  ct = va_centre_px(cw, g.phy_w);
+  (void)ct;
   /* The visible frame stays the FULL panel: reducing it got the 111 stream
    * rejected at activation (rgi, measured). */
   r->x = 0; r->y = 0; r->w = cw; r->h = chp;
@@ -1098,78 +1397,79 @@ static void va_preset_rect(int i, int cw, int chp, va_rect *r)
     /* full-map layout: WIDE, centred, generous margins */
     int sw = cw * 5 / 8, sh = chp * 7 / 12;
     if (sw < wt + wt / 3) sw = wt + wt / 3;
-    if (sh < 242) sh = 242;                     /* ETA floor + margin */
+    if (sh < chp * 242 / 480) sh = chp * 242 / 480;   /* ETA floor + margin, scaled */
     if (sw > cw) sw = cw;
     if (sh > chp) sh = chp;
     r->sx = (cw - sw) / 2; r->sy = (chp - sh) / 2; r->sw = sw; r->sh = sh;
   } else if (i == 1){
-    /* THE TUNED CARD (owner, 2026-10-20, measured on the car): top margin 57,
-     * bottom 55, full platter width.  Measured facts that fix these numbers:
-     *   - the block anchors to the safe box's top and bottom edges, so the
-     *     margins ARE sy and chp-sy-sh -- 40 px clipped the card, 55/57 is right;
-     *   - WIDTH IS A SCALE, not just a box: manoeuvreLayout=topAligned forces
-     *     the centred layout, and a 260 px box shrank the text to one word and
-     *     shrank the ETA too.  So width stays at/above the 300 px clamp ceiling
-     *     (platter = clamp(safeW,165,300)) -- do NOT "narrow it to fit".
-     * Fall back to the derived shape on a panel that is not this size. */
-    int sw = cw * 31 / 100, sh = chp - 105;         /* 397 / 375 on 1280x480 */
-    int centred = 1;
-    if (cw == 1280 && chp == 480){
-      /* THE FINAL CARD, owner-locked 2026-10-20 after tuning on the car:
-       *   x=439 (2 px left of dead centre)  y=50  w=397 (-> 300 px platter)
-       *   h=375  =>  bottom margin 480-(50+375) = 55, the value called perfect.
-       * Why these, so nobody re-derives it:
-       *   - bottom margin = 480-(sy+sh) and it is the ONE predictable knob;
-       *   - the top edge follows the card's HEIGHT, and sh acts near-linearly
-       *     as a zoom (366 -> 420 went from "a bit clipped" to "half clipped"),
-       *     so small steps only;
-       *   - width is a SIZE CLASS at 300 px, not a real width: below 300 iOS
-       *     shrinks the type and clips words, so safeW stays >= 300 (397 here);
-       *   - sx moves the card 1 px at a time; sub-pixel is impossible, the
-       *     safe-area fields are integer pixels at 1x.
-       * Everything except sy/sx is left to the derived fallback on other panels. */
-      sw = 397; sh = 375; r->sx = 439; r->sy = 50; centred = 0;
-    }
-    if (sh < 253) sh = 253;
-    if (sh > chp - 20) sh = chp - 20;
-    if (sw < 165) sw = 165;
-    if (sw > cw) sw = cw;
-    if (centred) r->sx = (cw - sw) / 2;
-    r->sw = sw; r->sh = sh;
+    /* THE TUNED CARD, owner-locked 2026-10-20 at 439,50,397,375 on 1280x480.
+     *
+     * SCALE-INVARIANT (2026-10-20, the 2x lane).  The numbers are expressed as
+     * FRACTIONS of the panel, so the same card lands in the same place, with the
+     * same class, at ANY pixel size.  At 1280x480 they evaluate to the locked
+     * values exactly (1280*397/1280 = 397, 480*375/480 = 375, ...), so the 1x
+     * advert is byte-identical to the shipped one.
+     *
+     * Why the fractions keep the CLASS: the classifier's thresholds are a fixed
+     * FRACTION of the panel width as long as the advertised mm does not change
+     * (wideThrPx = 660 * 0.153mm/(phyMm/pxW) = 34.6 % of the width at 292 mm),
+     * and this card is 31 % of the width -> "centred" at every scale.
+     *
+     * Measured, desk (container, unit CFLite): 1x -> 439,50,397,375;
+     * 1.5x -> 658,75,595,562; 2x -> 878,100,794,750; 2x+SCALE_PHY -> same px.
+     * The old branch produced 883,200,793,855 at 2x (95 px below the frame).
+     *
+     * The four tuning laws still hold, because they are all expressed relative
+     * to the frame: bottom margin = chp-(sy+sh) = 55*chp/480; the top edge
+     * follows sh; width is a size class at 300 px *at 1x* -- at 2x the platter
+     * clamp scales with the panel, so the type keeps its relative size. */
+    r->sw = cw * 397 / 1280;
+    r->sh = chp * 375 / 480;
+    r->sx = cw * 439 / 1280;
+    r->sy = chp * 50  / 480;
+    /* keep the platter at/above its size class, proportionally */
+    if (r->sw < cw * 165 / 1280) r->sw = cw * 165 / 1280;
+    if (r->sh < chp * 253 / 480) r->sh = chp * 253 / 480;
   } else {
     /* third layout (unmeasured): WIDE with a real margin, offset left so the
      * wide-side branch is exercised. */
     int sw = cw * 47 / 100, sh = chp * 62 / 100;
     if (sw < wt + wt / 3) sw = wt + wt / 3;
-    if (sh < 242) sh = 242;
+    if (sh < chp * 242 / 480) sh = chp * 242 / 480;
     if (sw > cw) sw = cw;
     if (sh > chp) sh = chp;
     r->sx = cw / 20; r->sy = (chp - sh) / 2; r->sw = sw; r->sh = sh;
   }
 }
+/* set by va_rect_at when it had to clamp, read (and cleared) by va_build so the
+ * warning can name the area index. */
+static int g_va_fit_bad = 0;
 /* Fill rect i (1-based env name suffix: area 0 -> MIB3_SHIM_VA0). */
 static int va_rect_at(int i, int cw, int chp, va_rect *r)
 {
   char nm[24]; int j = 0; const char *p = "MIB3_SHIM_VA";
+  int got = 0;
+  g_va_fit_bad = 0;
   while (*p && j < (int)sizeof(nm) - 3) nm[j++] = *p++;
   nm[j++] = (char)('0' + (i % 10)); nm[j] = 0;
-  { const char *s = getenv(nm); if (s && s[0] && va_parse_rect(s, r)) return 1; }
-  if (env_on("MIB3_SHIM_VA_PRESET",1)){ va_preset_rect(i, cw, chp, r); return 1; }
-  if (i == 0){                                     /* area 0 = the full panel */
-    r->x = 0; r->y = 0; r->w = cw; r->h = chp;
-    r->sx = 0; r->sy = 0; r->sw = cw; r->sh = chp;
-    return 1;
+  { const char *s = getenv(nm); if (s && s[0] && va_parse_rect(s, r)) got = 1; }
+  if (!got){
+    if (env_on("MIB3_SHIM_VA_PRESET",1)){
+      va_preset_rect(i, cw, chp, r);
+      got = 1;
+    } else if (i == 0){                              /* area 0 = the full panel */
+      r->x = 0; r->y = 0; r->w = cw; r->h = chp;
+      r->sx = 0; r->sy = 0; r->sw = cw; r->sh = chp;
+      got = 1;
+    } else {
+      va_rect g; va_parse_rect(VA_GAUGE_SAFE, &g);   /* provisional default */
+      r->x = 0; r->y = 0; r->w = cw; r->h = chp;
+      r->sx = g.sx; r->sy = g.sy; r->sw = g.sw; r->sh = g.sh;
+    }
   }
-  { va_rect g; va_parse_rect(VA_GAUGE_SAFE, &g);   /* provisional default */
-    r->x = 0; r->y = 0; r->w = cw; r->h = chp;
-    r->sx = g.sx; r->sy = g.sy; r->sw = g.sw; r->sh = g.sh;
-    /* clamp to the real panel so an odd size can never yield a safeArea that
-     * lies outside the display */
-    if (r->sx < 0) r->sx = 0;
-    if (r->sy < 0) r->sy = 0;
-    if (r->sw > cw - r->sx) r->sw = cw - r->sx;
-    if (r->sh > chp - r->sy) r->sh = chp - r->sy;
-  }
+  /* EVERY path ends here: a box that leaves the frame is invalid advert, so it
+   * is pulled inside and the event is logged (never shipped silently). */
+  g_va_fit_bad = va_fit(r, cw, chp);
   return 1;
 }
 /* One area dict: visible rect + nested safeArea (+ optional
@@ -1201,8 +1501,21 @@ static CFMutableDictionaryRef va_build_one(const va_rect *r)
   if (p_CFRelease) p_CFRelease(safe);
   return area;
 }
-/* one "visible=x,y,w,h safe=x,y,w,h" line, no allocation, then the CLASSIFIER
- * verdict for this box (see the CLASSIFIER block: 0 = blank cluster). */
+/* one "visible=x,y,w,h safe=x,y,w,h" line, the SAFE-AREA-IN-FRAME verdict, then
+ * the CLASSIFIER verdict for this box (see the CLASSIFIER block: 0 = blank
+ * cluster).
+ *
+ * The rect line prints SIGNED numbers: it used to clamp negatives to 0, which
+ * is how a safe area ending 95 px below the frame still read as a plausible
+ * "safe=883,200,793,855" for two car sessions. */
+static void va_put_int(char *b, int *k, int x)
+{
+  char d[12]; int m = 0;
+  if (x < 0){ b[(*k)++] = '-'; x = -x; }
+  if (!x) d[m++] = '0';
+  while (x){ d[m++] = (char)('0' + (x % 10)); x /= 10; }
+  while (m) b[(*k)++] = d[--m];
+}
 static void va_log_rect(int i, const va_rect *r, int cw)
 {
   char b[160]; int k = 0; int v[8]; int q, j;
@@ -1212,28 +1525,27 @@ static void va_log_rect(int i, const va_rect *r, int cw)
     const char *t = q ? " safe=" : "visible=";
     while (*t) b[k++] = *t++;
     for (j = 0; j < 4; j++){
-      int x = v[q*4 + j]; char d[12]; int m = 0;
-      if (x < 0) x = 0;
-      if (!x) d[m++] = '0';
-      while (x){ d[m++] = (char)('0' + (x % 10)); x /= 10; }
       if (j) b[k++] = ',';
-      while (m) b[k++] = d[--m];
+      va_put_int(b, &k, v[q*4 + j]);
     }
   }
   b[k] = 0;
   logkv("cluster/va","area index",(u64)(u32)i,0);
   logline("cluster/va/rect", b);
+  /* THE invariant the phone checks: is the safe area inside the frame? */
+  logkv("cluster/va","  safefit(1=inside)",(u64)(unsigned)va_in_frame(r),0);
   /* the phone's own verdict on this box, computed BEFORE the session so the car
    * tells us what it will draw instead of us guessing from the picture */
-  { int phy = (int)env_num("MIB3_SHIM_CWPHY", 292);
-    int cls = va_class_of(r->sw, r->sh, cw, phy);
+  { geom_t g; int cls;
+    cluster_geom(&g);
+    cls = va_class_of(r->sw, r->sh, cw, g.phy_w);
     logkv("cluster/va","class (0=BLANK 1=centred 2=wide)",(u64)(u32)cls,0);
     logkv("cluster/va","  safeW",(u64)(u32)r->sw,0);
     logkv("cluster/va","  safeH",(u64)(u32)r->sh,0);
-    logkv("cluster/va","  wideThrPx",(u64)(u32)va_wide_px(cw, phy),0);
-    logkv("cluster/va","  centreThrPx(safeH)",(u64)(u32)va_centre_px(cw, phy),0);
-    logkv("cluster/va","  etaOk(safeH>202)",(u64)(unsigned)(r->sh > 202),0);
-    logkv("cluster/va","  nearCliff(<=10%)",(u64)(unsigned)va_class_near_cliff(r->sw, r->sh, cw, phy),0); }
+    logkv("cluster/va","  wideThrPx",(u64)(u32)va_wide_px(cw, g.phy_w),0);
+    logkv("cluster/va","  centreThrPx(safeH)",(u64)(u32)va_centre_px(cw, g.phy_w),0);
+    logkv("cluster/va","  etaOk(safeH>202)",(u64)(unsigned)(r->sh > va_eta_px(cw, g.phy_w)),0);
+    logkv("cluster/va","  nearCliff(<=10%)",(u64)(unsigned)va_class_near_cliff(r->sw, r->sh, cw, g.phy_w),0); }
 }
 
 /* The multi-area `viewAreas` array.  Returns +1 owned by the caller.  Logs one
@@ -1244,6 +1556,7 @@ static CFMutableArrayRef va_build(int cw, int chp)
   fn_CFArrayCreateMutable mka = (fn_CFArrayCreateMutable)R("CFArrayCreateMutable");
   CFMutableArrayRef va;
   int n = va_count(), i;
+  int clamped = 0, classes[8], nclass = 0;
   if (!mka || !p_kCFTypeArrayCallBacks || !p_CFArrayAppendValue) return 0;
   va = mka(0, n, p_kCFTypeArrayCallBacks);
   if (!va) return 0;
@@ -1261,8 +1574,31 @@ static CFMutableArrayRef va_build(int cw, int chp)
     p_CFArrayAppendValue(va, a);       /* array retains */
     if (p_CFRelease) p_CFRelease(a);
     va_log_rect(i, &r, cw);
+    if (g_va_fit_bad){
+      clamped++;
+      logkv("cluster/va","  WARN clamped (1=visible 4=safe)",(u64)(u32)g_va_fit_bad,0);
+    }
+    if (nclass < 8){
+      geom_t g; cluster_geom(&g);
+      classes[nclass++] = va_class_of(r.sw, r.sh, cw, g.phy_w);
+    }
   }
   logkv("cluster/va","count declared",(u64)(unsigned)p_CFArrayGetCount(va),0);
+  /* ONE summary line per advert.  These two numbers are what the desk bench
+   * asserts at every scale:
+   *   boxes clamped  -- must be 0: an advert whose safe area leaves the frame is
+   *                     invalid and can cost the whole session (2026-10-20);
+   *   classes        -- must be the SAME sequence at every scale while the
+   *                     advertised mm is unchanged, because the classifier's
+   *                     cliffs are a fraction of the frame. */
+  { char b[80]; int k = 0, j;
+    logkv("cluster/va","out-of-frame boxes clamped",(u64)(u32)clamped,0);
+    for (j = 0; j < nclass; j++){
+      if (j) b[k++] = ',';
+      b[k++] = (char)('0' + (classes[j] & 7));
+    }
+    b[k] = 0;
+    logline("cluster/va/classes", b); }
   return va;
 }
 
@@ -1776,6 +2112,159 @@ static int info_complete(CFMutableDictionaryRef info){
 }
 
 /* ==========================================================================
+ * THE ADVERT SELF-CHECK (2026-10-20, the 2x lane).
+ *
+ * WHY.  The 2x experiment on the car could not be interpreted, because nothing
+ * ever checked that the advert we built was INTERNALLY CONSISTENT -- and it was
+ * not (see the CLUSTER GEOMETRY block: at 2x a safe area ended 95 px below the
+ * frame, invisibly, for two whole sessions).  A single malformed `displays`
+ * entry costs the WHOLE CarPlay session, so "the phone refused 2x" and "our
+ * advert was broken" are indistinguishable without this.
+ *
+ * WHAT IT ASSERTS (all of it from the dict we are about to serialise):
+ *   - exactly one type-111 entry, and its pixel/physical size;
+ *   - every declared view area's safeArea INSIDE its visible frame, and
+ *     initialViewArea inside the declared count;
+ *   - initialVideoStreams present and NON-empty (an empty array is a 0 s session);
+ *   - displayPanels: one panel per display, with the SAME pixel and physical
+ *     geometry as the display it describes, and `showsInstruments` on the cluster
+ *     panel;
+ *   - extendedFeatures carries altScreen + viewAreas, and altScreen is only
+ *     claimed when >= 2 displays exist (the both-ways contract that kills a
+ *     session otherwise).
+ *
+ * Runs on every /info by default (MIB3_SHIM_INFOCHECK=0 disables) and is also
+ * exported for the desk bench, so the SAME code judges the advert on the desk
+ * and on the car.  Log tag: `infocheck`.  `mismatch=0` is the only good value.
+ * ========================================================================*/
+static int ic_in_frame(CFTypeRef area, CFTypeRef *safeOut)
+{
+  CFTypeRef s;
+  int vx, vy, vw, vh, sx = 0, sy = 0, sw = 0, sh = 0;
+  if (!is_dict(area)) return -1;
+  vx = (int)dgeti64k((CFDictionaryRef)area, "originXPixels", 0);
+  vy = (int)dgeti64k((CFDictionaryRef)area, "originYPixels", 0);
+  vw = (int)dgeti64k((CFDictionaryRef)area, "widthPixels", 0);
+  vh = (int)dgeti64k((CFDictionaryRef)area, "heightPixels", 0);
+  s  = dgetk((CFDictionaryRef)area, "safeArea");
+  if (safeOut) *safeOut = s;
+  if (!is_dict(s)) return -1;
+  sx = (int)dgeti64k((CFDictionaryRef)s, "originXPixels", 0);
+  sy = (int)dgeti64k((CFDictionaryRef)s, "originYPixels", 0);
+  sw = (int)dgeti64k((CFDictionaryRef)s, "widthPixels", 0);
+  sh = (int)dgeti64k((CFDictionaryRef)s, "heightPixels", 0);
+  if (vw <= 0 || vh <= 0 || sw <= 0 || sh <= 0) return 0;
+  return (sx >= vx && sy >= vy && sx + sw <= vx + vw && sy + sh <= vy + vh) ? 1 : 0;
+}
+static int ic_arr_has(CFTypeRef arr, const char *want)
+{
+  CFIndex i, n;
+  if (!is_array(arr) || !p_CFStringGetCString) return 0;
+  n = p_CFArrayGetCount((CFArrayRef)arr);
+  for (i = 0; i < n; i++){
+    CFTypeRef s = p_CFArrayGetValueAtIndex((CFArrayRef)arr, i);
+    char tmp[64]; int k = 0;
+    if (!s) continue;
+    tmp[0] = 0;
+    if (!p_CFStringGetCString((CFStringRef)s, tmp, sizeof(tmp), K128)) continue;
+    while (want[k] && tmp[k] && want[k] == tmp[k]) k++;
+    if (want[k] == 0 && tmp[k] == 0) return 1;
+  }
+  return 0;
+}
+static int info_check(CFMutableDictionaryRef info)
+{
+  CFTypeRef dv, cl = 0, va, pa, ef;
+  CFIndex n = 0, i;
+  int cli = -1, areas = 0, inside = 0, ix = -1, ivs = 0;
+  int ctype = 0, cw = 0, ch = 0, cpw = 0, cph = 0;
+  int panels = 0, wm = 0, hm = 0, pm = 0, mk = 0;
+  int alt = 0, vaf = 0, mismatch = 0;
+  info_keys_init();
+  if (!g_info_keys_ready) return 0;
+  if (!info){ logline("infocheck","no dict"); return 0; }
+  dv = dgetk(info, "displays");
+  if (!is_array(dv)){ logline("infocheck","no displays array"); return 0; }
+  n = p_CFArrayGetCount((CFArrayRef)dv);
+  for (i = 0; i < n; i++){
+    CFTypeRef e = p_CFArrayGetValueAtIndex((CFArrayRef)dv, i);
+    if (!is_dict(e)) continue;
+    if ((int)dict_i64((CFDictionaryRef)e, g_k_type) == MIB3_CLUSTER_TYPE){ cl = e; cli = (int)i; break; }
+  }
+  if (!cl){
+    logline("infocheck","no cluster entry -- nothing to check (publishes nothing)");
+    return 0;
+  }
+  ctype = (int)dict_i64((CFDictionaryRef)cl, g_k_type);
+  cw  = (int)dgeti64k((CFDictionaryRef)cl, "widthPixels", 0);
+  ch  = (int)dgeti64k((CFDictionaryRef)cl, "heightPixels", 0);
+  cpw = (int)dgeti64k((CFDictionaryRef)cl, "widthPhysical", 0);
+  cph = (int)dgeti64k((CFDictionaryRef)cl, "heightPhysical", 0);
+  /* initialVideoStreams: present and NON-empty */
+  { CFTypeRef v = dgetk((CFDictionaryRef)cl, "initialVideoStreams");
+    if (is_array(v)) ivs = (int)p_CFArrayGetCount((CFArrayRef)v); }
+  if (ivs < 1) mismatch++;
+  /* view areas: count, every safeArea inside its frame, initial index in range */
+  va = dgetk((CFDictionaryRef)cl, "viewAreas");
+  if (is_array(va)){
+    areas = (int)p_CFArrayGetCount((CFArrayRef)va);
+    for (i = 0; i < areas; i++){
+      CFTypeRef a = p_CFArrayGetValueAtIndex((CFArrayRef)va, i);
+      if (ic_in_frame(a, 0) == 1) inside++;
+    }
+  }
+  ix = (int)dgeti64k((CFDictionaryRef)cl, "initialViewArea", 0);
+  if (areas < 1 || inside != areas) mismatch++;
+  if (ix < 0 || (areas > 0 && ix >= areas)) mismatch++;
+  /* displayPanels: one per display, same geometry as the display, cluster marked */
+  pa = dgetk(info, "displayPanels");
+  if (is_array(pa)){
+    panels = (int)p_CFArrayGetCount((CFArrayRef)pa);
+    for (i = 0; i < panels && i < n; i++){
+      CFTypeRef p = p_CFArrayGetValueAtIndex((CFArrayRef)pa, i);
+      CFTypeRef d = p_CFArrayGetValueAtIndex((CFArrayRef)dv, i);
+      CFTypeRef pr;
+      if (!is_dict(p) || !is_dict(d)) continue;
+      if ((int)dgeti64k((CFDictionaryRef)p, "widthPixels", -1)  == (int)dgeti64k((CFDictionaryRef)d, "widthPixels", -2))  wm++;
+      if ((int)dgeti64k((CFDictionaryRef)p, "heightPixels", -1) == (int)dgeti64k((CFDictionaryRef)d, "heightPixels", -2)) hm++;
+      if ((int)dgeti64k((CFDictionaryRef)p, "widthPhysical", -1) == (int)dgeti64k((CFDictionaryRef)d, "widthPhysical", -2) &&
+          (int)dgeti64k((CFDictionaryRef)p, "heightPhysical", -1) == (int)dgeti64k((CFDictionaryRef)d, "heightPhysical", -2)) pm++;
+      pr = dgetk((CFDictionaryRef)p, "properties");
+      if (ic_arr_has(pr, "showsInstruments")) mk++;
+    }
+    if (panels != (int)n) mismatch++;
+    if (wm != panels || hm != panels || pm != panels) mismatch++;
+  } else mismatch++;
+  /* features: both-ways contract with the display count */
+  ef = dgetk(info, "extendedFeatures");
+  alt = ic_arr_has(ef, "altScreen");
+  vaf = ic_arr_has(ef, "viewAreas");
+  if (!alt || !vaf) mismatch++;
+  if (alt && (int)n < 2) mismatch++;
+  (void)ctype;
+  logkv("infocheck","displays",(u64)(unsigned)n,0);
+  logkv("infocheck","cluster index",(u64)(unsigned)cli,0);
+  logkv("infocheck","cluster type",(u64)(unsigned)ctype,0);
+  logkv("infocheck","cluster w",(u64)(unsigned)cw,0);
+  logkv("infocheck","cluster h",(u64)(unsigned)ch,0);
+  logkv("infocheck","cluster wPhys",(u64)(unsigned)cpw,0);
+  logkv("infocheck","cluster hPhys",(u64)(unsigned)cph,0);
+  logkv("infocheck","cluster initialVideoStreams",(u64)(unsigned)ivs,0);
+  logkv("infocheck","viewAreas declared",(u64)(unsigned)areas,0);
+  logkv("infocheck","viewAreas inside frame",(u64)(unsigned)inside,0);
+  logkv("infocheck","initialViewArea",(u64)(unsigned)ix,0);
+  logkv("infocheck","panels",(u64)(unsigned)panels,0);
+  logkv("infocheck","panels size match",(u64)(unsigned)wm,0);
+  logkv("infocheck","panels phys match",(u64)(unsigned)pm,0);
+  logkv("infocheck","panels showsInstruments",(u64)(unsigned)mk,0);
+  logkv("infocheck","extFeatures altScreen",(u64)(unsigned)alt,0);
+  logkv("infocheck","extFeatures viewAreas",(u64)(unsigned)vaf,0);
+  logkv("infocheck","VERDICT mismatch",(u64)(unsigned)mismatch,0);
+  return mismatch == 0;
+}
+
+
+/* ==========================================================================
  * Cluster (type 111) STREAM handling.
  *
  * The unit's stream SETUP dispatcher (inside AirPlayReceiverSessionSetup)
@@ -1840,10 +2329,6 @@ static int cl_stream_add(void *s){
   for (i=0;i<MIB3_MAX_CL_STREAMS;i++) if (g_cl_streams[i]==s) return 0;
   for (i=0;i<MIB3_MAX_CL_STREAMS;i++) if (!g_cl_streams[i]){ g_cl_streams[i]=s; return 0; }
   return -1;
-}
-static void cl_stream_remove(void *s){
-  int i; if (!s) return;
-  for (i=0;i<MIB3_MAX_CL_STREAMS;i++) if (g_cl_streams[i]==s){ g_cl_streams[i]=0; return; }
 }
 static int cl_stream_has(void *s){
   int i; if (!s) return 0;
@@ -2084,6 +2569,96 @@ static void cluster_send_forcekeyframe(void *session, const char *why)
   logline("cluster/cmd/idr-why", why);
   if (p_CFRelease) p_CFRelease(p);
 }
+/* CLOCK, monotonic, milliseconds -- used by the recovery-point pump.
+ * Prefers the libc symbol; falls back to syscall(2) so nothing here depends on a
+ * libc header (this file is built -nostdlib).  If BOTH are unavailable the pump
+ * cannot time anything, so say so once -- a silently disabled fix is the worst
+ * outcome (that mistake has already cost a session: see MIB3_SHIM_CMDALIVE). */
+typedef struct { long sec; long nsec; } mib3_ts;
+static long (*p_clock_gettime)(int, void*);
+static int  g_clock_warned = 0;
+static u64 mono_ms(void)
+{
+  mib3_ts t;
+  t.sec = 0; t.nsec = 0;
+  if (p_clock_gettime) p_clock_gettime(1 /*CLOCK_MONOTONIC*/, &t);
+  else if (p_syscall)  p_syscall(113 /*__NR_clock_gettime*/, 1, &t);
+  else if (!g_clock_warned) { g_clock_warned = 1; logline("cluster/cmd","NO CLOCK -- periodic recovery points DISABLED"); }
+  return (u64)t.sec * 1000u + (u64)t.nsec / 1000000u;
+}
+
+/* ==========================================================================
+ * PERIODIC RECOVERY POINTS -- THE MISSING INGREDIENT OF THE CLUSTER PICTURE
+ * (2026-10-27, measured)
+ *
+ * Every H.264 stream this cluster ECU sustains carries a recovery point at a
+ * fixed short cadence, and the phone's does not:
+ *
+ *   stream                              IDRs                 cadence      held?
+ *   the car's own nav (multi-screen-   17 of 81 AUs          every 5 AUs  yes
+ *     server, captured 2026-10-26)                            (500 ms @10fps)
+ *   the known-good test pattern        5 of 50 frames        every 12     yes (40 s)
+ *     (pathb_base.264)                                        (1.2 s @10fps)
+ *   the phone's live stream            2 of 2077 AUs         one at start NO  (0.5-1 s
+ *     (w7.bin, 2026-10-27 field run)                          + our own      then the
+ *                                                             start-request  placeholder)
+ *
+ * So the picture appeared and then fell back not because of framing, pacing,
+ * SPS, profile or rate -- all of those were measured and eliminated -- but
+ * because after the first ~0.5 s the ECU had no keyframe to decode from.  It is
+ * exactly the interval the other MHI2 implementation tunes: their "40 FPS
+ * display optimisation" for the 791 cluster is a two-byte change from a forced
+ * IDR every 20 frames to every 5 (core.so offsets 0x4370/0x452c), and their
+ * bridge requests a fresh IDR on latency recovery.
+ *
+ * We already have the verb: forceKeyFrame{params:{uuid}} (rc=0 measured, and it
+ * is answered in ~3 access units -- w7.bin shows the second IDR at AU index 3
+ * from the requests we sent at stream start).  What was missing is the CADENCE:
+ * today it fires only at stream-start / first-IDR / helper-connect, i.e. once.
+ *
+ * MIB3_SHIM_IDR_MS sets the target interval (default 500 ms == the car's own
+ * 10 fps/5-frame cadence; 0 disables it).  A request is only sent while video
+ * is actually flowing and only while no IDR has arrived inside the interval, so
+ * a phone that honours it costs one command per interval and nothing else.
+ */
+static u64  g_kf_seen_ms;      /* when the last IDR ARRIVED (0 = none yet) */
+static u64  g_kf_req_ms;       /* when we last ASKED */
+static u64  g_kf_reqs;         /* requests shipped */
+static u64  g_kf_idrs;         /* IDRs observed */
+static u64  g_au_last_ms;      /* when the last video AU ARRIVED */
+
+static void cluster_idr_pump(void *session)
+{
+  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!g_kf_seen_ms) return;                       /* the start sequence owns the first one */
+  int iv = (int)env_num("MIB3_SHIM_IDR_MS", 500);
+  if (iv <= 0) return;
+  u64 now = mono_ms();
+  /* the phone is quiet when the map is static: asking then is pointless (there
+   * is no picture to refresh) and would only churn the command channel. */
+  if (g_au_last_ms && (now - g_au_last_ms) > 2000) return;
+  if ((now - g_kf_seen_ms) < (u64)iv) return;      /* a recovery point is still fresh */
+  if (g_kf_req_ms && (now - g_kf_req_ms) < (u64)iv) return;  /* one request per interval */
+  g_kf_req_ms = now;
+  g_kf_reqs++;
+  cluster_send_forcekeyframe(session, "periodic-recovery-point");
+}
+
+/* Poll the stream socket for at most `wait_ms`, then let the recovery-point
+ * pump run.  Without this the receiver thread blocks in read() for as long as
+ * the phone is quiet and NOTHING can be requested exactly when a fresh
+ * recovery point is most needed.  Returns 1 when the socket is readable. */
+static int cluster_wait_frame(int fd, void *session, int wait_ms)
+{
+  struct pollfd { int fd; short events; short revents; } pfd;
+  extern int poll(void*, unsigned long, int);
+  int pr;
+  pfd.fd = fd; pfd.events = 1 /*POLLIN*/; pfd.revents = 0;
+  pr = poll(&pfd, 1, wait_ms);
+  cluster_idr_pump(session);
+  return pr > 0;
+}
+
 static void cluster_send_nightmode(void *session)
 {
   if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
@@ -2418,13 +2993,13 @@ static void *zoom_listen_thread(void *arg)
   const char *path = (const char*)arg;
   struct sun { unsigned short family; char p[108]; };
   struct sun sa;
-  int fd, conn, i;
+  int fd, conn;
   logline("cluster/zoom","listener starting");
   unlink(path);
   fd = socket(1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
   if (fd < 0){ logline("cluster/zoom","socket() failed"); return 0; }
   { unsigned char *q = (unsigned char*)&sa;
-    for (i = 0; i < (int)sizeof(sa); i++) q[i] = 0;
+    memset(q, 0, sizeof(sa));
     sa.family = 1;
     { unsigned long n = 0; while (path[n] && n < sizeof(sa.p)-1){ sa.p[n] = path[n]; n++; } }
   }
@@ -2640,7 +3215,7 @@ static unsigned avcc_config_to_annexb(const unsigned char *a, unsigned len,
       size = ((unsigned)a[i] << 8) | a[i+1]; i += 2;
       if (!size || size > len - i || cap - o < 4 || size > cap - o - 4) return 0;
       out[o] = out[o+1] = out[o+2] = 0; out[o+3] = 1;
-      { unsigned k; for (k = 0; k < size; k++) out[o+4+k] = a[i+k]; }
+      memcpy(out + o + 4, a + i, size);
       o += 4 + size; i += size;
     }
     if (group == 0){ if (i == len) return 0; count = a[i++]; }
@@ -2762,7 +3337,7 @@ static void *cluster_thread(void *arg){
       unsigned char *rbuf = 0; unsigned long rcap = 0;
       unsigned char cxbuf[512];
       long frames = 0, configs = 0, others = 0, idrs = 0;
-      int stop = 0, have_cfg = 0, first_idr_sent = 0;
+      int stop = 0, first_idr_sent = 0;
       unsigned char ls = g_cl_ls;
       logkv("cluster/thread","cipher",(u64)(u32)c->cipher,0);
       while (!stop){
@@ -2777,7 +3352,12 @@ static void *cluster_thread(void *arg){
         /* Appearance updates queued by the same inbox ("a map|ui mode setting"). */
         mib3shim_appear_pump(c->session, 1);
         /* 128-byte screen header (bodySize u32 LE @0, opcode @4) */
-        while (got < 128){ n = read(connfd, hdr + got, 128 - got); if (n <= 0){ logkv("cluster/thread","hdr read ended (0=EOF,1=err)",(u64)(n==0?0:1),0); logkv("cluster/thread","  bytes got",(u64)got,0); stop = 1; break; } got += n; }
+        while (got < 128){
+          /* PERIODIC RECOVERY POINTS: wait at most 100 ms, then run the pump.
+           * A blocking read() would hide the phone's silences from us -- and a
+           * silence is exactly when the ECU needs a keyframe. */
+          if (got == 0 && !cluster_wait_frame(connfd, c->session, 100)) continue;
+          n = read(connfd, hdr + got, 128 - got); if (n <= 0){ logkv("cluster/thread","hdr read ended (0=EOF,1=err)",(u64)(n==0?0:1),0); logkv("cluster/thread","  bytes got",(u64)got,0); stop = 1; break; } got += n; }
         if (stop) break;
         {
           unsigned bs = (unsigned)(unsigned char)hdr[0] | ((unsigned)(unsigned char)hdr[1] << 8) |
@@ -2792,7 +3372,7 @@ static void *cluster_thread(void *arg){
               while (newsz < bs) newsz <<= 1;
               unsigned char *nb2 = (unsigned char*)p_malloc(newsz);
               if (!nb2){ logline("cluster/thread","body alloc failed"); break; }
-              { unsigned long k; for (k = 0; k < rcap; k++) nb2[k] = rbuf[k]; }
+              memcpy(nb2, rbuf, rcap);
               if (p_free && rbuf) p_free(rbuf);
               rbuf = nb2; rcap = newsz;
             } else { logline("cluster/thread","no malloc"); break; }
@@ -2815,7 +3395,7 @@ static void *cluster_thread(void *arg){
             { unsigned char cfgout[4096]; unsigned cfglen = 0;
               unsigned nls = avcc_config_to_annexb(rbuf, bs, cfgout, sizeof(cfgout), &cfglen);
               if (nls){
-                ls = (unsigned char)nls; g_cl_ls = ls; have_cfg = 1;
+                ls = (unsigned char)nls; g_cl_ls = ls;
                 { unsigned long k; for (k = 0; k < cfglen && k < sizeof(g_cl_cfg_annexb); k++)
                     g_cl_cfg_annexb[k] = cfgout[k]; }
                 g_cl_cfg_len = cfglen < sizeof(g_cl_cfg_annexb) ? cfglen : sizeof(g_cl_cfg_annexb);
@@ -2856,8 +3436,11 @@ static void *cluster_thread(void *arg){
             if (dec_ok && pl > 0){
               int is_idr = 0;
               if (avcc_prepare(rbuf, (unsigned long)pl, ls, &is_idr) == 0){
+                g_au_last_ms = mono_ms();
                 if (is_idr){
                   idrs++;
+                  g_kf_idrs++;
+                  g_kf_seen_ms = g_au_last_ms;      /* the recovery point is now on the wire */
                   if (!first_idr_sent){
                     first_idr_sent = 1;
                     logkv("cluster/thread","FIRST IDR at frame",(u64)frames,0);
@@ -2905,6 +3488,15 @@ static void *cluster_thread(void *arg){
               logkv("cluster/thread","body",(u64)bs,0);
               logkv("cluster/thread","plain",(u64)pl,0);
               logline("cluster/thread/plain-head", hs);   /* want 00000001 (Annex-B NAL) */
+              /* the helper-hop totals on the same marker (2026-10-26): the
+               * DECODER prints its own counters (parse/ausz/kdrop/qdrop/awt)
+               * -- diffing `sent total` here against `ausz` there, per window,
+               * is the ONLY way to see AUs lost between the two processes.
+               * `dropped total` must stay 0 in a healthy session; any nonzero
+               * value here with qdrop=0 there is the artifact mechanism
+               * hiding in plain sight. */
+              logkv("cluster/thread","helper sent total",(u64)hlp_sent,0);
+              logkv("cluster/thread","helper dropped total",(u64)hlp_drop,0);
             }
           } else {
             others++;   /* opcodes 2/4/5: keepalive/misc -- previously ignored.
@@ -2937,7 +3529,8 @@ static void *cluster_thread(void *arg){
               logkv("cluster/ctl","bodySize",(u64)bs,0);
               if (op == 2)      logline("cluster/ctl/meaning","opcode 2 = stock-ignored keepalive/misc (no error, no state change)");
               else if (op == 4) logline("cluster/ctl/meaning","opcode 4 = stock-ignored keepalive/misc (no error, no state change)");
-              else if (op == 5) logline("cluster/ctl/meaning","opcode 5 = stock-ignored telemetry/keepalive (no error, no state change)");
+              else if (op == 5) { logline("cluster/ctl/meaning","opcode 5 = SENDER TELEMETRY (binary plist: encoderCurrentFPS/sinkOverflowDropFPS/rttAvg/txUsageAvg) -- inert to us, but it is the phone telling us its own rate");
+                                   ctl5_dump(rbuf, (unsigned long)bs); }
               else              logline("cluster/ctl/meaning","UNKNOWN opcode (stock returns -6727 '### Unknown screen opcode')");
               logline("cluster/ctl/hdr-head", hs);
               logline("cluster/ctl/body-head", bh); } }
@@ -2945,6 +3538,8 @@ static void *cluster_thread(void *arg){
       }
       logkv("cluster/thread","frames total",(u64)frames,0);
       logkv("cluster/thread","idrs total",(u64)idrs,0);
+      logkv("cluster/thread","keyframe requests total",g_kf_reqs,0);
+      logkv("cluster/thread","idr refresh target ms",(u64)(int)env_num("MIB3_SHIM_IDR_MS",500),0);
       logkv("cluster/thread","configs",(u64)configs,0);
       logkv("cluster/thread","other-opcodes",(u64)others,0);
       if (p_free && rbuf) p_free(rbuf);
@@ -2995,8 +3590,7 @@ static int own_listen(int *out_port, int *out_gen){
   struct in6 { unsigned char b[16]; };
   struct sa6 { unsigned short family, port; unsigned int flow; struct in6 addr; unsigned int scope; };
   int fd, one = 1;
-  struct sa6 sa, got; unsigned int glen = sizeof(got), i;
-  unsigned char *p;
+  struct sa6 sa, got; unsigned int glen = sizeof(got);
   /* port chain: explicit knob -> 5000 (fw-allowlisted, stock-observed free) ->
    * 6031 (MHI3-native alt; fw-DROPPED, needs cluster_port_fw.sh) -> ephemeral
    * (fw-DROPPED, needs cluster_port_fw.sh).  Log every attempt so the log
@@ -3026,7 +3620,7 @@ static int own_listen(int *out_port, int *out_gen){
   { int zero = 0;
     int r = setsockopt(fd, 41 /*IPPROTO_IPV6*/, 26 /*IPV6_V6ONLY*/, &zero, sizeof(zero));
     logkv("cluster/listen","IPV6_V6ONLY=0 rc",(u64)(u32)r,0); }
-  p = (unsigned char*)&sa; for (i = 0; i < sizeof(sa); i++) p[i] = 0;
+  memset(&sa, 0, sizeof(sa));
   sa.family = 10;
   { int ci; int bound = 0;
     for (ci = 0; ci < nc && !bound; ci++){
@@ -3071,8 +3665,8 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   /* Stream key: mirror stock _ScreenSetup (corpus libAirPlay case 0x6e) --
    * AES when session+0x478==0, else chacha via the unit's FUN_001163d8.
    * AES: 16-byte key at [0..16) + 16-byte IV at [16..32). */
-  unsigned char skey[32]; int keylen = 0, cipher = 0, i;
-  for (i = 0; i < 32; i++) skey[i] = 0;
+  unsigned char skey[32]; int keylen = 0, cipher = 0;
+  memset(skey, 0, 32);
   if (*(void**)((char*)session + 0x478) == 0){
     if (p_DeriveAES){ p_DeriveAES((char*)session + 0x268, 0x10, connID, skey, skey + 16);
                       keylen = 16; cipher = 1; logline("cluster","key: AES-CTR"); }
@@ -3162,7 +3756,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   cl_ctx *c = (cl_ctx*)p_malloc(sizeof(cl_ctx));
   if (!c){ logline("cluster","ctx alloc failed"); goto fail_sock; }
   c->screen = 0; c->lsock = lsock; c->lsockgen = lgen; c->session = session; c->stream = 0;
-  { int j; for (j = 0; j < 32; j++) c->key[j] = skey[j]; }
+  memcpy(c->key, skey, 32);
   c->keylen = keylen; c->cipher = cipher; c->counter = 0;
   c->night = g_night_mode; c->aes_inited = 0;
   g_cmd_session = session;   /* the command target once the stream connects */
@@ -3235,17 +3829,11 @@ static void resolve_gfx(void){
   if (g_gfx.resolved) return;
   g_gfx.resolved = 1;
   p_wl_display_connect   = (fn_wl_connect)       R("wl_display_connect");
-  p_wl_display_disconnect= (fn_wl_disp_void)     R("wl_display_disconnect");
-  p_wl_display_get_fd    = (fn_wl_disp_int)      R("wl_display_get_fd");
   p_wl_display_roundtrip = (fn_wl_disp_int)      R("wl_display_roundtrip");
-  p_wl_display_dispatch_pending = (fn_wl_disp_int)R("wl_display_dispatch_pending");
-  p_wl_display_flush     = (fn_wl_disp_int)      R("wl_display_flush");
   p_wl_pmc               = (fn_wl_pmc)           R("wl_proxy_marshal_constructor");
   p_wl_pmcv              = (fn_wl_pmcv)          R("wl_proxy_marshal_constructor_versioned");
   p_wl_proxy_add_listener= (fn_wl_add_listener)  R("wl_proxy_add_listener");
-  p_wl_proxy_destroy     = (fn_wl_destroy)       R("wl_proxy_destroy");
   p_wl_egl_window_create = (fn_wl_eglwin_create) R("wl_egl_window_create");
-  p_wl_egl_window_destroy= (fn_wl_eglwin_destroy)R("wl_egl_window_destroy");
   p_eglGetDisplay        = (fn_eglGetDisplay)    R("eglGetDisplay");
   p_eglInitialize        = (fn_eglInitialize)    R("eglInitialize");
   p_eglBindAPI           = (fn_eglBindAPI)       R("eglBindAPI");
@@ -3431,9 +4019,27 @@ static void run_banner(void){
   bs(&b,"  VA_COUNT="); bu64(&b,(u64)(unsigned)va_count(),10,0);
   bs(&b,"  VA_PRESET="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_PRESET",1),10,0);
   bs(&b,"  VA_INITIAL="); bu64(&b,(u64)(unsigned)env_num("MIB3_SHIM_VA_INITIAL",1),10,0);
-  bs(&b,"  VA_COUNT="); bu64(&b,(u64)(u32)va_count(),10,0);
   bs(&b,"  VA_CMD="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_CMD",1),10,0);
   bs(&b,"  VA_VISIBLE="); bu64(&b,(u64)env_on("MIB3_SHIM_VA_VISIBLE",0),10,0);
+  /* The frame-rate CEILING we advertise for the cluster, and whether the phone's
+   * own telemetry will be recorded.  Both are on the banner because both were
+   * invisible knobs in a session that needed them: FPS decides what the phone
+   * will encode at (the leading suspect for the remaining cluster defect) and
+   * CTL5 is the only channel that reports the rate it actually achieved. */
+  bs(&b,"  FPS="); bu64(&b,(u64)(u32)env_num("MIB3_SHIM_FPS",60),10,0);
+  ctl5_resolve();
+  bs(&b,"  CTL5="); bu64(&b,(u64)(u32)(ctl5_want > 0 ? 1 : 0),10,0);
+  /* geometry, on every plug: the 2x experiment was run without knowing what the
+   * phone was told about the panel's PHYSICAL size, i.e. without its density. */
+  { geom_t gm; cluster_geom(&gm);
+    bs(&b,"  W="); bu64(&b,(u64)(u32)gm.w,10,0);
+    bs(&b,"  H="); bu64(&b,(u64)(u32)gm.h,10,0);
+    bs(&b,"  SCALE="); bu64(&b,(u64)env_num("MIB3_SHIM_SCALE",100),10,0);
+    bs(&b,"  SCALE_PHY="); bu64(&b,(u64)env_on("MIB3_SHIM_SCALE_PHY",0),10,0);
+    bs(&b,"  PHY="); bu64(&b,(u64)(u32)gm.phy_w,10,0);
+    bs(&b,"x"); bu64(&b,(u64)(u32)gm.phy_h,10,0);
+    bs(&b,"mm="); bu64(&b,(u64)(u32)geom_density_milli(&gm),10,0);
+    bs(&b,"px/mm(milli)"); }
   bs(&b,"  APPEARANCE="); bu64(&b,(u64)env_on("MIB3_SHIM_APPEARANCE",0),10,0);
   /* command-channel health, cumulative since injection: /0 accepted, /refused,
    * /stale.  A non-zero REFUSED or STALE here is the first thing to read when a
@@ -3510,21 +4116,44 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
       unsigned long n = 0; while (us[n] && n < sizeof(g_cluster_url)-1){ g_cluster_url[n] = us[n]; n++; }
       g_cluster_url[n] = 0; }
     CFStringRef cu = p_CFStringCreateWithCString ? p_CFStringCreateWithCString(0,cu_s,K128) : 0;
-    int cw   = (int)env_num("MIB3_SHIM_W", 1280);
-    int chp  = (int)env_num("MIB3_SHIM_H", 480);   /* grounded cluster default: 1280x480 (LANE_SURFACE_BINDING_DESK §3a) */
-    int cfps = (int)env_num("MIB3_SHIM_FPS", 30);  /* refs: rgi/PlayPort advertise 30 (LIVI 60) */
+    geom_t gm;
+    int cw, chp, cwph, chph, cfps;
+    cluster_geom(&gm);
+    cw   = gm.w;
+    chp  = gm.h;
+    cwph = gm.phy_w;      /* real PHYSICAL size in mm, NOT the pixel size */
+    chph = gm.phy_h;
+    cfps = (int)env_num("MIB3_SHIM_FPS", 60);  /* 60 by default (2026-10-20): maxFPS is a
+                                                * CEILING, not the rate (rgi: the sender's
+                                                * bandwidth ladder maps avgTx -> 10/20/30/60
+                                                * and is then clamped to maxFPS; the 1 Mbps
+                                                * floor makes the 10/20 rungs unreachable).
+                                                * With 30 every reachable outcome was
+                                                * already 30 and we sit at ~15-16, so 30
+                                                * was never the limit for the cluster.  On
+                                                * the WIRED branch the ladder is skipped and
+                                                * maxFPS is used directly -- which is the
+                                                * case this raises.  refs: rgi/PlayPort/LIVI. */
     logline("AddScreenDisplay","ADDING cluster display");
     log_uuid("AddScreenDisplay/cluster-uuid", cu);
     logkv("AddScreenDisplay","cluster widthPixels",(u64)(u32)cw,0);
     logkv("AddScreenDisplay","cluster heightPixels",(u64)(u32)chp,0);
     logkv("AddScreenDisplay","cluster maxFPS",(u64)(u32)cfps,0);
+    /* the advertised PHYSICAL size and the DENSITY it implies.  The density is
+     * the number that changes when only the pixels are scaled -- it was never
+     * logged before, so "the phone sees 222 dpi at 2x" was invisible. */
+    logkv("AddScreenDisplay","cluster widthPhysical",(u64)(u32)cwph,0);
+    logkv("AddScreenDisplay","cluster heightPhysical",(u64)(u32)chph,0);
+    logkv("AddScreenDisplay","cluster px per mm (milli)",(u64)(u32)geom_density_milli(&gm),0);
+    logkv("AddScreenDisplay","cluster scale pct",(u64)(u32)env_num("MIB3_SHIM_SCALE",100),0);
+    logkv("AddScreenDisplay","cluster scale physical",(u64)(u32)env_on("MIB3_SHIM_SCALE_PHY",0),0);
     /* cluster features/inputDevice: PlayPort's cluster config uses 0/0;
      * LIVI's working stack uses features=0x0A, primaryInputDevice=3. Env-tunable. */
     int cfeat  = (int)env_num("MIB3_SHIM_CFEAT", 0x0A);  /* LIVI/PlayPort: HIGH_FIDELITY_TOUCH|KNOBS = 0x0A */
     int cindev = (int)env_num("MIB3_SHIM_CINDEV", 0);
-    /* real PHYSICAL size in mm, NOT the pixel size (LIVI mm_at_dpi / rgi 292x110) */
-    int cwph = (int)env_num("MIB3_SHIM_CWPHY", 292);
-    int chph = (int)env_num("MIB3_SHIM_CHPHY", 110);
+    /* cwph/chph came from cluster_geom() above (geometry + mm + density live in
+     * ONE place now -- reading MIB3_SHIM_CWPHY again here is what let the two
+     * diverge during the 2x experiment). */
     int rc2 = real_AddScreenDisplay(inArray, cu, cfeat, cindev, cfps, cw, chp, cwph, chph);
     logkv("AddScreenDisplay","cluster rc",(u64)(u32)rc2,0);
     if (rc2 == 0){ add_cluster_fields(inArray, cw, chp); g_cluster_advertised = 1; }
@@ -3661,7 +4290,6 @@ int AirPlayReceiverSessionSetup(void *session, void *request, void **responseOut
         if (env_on("MIB3_SHIM_EF_IAPCHANNEL",0)) feats[nf++] = "iAPChannel";
         feats[nf++] = "viewAreas";
         feats[nf++] = "altScreen";
-        if (env_on("MIB3_SHIM_EF_UICONTEXT",0)) feats[nf++] = "uiContext";
         int i;
         if (arr){
           CFTypeRef cur = p_CFDictionaryGetValue(*responseOut, k);
@@ -3731,6 +4359,10 @@ void *AirPlayCopyServerInfo(void *a0, void *a1, void *a2)
   if (info && env_on("MIB3_SHIM_INFO",1) && gate_active()){
     int done = info_complete((CFMutableDictionaryRef)info);
     g_info_completed = done;
+    /* judge the advert we are about to serialise: one malformed display entry
+     * costs the whole session, and the 2x experiment proved the log alone does
+     * not show it (see THE ADVERT SELF-CHECK). */
+    if (done && env_on("MIB3_SHIM_INFOCHECK",1)) info_check((CFMutableDictionaryRef)info);
   }
   /* MIB3_SHIM_FEATURES=<dec> overrides the top-level /info `features` capability
    * mask (the stock LG value differs from the working receivers' 0x615653aee2). */
@@ -3750,6 +4382,7 @@ void *AirPlayCopyServerInfo(void *a0, void *a1, void *a2)
 
 /* exported for the harness: drive the /info completion on a synthesised dict. */
 int  mib3shim_complete_info(void *info){ resolve(); return info_complete((CFMutableDictionaryRef)info); }
+int  mib3shim_info_check(void *info){ resolve(); return info_check((CFMutableDictionaryRef)info); }
 int  mib3shim_info_completed(void){ return g_info_completed; }
 
 /* ==========================================================================
@@ -3851,7 +4484,7 @@ int ScreenStreamProcessData(void *stream, const void *data, unsigned long len,
 /* ---- harness hooks (frame interception) --------------------------------- */
 void          mib3shim_cluster_stream_set(void *stream){
   resolve();
-  { int i; for (i=0;i<MIB3_MAX_CL_STREAMS;i++) g_cl_streams[i]=0; }  /* reset */
+  memset(g_cl_streams, 0, sizeof g_cl_streams);  /* reset */
   if (stream) cl_stream_add(stream);
 }
 int           mib3shim_cluster_stream_add(void *stream){ resolve(); return cl_stream_add(stream); }
@@ -3912,26 +4545,7 @@ static unsigned long g_br_events;
  * reads `painter-callback` / `painter-cookie` from its own name via
  * NmeString::get_url_parameter_ptr (a real pointer, carried as text).  We pass
  * our own function so the decoded frames come to us instead of nowhere. */
-static volatile unsigned long g_painter_calls;
-static long painter_cb(void *a, void *b, void *c, void *d, void *e, void *f){
-  (void)b;(void)c;(void)d;(void)e;(void)f;
-  g_painter_calls++;
-  if (g_painter_calls <= 4){
-    logline("bridge","PAINTER CB");
-    logkv("bridge","pcb arg0",(u64)(unsigned long)a,1);
-    logkv("bridge","pcb arg1",(u64)(unsigned long)b,1);
-    logkv("bridge","pcb arg2",(u64)(unsigned long)c,1);
-  }
-  return 0;
-}
-static void fmt_hexp(char *out, unsigned long v){
-  const char *h = "0123456789abcdef"; char t[18]; int k=0, i=0;
-  out[i++]='0'; out[i++]='x';
-  if (!v){ out[i++]='0'; out[i]=0; return; }
-  while (v){ t[k++] = h[v & 0xf]; v >>= 4; }
-  while (k) out[i++] = t[--k];
-  out[i]=0;
-}static long bridge_event_handler(void *self, void *ev){
+static long bridge_event_handler(void *self, void *ev){
   (void)self;
   /* The framework's handler (CinemoMediaEngineUtils::handlePlaybackEvents) reads
    * the event's first int and, on type 4 (CINEMO_EC_CUE), marks the playback
@@ -3968,11 +4582,6 @@ static void fmt_2int(char *out, int a, int b){
  * with cb==0 segfaulted when the Cinemo logging was first enabled on the desk
  * bench (2026-10-17); pass a valid sink so the engine can call it safely and we
  * can see the graph/swap-chain decisions it otherwise keeps to itself. */
-static unsigned long g_nme_logs = 0;
-static void bridge_log_sink(void *user, const void *item){
-  (void)user; (void)item;      /* item is a CinemoLogItem&; layout unknown -- do not deref */
-  g_nme_logs++;
-}
 static void resolve_bridge(void){
   if (g_br.resolved) return;
   g_br.resolved = 1;
@@ -3996,17 +4605,8 @@ static void resolve_bridge(void){
   logkv("bridge","CinemoCreateProjection",(u64)p_CinemoCreateProjection,1);
   logkv("bridge","CINEMO_OPTION_VIDEO_DEVICE_ID",(u64)p_opt_video_device_id,1);
   /* Cinemo log on (device/swap-chain decisions are otherwise silent).  FILE target
-   * (1) + Debug level (1: Verbose=-1, Trace=0, Debug=1).  MIB3_SHIM_BRIDGE_LOG=0 off. */
-  p_NmeLogSetLevel  = (int (*)(int)) R("_Z14NmeLogSetLevel15CINEMO_LOGLEVEL");
-  p_NmeLogSetTarget = (int (*)(int,const char*,void*,void*)) R("_Z15NmeLogSetTarget16CINEMO_LOGTARGETPKcPFvPvRK13CinemoLogItemES2_");
-  if (env_on("MIB3_SHIM_BRIDGE_LOG",0) && p_NmeLogSetLevel){
-    const char *lg = getenv("MIB3_SHIM_BRIDGE_LOGPATH");
-    if (!lg || !lg[0]) lg = "/tmp/nme_bridge.log";
-    if (p_NmeLogSetTarget){ int rt = p_NmeLogSetTarget(1, lg, (void*)&bridge_log_sink, 0);
-      logkv("bridge","NmeLogSetTarget rc",(u64)(unsigned)rt,0); }
-    { int rl = p_NmeLogSetLevel(1);
-      logkv("bridge","NmeLogSetLevel rc",(u64)(unsigned)rl,0); }
-    logline("bridge","cinemo log enabled"); }
+   * Cinemo's own log stays OFF: the old MIB3_SHIM_BRIDGE_LOG/LOGPATH pair could
+   * turn it on, and it was never enabled in any shipped configuration. */
 }
 static void bridge_release(void *obj){
   if (!obj) return;
@@ -4047,13 +4647,12 @@ static int bridge_create(int w, int h, unsigned ivi_id){
    * is /usr/lib64/cinemo; the configured dir is /lge/app_rw/lib64/cinemo.
    * MIB3_SHIM_CINEMO_DIR overrides. */
   { fn_vc1 f = (fn_vc1)vslot(g_br.cfg, 0x90);
-    if (f){ unsigned char ver[32]; unsigned i; for (i=0;i<sizeof(ver);i++) ver[i]=0; f(g_br.cfg, ver); } }
-  { char *pd = getenv("MIB3_SHIM_CINEMO_DIR"); int rc;
+    if (f){ unsigned char ver[32]; memset(ver,0,sizeof ver); f(g_br.cfg, ver); } }
+  { const char *pd = "/lge/app_rw/lib64/cinemo"; int rc;
     fn_vc1 f = (fn_vc1)vslot(g_br.cfg, 0xb0);
     if (!f){ logline("bridge","FAIL: config->SetPluginDirectory missing"); goto fail; }
-    if (!pd || !pd[0]) pd = "/lge/app_rw/lib64/cinemo";
     logline("bridge/cinemo-dir", pd);
-    rc = f(g_br.cfg, pd);
+    rc = f(g_br.cfg, (void*)pd);
     logkv("bridge","cfg->[0xb0] rc",(u64)(unsigned)rc,0);
     if (rc != 0){
       logline("bridge/cinemo-dir","fallback /usr/lib64/cinemo");
@@ -4067,10 +4666,7 @@ static int bridge_create(int w, int h, unsigned ivi_id){
   { fn_vc2 f = (fn_vc2)vslot(g_br.playback, 0x28);
     /* (playback, self, handler) -- the framework passes all three; we passed (0,0).
      * MIB3_SHIM_BRIDGE_EVH=0 ablates. */
-    if (f){
-      if (env_on("MIB3_SHIM_BRIDGE_EVH",1)) f(g_br.playback, 0, (void*)bridge_event_handler);
-      else f(g_br.playback, 0, 0);
-    } }
+    if (f) f(g_br.playback, 0, (void*)bridge_event_handler); }
   /* ---- THE OPTIONS BLOCK (2026-10-17) ------------------------------------
    * The framework's CinemoMediaEngineUtils::screenSetup() sets these on the playback's
    * ICinemoOption (playback->[0x10](pb,&opt,ICinemoOption::iid), then opt->[0x28] per key)
@@ -4081,7 +4677,7 @@ static int bridge_create(int w, int h, unsigned ivi_id){
    * 0x0" wall.  Values are read out of the framework's own rodata pool
    * (libCarPlayMediaFramework.so, imagebase 0x100000): "Native" / "1920x1080" / "50" /
    * "60000" / "FALSE" / "0" / "TRUE".  Single change; MIB3_SHIM_BRIDGE_OPTS=0 ablates it. */
-  if (env_on("MIB3_SHIM_BRIDGE_OPTS",1) && p_iid_cinemo_option){
+  if (p_iid_cinemo_option){
     void *opts = 0;
     fn_vc2 getopt = (fn_vc2)vslot(g_br.playback, 0x10);
     void *iid = *(void**)p_iid_cinemo_option;
@@ -4106,8 +4702,7 @@ static int bridge_create(int w, int h, unsigned ivi_id){
          * the render stage is never reached.  MIB3_SHIM_BRIDGE_HWDEC=FALSE
          * selects the SW codec.  Default stays "TRUE" (vendor parity). */
         o[6].sym = p_opt_hw_decode;
-        { const char *hw = getenv("MIB3_SHIM_BRIDGE_HWDEC");
-          o[6].val = (hw && hw[0]) ? hw : "TRUE"; }
+        o[6].val = "TRUE";
         for (k = 0; k < 7; k++){
           if (!o[k].sym) continue;
           lastrc = (int)setopt(opts, *(void**)o[k].sym, (void*)o[k].val);
@@ -4153,22 +4748,6 @@ static int bridge_create(int w, int h, unsigned ivi_id){
     logkv("bridge","ivi_id",(u64)ivi_id,0); }
   /* A2 probe: force a client-visible swap-chain backend.  The device reads the
    * `swap-chain` URL parameter from its own name (NmeSwapChain::Create). */
-  { const char *sc = getenv("MIB3_SHIM_BRIDGE_SC");
-    if (sc && sc[0]){ fn_vc2 sf = (fn_vc2)vslot(g_br.dev, 0xa0);
-      int r = sf ? (int)sf(g_br.dev, (void*)"swap-chain", (void*)sc) : -1;
-      logkv("bridge","swap-chain set rc",(u64)(unsigned)r,0); } }
-  { const char *pp = getenv("MIB3_SHIM_BRIDGE_PAINTER");
-    if (pp && pp[0] && pp[0] != '0'){
-      fn_vc2 sf = (fn_vc2)vslot(g_br.dev, 0xa0);
-      char cb[24], ck[24];
-      fmt_hexp(cb, (unsigned long)(unsigned long)&painter_cb);
-      fmt_hexp(ck, (unsigned long)(unsigned long)&g_br);
-      logline("bridge","painter-callback set"); logline("bridge/pcb", cb);
-      if (sf){
-        logkv("bridge","pcb rc sc",(u64)(unsigned)(sf(g_br.dev,(void*)"swap-chain",(void*)"painter")),0);
-        logkv("bridge","pcb rc cb",(u64)(unsigned)(sf(g_br.dev,(void*)"painter-callback",(void*)cb)),0);
-        logkv("bridge","pcb rc ck",(u64)(unsigned)(sf(g_br.dev,(void*)"painter-cookie",(void*)ck)),0);
-      } } }
   { fn_vc0 f = (fn_vc0)vslot(g_br.dev, 0x58);
     const char *dn = f ? (const char*)f(g_br.dev) : 0;
     if (!dn){ logline("bridge","FAIL: dev->GetName"); goto fail; }
@@ -4182,9 +4761,9 @@ static int bridge_create(int w, int h, unsigned ivi_id){
      * to the device the decoder decodes (WriteVideo returns OK) but has no render target, so
      * it never attaches a buffer to the ivi surface (ILM: original size 0x0).  Single change;
      * MIB3_SHIM_BRIDGE_BIND=0 ablates it. */
-    if (env_on("MIB3_SHIM_BRIDGE_BIND",1)){
+    {
       char wdn[300];
-      { int i; for (i = 0; i < 300; i++) wdn[i] = 0; }
+      memset(wdn, 0, sizeof wdn);
       { fn_vc1 g = (fn_vc1)vslot(g_br.window, 0x60);
         int r = g ? (int)g(g_br.window, wdn) : -1;
         logkv("bridge","window->[0x60] devname rc",(u64)(unsigned)r,0);
@@ -4205,7 +4784,7 @@ static int bridge_create(int w, int h, unsigned ivi_id){
      * MIB3_SHIM_BRIDGE_LEGACYBIND=0 skips it -- the vendor framework never makes
      * this call, and the desk bench shows no difference either way, so it is the
      * first thing to ablate if the device still refuses to paint. */
-    if (env_on("MIB3_SHIM_BRIDGE_LEGACYBIND",1)){
+    {
       fn_vc1 g = (fn_vc1)vslot(g_br.window, 0x58);
       int brc = g ? g(g_br.window, (void*)dn) : -1;
       logkv("bridge","window->[0x58] bind-device rc",(u64)(unsigned)brc,0); } }
@@ -4216,8 +4795,8 @@ static int bridge_create(int w, int h, unsigned ivi_id){
   /* Framework parity (CinemoMediaEngineUtils::writeVideoFormat): tell the decoder the output format
    * BEFORE feeding.  0xa0-byte descriptor; fields per corpus decompiled.c:14590. */
   { fn_vc1 f = (fn_vc1)vslot(g_br.projection, 0x28);
-    unsigned char d[0xa0]; unsigned i; int rc;
-    for (i=0;i<(unsigned)sizeof(d);i++) d[i]=0;
+    unsigned char d[0xa0]; int rc;
+    memset(d,0,sizeof d);
     *(unsigned*)(d+0x00)=1u; *(unsigned*)(d+0x04)=0x2002u; *(unsigned*)(d+0x08)=1u;
     *(unsigned*)(d+0x0c)=(unsigned)w; *(unsigned*)(d+0x10)=(unsigned)h;
     d[0x2c]=0x10; d[0x39]=1;
@@ -4238,7 +4817,7 @@ static int bridge_create(int w, int h, unsigned ivi_id){
    * it never opened a video decoder node and never made a single GL call, so the surface
    * stayed empty.  The pipeline was constructed but never started.
    * MIB3_SHIM_BRIDGE_PLAY=0 ablates this single change. */
-  if (env_on("MIB3_SHIM_BRIDGE_PLAY",1)){
+  {
     unsigned long id = 0;
     { fn_vc1 g = (fn_vc1)vslot(g_br.playlist, 0x90);
       id = g ? (unsigned long)g(g_br.playlist, (void*)1UL) : 0;

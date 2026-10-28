@@ -120,8 +120,13 @@ for i,au in enumerate(aus):
 s.close()
 PY
 PY_PEER=$!
-"$NAT" --in "unix:$OUT/fake_shim.sock" --out "file:$OUT/stream_unix.dgrams" >/dev/null 2>"$OUT/unix.log"
+# The muxer RE-ACCEPTS forever since 2026-10-26 (a shim reconnect must not kill the
+# delivery), so run it in the background and stop it once the peer is done.
+"$NAT" --in "unix:$OUT/fake_shim.sock" --out "file:$OUT/stream_unix.dgrams" >/dev/null 2>"$OUT/unix.log" &
+MUXPID=$!
 wait $PY_PEER 2>/dev/null
+sleep 0.6
+kill $MUXPID 2>/dev/null; wait $MUXPID 2>/dev/null
 if python3 "$HERE/cluster_rtp_ts.py" "$OUT/stream_unix.dgrams" --quiet >/dev/null 2>&1; then
   ok unix_helper_protocol verified
 else
