@@ -29,8 +29,44 @@
  *   XDG_RUNTIME_DIR=/run/platform/weston WAYLAND_DISPLAY=wayland-0 \
  *     mib3egl [ivi_id] [w] [h] [secs] [colourRRGGBB] \
  *             [--persist] [--fps N] [--hold] [--frames N] \
- *             [--rgbafile F | --rgba-sock S]
- *   defaults: id 3000, 1280x480, PERSISTENT, 00ff00, 10 fps.
+ *             [--rgbafile F | --rgba-sock S] \
+ *             [--idle-blank-ms N] [--idle-blank-colour RRGGBB]
+ *   defaults: id 3000, 1280x480, PERSISTENT, 00ff00, 10 fps, idle-blank 8000 ms.
+ *
+ * 2026-10-20 (LANE_SWITCH_EVENTS) -- EVENT-DRIVEN COMMITS (--poll-ms, default 20).
+ *   The loop used to commit on a fixed 1/fps timer: at --fps 30 that is a commit
+ *   every 33 ms whatever the input did, so a frame that arrived 1 ms after a tick
+ *   sat on the socket for 32 ms before it reached the glass, and a burst of frames
+ *   was committed one per tick no matter how stale the queued ones had become.
+ *   Now:
+ *     * the process BLOCKS in poll(2) on the rgba socket (or the listen socket),
+ *       so a frame wakes it in microseconds instead of at the next tick;
+ *     * it DRAINS everything the decoder has written and uploads only the NEWEST
+ *       complete frame (older ones are coalesced away -- they are already stale);
+ *     * it commits IMMEDIATELY when that upload happens, and otherwise keeps a
+ *       cadence commit at --fps so MS-S keeps its encoder and a damage-free
+ *       surface still refreshes (the property the 2026-10-16 storm fix depends on);
+ *     * --poll-ms caps how long poll() may block, so the idle-blank deadline is
+ *       honoured to the millisecond and no path can spin: with no data and no
+ *       deadline the process is asleep, not looping.
+ *   Measured effect (desk, container, stub gfx): 5 frames delivered in a burst are
+ *   on the texture and committed within one poll wake-up instead of one per
+ *   keepalive tick, and an idle presenter burns ~0 CPU instead of waking 30x/s.
+ *
+ * 2026-10-20 -- THE DEAD-MAN SWITCH (--idle-blank-ms, default 8000, 0 disables).
+ *   Presenting the last texture forever is a LIE, and it is the one this process
+ *   tells best: when the phone leaves, the decoder stops and MS-S keeps encoding
+ *   a picture of a road that no longer exists -- a LIVE STREAM OF A STALE FRAME,
+ *   which is why every health check in the chain reads green while it happens.
+ *   So: if no complete frame has arrived on --rgba-sock for N ms, stop drawing the
+ *   texture and draw a NEUTRAL fill instead.  The colour is the same mid-grey
+ *   (808080) that `transition_ctl.sh` feeds, so the two paths look identical to
+ *   the driver.  The presenter keeps committing at --fps, so MS-S keeps its
+ *   encoder and the first real frame after the gap repaints immediately.
+ *   It depends on nothing but this process: phone yanked, decoder crashed, shim
+ *   thread dead, controller never started -- all of them end in a dark panel
+ *   instead of a stale map.  It deliberately does NOT apply to --rgbafile: a
+ *   static image is the point there.
  *
  * Success test (no eyes needed): the ILM scene shows surface 3000 with
  * `original size 1280x480` / `source region 1280x480`, MS-S logs ONE
@@ -122,6 +158,20 @@ extern void   glTexImage2D(u32 target, int level, int ifmt, int w, int h, int bo
 extern void   glTexSubImage2D(u32 target, int level, int x, int y, int w, int h, u32 fmt, u32 type, const void *px);
 extern void   glDrawArrays(u32 mode, int first, int count);
 extern unsigned glGetError(void);
+extern long   time(long *t);          /* idle-blank: wall clock, 1 s is plenty */
+/* --- monotonic ms + poll(2): the event-driven commit path --------------- */
+struct ts { long s; long n; };
+struct pollfd_st { int fd; short events; short revents; };
+extern int    clock_gettime(int, struct ts *);   /* CLOCK_MONOTONIC = 1 */
+extern int    poll(struct pollfd_st *, unsigned long, int);
+#define CLOCK_MONOTONIC_ 1
+#define EPOLLIN_         0x001        /* POLLIN */
+static long mono_ms(void){
+  struct ts t;
+  if (clock_gettime(CLOCK_MONOTONIC_, &t) != 0) return time(0) * 1000L;
+  return t.s * 1000L + t.n / 1000000L;
+}
+
 
 #define EGL_OPENGL_ES_API   0x30A0
 #define EGL_SURFACE_TYPE    0x3033
@@ -303,6 +353,17 @@ static int load_rgbafile(const char *path, int w, int h){
 static int  g_lfd = -1;
 static int  g_cfd = -1;
 static unsigned long g_acc = 0;      /* bytes accumulated toward the next frame */
+/* --- idle blank (the dead-man switch): see the header block --- */
+static int  g_idle_ms    = 8000;     /* 0 = disabled */
+static long g_idle_last  = 0;        /* MONOTONIC ms of the last COMPLETE frame */
+static int  g_idle_state = -1;       /* current mode, only for transition logging */
+static long g_idle_col   = 0x808080L;/* same neutral transition_ctl.sh feeds */
+/* --- event-driven cadence --- */
+static int  g_poll_ms    = 20;       /* max time poll() may block; data wakes it sooner */
+static long g_frames_in  = 0;        /* complete frames received on the socket */
+static long g_commits    = 0;        /* eglSwapBuffers calls */
+static long g_up_lag_max = 0;        /* worst observed drain->commit lag, ms (diagnostic) */
+
 static int  rgba_sock_open(const char *path, int w, int h){
   struct { unsigned short fam; char path[108]; } sa; int i;
   for (i = 0; i < 108; i++) sa.path[i] = 0;
@@ -319,9 +380,15 @@ static int  rgba_sock_open(const char *path, int w, int h){
   put("[egl] rgba-sock path="); put(path); put("\n");
   return 0;
 }
-/* returns 1 when a complete new frame has landed in g_rgba */
+/* returns the number of COMPLETE frames that landed (uploaded into the texture)
+ * during this call.  EVENT DRIVEN: it drains everything the peer has written and
+ * uploads each completed frame as it completes, so the texture always holds the
+ * NEWEST coherent frame; a partial tail never corrupts it (the pixels are already
+ * in the GL texture by then).  A burst is therefore narrowed to "the last frame",
+ * which is exactly the right thing to show: the older ones are already stale. */
 static int rgba_sock_pump(int w, int h){
   unsigned long need = (unsigned long)w * (unsigned long)h * 4UL;
+  int complete = 0;
   if (g_cfd < 0){
     int c = accept(g_lfd, 0, 0);
     if (c < 0) return 0;
@@ -332,11 +399,28 @@ static int rgba_sock_pump(int w, int h){
   }
   for (;;){
     long r = read(g_cfd, (char*)g_rgba + g_acc, need - g_acc);
-    if (r > 0){ g_acc += (unsigned long)r; if (g_acc >= need){ g_acc = 0; return 1; } continue; }
-    if (r == 0){ close(g_cfd); g_cfd = -1; g_acc = 0; ok("rgba-sock client gone -> re-accept"); return 0; }
-    return 0;   /* r < 0: no data right now (non-blocking) */
+    if (r > 0){
+      g_acc += (unsigned long)r;
+      if (g_acc >= need){ g_acc = 0; tex_update(w, h, g_rgba); complete++; g_frames_in++; }
+      continue;
+    }
+    if (r == 0){ close(g_cfd); g_cfd = -1; g_acc = 0; ok("rgba-sock client gone -> re-accept"); return complete; }
+    return complete;   /* r < 0: no data right now (non-blocking) -- fully drained */
   }
 }
+/* Block until the socket has data, the client changes, or `ms` elapses.  This is
+ * what makes the presenter event driven: no ticking, no spinning -- the process
+ * is ASLEEP in poll(2) and a frame wakes it in microseconds.  0 fds (no socket
+ * source) falls through to the caller's own sleep. */
+static int sock_wait(int ms){
+  struct pollfd_st p[2]; int n = 0;
+  if (ms < 0) ms = 0;
+  if (g_lfd >= 0 && g_cfd < 0){ p[n].fd = g_lfd; p[n].events = EPOLLIN_; p[n].revents = 0; n++; }
+  if (g_cfd >= 0){ p[n].fd = g_cfd; p[n].events = EPOLLIN_; p[n].revents = 0; n++; }
+  if (n == 0) return 0;
+  return poll(p, (unsigned long)n, ms);
+}
+
 
 int main(int argc, char **argv){
   u32 ivi_id = 3000u;
@@ -362,6 +446,9 @@ int main(int argc, char **argv){
     else if (streq(a, "--frames") && i + 1 < argc) maxframes = my_atoi(argv[++i]);
     else if (streq(a, "--rgbafile") && i + 1 < argc) rgbafile = argv[++i];
     else if (streq(a, "--rgba-sock") && i + 1 < argc) rgbasock = argv[++i];
+    else if (streq(a, "--idle-blank-ms") && i + 1 < argc) g_idle_ms = my_atoi(argv[++i]);
+    else if (streq(a, "--idle-blank-colour") && i + 1 < argc) g_idle_col = my_strtol16(argv[++i]);
+    else if (streq(a, "--poll-ms") && i + 1 < argc) g_poll_ms = my_atoi(argv[++i]);
     else if (a[0] == '-' ) { /* unknown flag: ignore */ }
     else {
       switch (npos++){
@@ -376,6 +463,8 @@ int main(int argc, char **argv){
   }
   cr = (float)((col >> 16) & 0xff) / 255.0f; cg = (float)((col >> 8) & 0xff) / 255.0f; cb = (float)(col & 0xff) / 255.0f;
   if (fps < 1) fps = 1;
+  if (g_poll_ms < 1) g_poll_ms = 1;
+  if (g_poll_ms > 250) g_poll_ms = 250;
   if (secs > 0) persistent = 0;          /* a positive secs bounds the run (tests) */
   if (maxframes > 0) persistent = 0;
 
@@ -413,24 +502,88 @@ int main(int argc, char **argv){
   if (rgbasock){
     if (rgba_sock_open(rgbasock, w, h) == 0) tex_init(w, h);
   } else if (rgbafile){
-    if (load_rgbafile(rgbafile, w, h) == 0){ tex_init(w, h); have_frame = 1; }
+    if (load_rgbafile(rgbafile, w, h) == 0){
+      tex_init(w, h);
+      tex_update(w, h, g_rgba);   /* a static image: ONE upload, then keepalive commits */
+      have_frame = 1;
+    }
   }
 
   nframes = hold ? 1 : (maxframes > 0 ? maxframes : (persistent ? 0 : secs * fps));
   num("frames to commit", nframes ? nframes : -1);   /* -1 = unbounded/persistent */
   num("cadence (fps)", fps);
-  for (i = 0; nframes == 0 || i < nframes; i++){
-    int got = 0;
-    if (g_src == 2) got = rgba_sock_pump(w, h);
-    if (g_src == 1) got = 1;
-    if (got && g_rgba){ tex_update(w, h, g_rgba); have_frame = 1; }
-    if (g_src && have_frame) tex_draw(w, h);
-    else { glClearColor(cr, cg, cb, 1.0f); glClear(GL_COLOR_BUFFER_BIT); }
-    eglSwapBuffers(dpy, esurf);
-    wl_display_flush(g_display);
-    if ((i % 50) == 0) num("frame", i);
-    if (nframes == 0 || i + 1 < nframes) usleep((unsigned int)(1000000 / fps));
+  num("poll cap (ms)", (long)g_poll_ms);
+  num("idle-blank (ms, 0=off)", (long)g_idle_ms);
+  g_idle_last = mono_ms();
+  { long _keep = 1000L / (fps > 0 ? fps : 1); if (_keep < 1) _keep = 1;
+    long _next_commit = mono_ms();
+    int  _dirty = 1;                 /* the first commit paints immediately */
+    int  _i = 0;
+    while (nframes == 0 || _i < nframes){
+      long _t0 = mono_ms(), _t = _t0;
+      int  _got = 0, _blank = 0, _commit = 0;
+      if (g_src == 2) _got = rgba_sock_pump(w, h);
+      if (_got){ have_frame = 1; g_idle_last = mono_ms(); _dirty = 1; }
+
+      /* THE DEAD-MAN SWITCH.  Only the socket source: a --rgbafile is meant to be
+       * static.  `!have_frame` counts as idle too -- before the first frame we show
+       * the neutral fill rather than the launch colour, so a surface that gets shared
+       * early is never a flat green lie either. */
+      if (g_src == 2 && g_idle_ms > 0 &&
+          (!have_frame || (_t - g_idle_last) >= (long)g_idle_ms)) _blank = 1;
+      if (_blank != g_idle_state){
+        g_idle_state = _blank; _dirty = 1;
+        if (_blank){
+          num("idle-blank: ON, no frame for >= ms", (long)g_idle_ms);
+          ok("idle-blank: presenting the NEUTRAL fill, not the stale frame");
+        } else {
+          ok("idle-blank: OFF (a frame arrived) -> live again");
+        }
+      }
+      if (_blank){
+        float br = (float)((g_idle_col >> 16) & 0xff) / 255.0f;
+        float bg = (float)((g_idle_col >>  8) & 0xff) / 255.0f;
+        float bb = (float)( g_idle_col        & 0xff) / 255.0f;
+        glClearColor(br, bg, bb, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
+      }
+      else if (g_src && have_frame) tex_draw(w, h);
+      else { glClearColor(cr, cg, cb, 1.0f); glClear(GL_COLOR_BUFFER_BIT); }
+
+      /* COMMIT POLICY (event driven):
+       *   * a new frame  -> commit NOW (this is the latency that matters);
+       *   * idle/keepalive cadence at --fps -> re-commit the same texture, which is
+       *     what keeps MS-S's encoder attached and makes the first frame after a gap
+       *     repaint at once (the 2026-10-16 lifecycle rule -- do not remove). */
+      if (_t < _next_commit) _commit = _dirty ? 1 : 0; else _commit = 1;
+      if (_commit){
+        eglSwapBuffers(dpy, esurf);
+        wl_display_flush(g_display);
+        g_commits++; _i++;
+        if (_got){ long _lag = mono_ms() - _t0; if (_lag > g_up_lag_max) g_up_lag_max = _lag; }
+        _next_commit = mono_ms() + _keep;
+        _dirty = 0;
+        if ((_i % 50) == 0) num("frame", _i);
+      }
+      if (nframes != 0 && _i >= nframes) break;
+      /* SLEEP UNTIL DATA OR THE NEXT DEADLINE -- bounded, never a spin. */
+      if (g_src == 2){
+        long _to = _next_commit - mono_ms();
+        if (_to > g_poll_ms) _to = g_poll_ms;
+        if (_to < 0) _to = 0;
+        if (g_idle_ms > 0 && have_frame){
+          long _ito = (g_idle_last + (long)g_idle_ms) - mono_ms();
+          if (_ito >= 0 && _ito < _to) _to = _ito;      /* land the blank on time */
+        }
+        sock_wait((int)_to);
+      } else {
+        long _to = _next_commit - mono_ms();
+        if (_to > 0) usleep((unsigned int)(_to * 1000));
+      }
+    }
   }
+  num("frames received on rgba-sock", g_frames_in);
+  num("commits (eglSwapBuffers)", g_commits);
+  num("worst drain->commit lag (ms)", g_up_lag_max);
   ok(persistent ? "done" : "done (bounded run)");
   return 0;
 }

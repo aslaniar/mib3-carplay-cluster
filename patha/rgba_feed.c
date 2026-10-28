@@ -16,6 +16,7 @@
  * It is used by harness/run_delivery.sh to prove the decode-to-texture delivery
  * chain offline: h264ipcm.py --out frame.rgba  ->  rgba_feed  ->  mib3egl tex.
  * ==========================================================================*/
+#include "toolkit.h"
 typedef unsigned int  u32;
 typedef unsigned long usize;
 
@@ -23,16 +24,13 @@ extern int    open(const char *, int, ...);
 extern long   read(int, void *, unsigned long);
 extern int    close(int);
 extern void   _exit(int);
-extern int    write(int, const void *, unsigned long);
 extern int    usleep(unsigned int);
 extern void  *malloc(unsigned long);
 extern int    socket(int, int, int);
 extern int    connect(int, const void *, unsigned int);
 static int streq(const char *a, const char *b){ while (*a && *a == *b) { a++; b++; } return *a == *b; }
-static void put(const char *s){ usize n=0; while (s[n]) n++; write(2, s, n); }
-static void putnum(long v){ char b[24]; int i=0; if(v<0){write(2,"-",1);v=-v;} if(!v){write(2,"0",1);return;} while(v){b[i++]=(char)('0'+v%10);v/=10;} while(i) write(2,&b[--i],1); }
-static void ok(const char*m){ put("[feed] "); put(m); put("\n"); }
-static void num(const char*m,long v){ put("[feed] "); put(m); put("="); putnum(v); put("\n"); }
+static void ok(const char*m){ Pe("[feed] "); Pe(m); Pe("\n"); }
+static void num(const char*m,long v){ Pe("[feed] "); Pe(m); Pe("="); Pw(v); Pe("\n"); }
 static int my_atoi(const char*s){ long v=0; int neg=0; if(*s=='-'){neg=1;s++;} while(*s>='0'&&*s<='9'){v=v*10+(*s-'0');s++;} return (int)(neg?-v:v); }
 static int read_full(int fd, void *buf, unsigned long n){
   unsigned long got=0; while (got<n){ long r=read(fd,(char*)buf+got,n-got); if(r<=0) return 0; got+=(unsigned long)r; } return 1;
@@ -57,10 +55,20 @@ void _start(void){
         if (streq(t,"--library-path")||streq(t,"--preload")||streq(t,"--audit")||streq(t,"--argv0")||streq(t,"--inhibit-cache")){ j+=2; continue; }
         if (t[0]=='-'){ j+=1; continue; }
         break; }
-      skip=j; } }
-  for (k=0; skip+k<argc && k<47; k++) nav[k]=av[skip+k];
-  nav[k]=0;
-  _exit(main(k, nav));
+      skip=j+1; } }
+  for (k=0; skip+k<argc && k<46; k++) nav[k+1]=av[skip+k];
+  /* nav[0] MUST be a program name and av[skip] MUST be the first REAL argument.
+   * The two launch paths disagree about that and the difference used to hide:
+   *   direct (the car):        av[0] is the program      -> skip = 1
+   *   under ld-2.23.so (bench): av[j] is the program     -> skip = j + 1
+   * `skip = j` made nav[1] the program path, so every positional shifted one
+   * RIGHT under the loader -- "FAIL open <the binary path>" -- while working on
+   * the car.  The mirror case was the original bug (nav[0] = the sock path, so
+   * `1280` was opened as the image: the neutral frame never worked on the car).
+   * With skip = j + 1 both paths land argv[1] on <sock>. */
+  nav[0] = "rgba_feed";
+  nav[k+1]=0;
+  _exit(main(k+1, nav));
 }
 
 int main(int argc, char **argv){
@@ -82,7 +90,8 @@ int main(int argc, char **argv){
   buf = malloc(need);
   if (!buf || !read_full(fd, buf, need)){ ok("FAIL read rgbafile (need w*h*4 bytes)"); return 2; }
   close(fd); num("frame bytes", (long)need);
-  for (i=0;i<108;i++) sa.path[i]=0;
+  memset(&sa, 0, sizeof sa);
+  
   for (i=0;i<107 && sock[i];i++) sa.path[i]=sock[i];
   sa.fam=1;
   lfd = socket(1,1,0);
