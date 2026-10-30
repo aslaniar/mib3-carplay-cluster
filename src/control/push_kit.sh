@@ -124,6 +124,7 @@ FILES="mib3shim.so \
   tools/mib3wheel tools/mib3night tools/mib3ctl \
   live_kit/pathb_ctl.sh live_kit/pathb/msport.py live_kit/pathb/fake_shim.py \
   live_kit/pathb/sniff.py tools/pathb_report.py tools/pes_frames.py \
+  live_kit/pathb_guard.sh live_kit/pathb_nudge.sh live_kit/pathb/renderer.py \
   tools/pes_extract.py tools/au_boundary.py tools/sps_dump.py tools/wire_diff.py \
   tools/mib3clusterstream \
   $PATHB_FIX"
