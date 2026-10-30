@@ -22,24 +22,78 @@ cd "$SHIM" || exit 1
 # Abort BEFORE staging if a tool does not match, so a stale decoder/presenter
 # cannot reach the car (the same discipline run_inject.sh applies to the shim).
 md5of(){ if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
-SHIM_WANT=13e0456e9e5f9ceb6d07e9cd9978cb4f
-V4L2_WANT=250466e1d00421b7136c192cc3878d47
-EGL_WANT=bd20b5910507e3876471cb922c9c6556
-NIGHT_WANT=acaf614dbb7211963dcbca1bea7013d2
-# Path B sender (2026-10-27, second session).  CORRECTED: this used to pin
-# data/PATHB_20261026/mib3clusterstream.unit at 6b668509 -- which is the *run 1*
-# build of the field session, the one that put the sequence header on EVERY frame
-# and left the cluster on its pre-render grid.  The comment above it forbade
-# exactly that binary while the pin deployed it.  The truth is now the fresh
-# build in tools/, pinned here, and `pathb_ctl.sh` finds it at /tmp/kit/<name>.
-PATHB_WANT=fc923b446505c83ae23ad2bccd5a0513
-PATHB_BIN=tools/mib3clusterstream
+
+# WHICH GENERATION DO WE STAGE? (2026-10-28, P0 -- REVIEW_PATHB_2026-10-28.md)
+# The pins are FIELD-PROVEN binaries only.  Both live as source+binary pairs in
+# MIB3_RE/artifacts/, and this script stages THAT generation from its artifact
+# bin/ onto the tree paths the kit expects.  Select with one variable:
+#
+#   MIB3_SHIP_PATH=A   Path A -- decode/present/MS-S.  THE SHIPPING PATH (default).
+#   MIB3_SHIP_PATH=B   Path B -- the phone's H.264 re-muxed to the ECU (lab path).
+#
+# Before 2026-10-28 these pins pointed at the PATH B lab build while the decision
+# on record was "Path A ships" -- a routine trip would have staged the lab path
+# thinking it was shipping, and the md5 fence could not catch that (both pins are
+# valid).  The A/B selector makes the wrong default impossible.
+# NOTE: the tree's mib3shim.c / tools/mib3clusterstream.c now carry the
+# 2026-10-28 P0 desk build, which has NOT run on the car and therefore has NO
+# pin.  Bench it, then repin after its first field session.  Staging never
+# clobbers sources -- only the four built binaries below.
+SHIP_PATH="${MIB3_SHIP_PATH:-A}"
+ABIN="$(cd "$SHIM/../artifacts/PATH_A_WORKING_20261026/bin" && pwd)"
+BBIN="$(cd "$SHIM/../artifacts/PATH_B_WORKING_20261027/bin" && pwd)"
+if [ "$SHIP_PATH" = "NEW" ]; then
+  # DELIBERATE UN-PINNED STAGING (2026-10-29): the tree build is a bench build
+  # with no pin until it has run on the car.  Staging it is intentional and
+  # loud: the operator must state the shim md5 they intend to test.
+  GEN_DIR="(tree build, un-pinned)"
+  SHIM_WANT="${MIB3_SHIP_NEW_MD5:-}"
+  V4L2_WANT=7921f0e4501b693253890918ae47505b
+  EGL_WANT=bd20b5910507e3876471cb922c9c6556
+  NIGHT_WANT=acaf614dbb7211963dcbca1bea7013d2
+  cp -f "$ABIN/v4l2_seq" tools/v4l2_seq
+  cp -f "$ABIN/mib3egl" tools/mib3egl
+  cp -f "$ABIN/mib3night" tools/mib3night
+  PATHB_WANT="${MIB3_SHIP_NEW_SENDER_MD5:-}"
+  PATHB_BIN="$(cd "$SHIM" && pwd)/tools/mib3clusterstream"
+elif [ "$SHIP_PATH" = "B" ]; then
+  GEN_DIR="$BBIN"
+  SHIM_WANT=13e0456e9e5f9ceb6d07e9cd9978cb4f
+  V4L2_WANT=7921f0e4501b693253890918ae47505b     # shared tools: staged from Path A's (unchanged across generations)
+  EGL_WANT=bd20b5910507e3876471cb922c9c6556
+  NIGHT_WANT=acaf614dbb7211963dcbca1bea7013d2
+  cp -f "$ABIN/v4l2_seq" tools/v4l2_seq
+  cp -f "$ABIN/mib3egl" tools/mib3egl
+  cp -f "$ABIN/mib3night" tools/mib3night
+  cp -f "$BBIN/mib3shim.so" mib3shim.so
+  PATHB_WANT=fc923b446505c83ae23ad2bccd5a0513
+  PATHB_BIN="$(cd "$SHIM" && pwd)/tools/mib3clusterstream"
+  cp -f "$BBIN/mib3clusterstream" "$PATHB_BIN"
+else
+  GEN_DIR="$ABIN"
+  cp -f "$ABIN/mib3shim.so"  mib3shim.so
+  cp -f "$ABIN/v4l2_seq"     tools/v4l2_seq
+  cp -f "$ABIN/mib3egl"      tools/mib3egl
+  cp -f "$ABIN/mib3night"    tools/mib3night
+  SHIM_WANT=bba65300965f287a5e70ac072d664844
+  V4L2_WANT=7921f0e4501b693253890918ae47505b
+  EGL_WANT=bd20b5910507e3876471cb922c9c6556
+  NIGHT_WANT=acaf614dbb7211963dcbca1bea7013d2
+  PATHB_WANT=fc923b446505c83ae23ad2bccd5a0513     # the lab sender, for experiments
+  PATHB_BIN="$(cd "$SHIM" && pwd)/tools/mib3clusterstream"
+  cp -f "$BBIN/mib3clusterstream" "$PATHB_BIN"
+fi
+echo "[i] generation: Path $SHIP_PATH (from $GEN_DIR)"
 # the synthetic rate-test file (field plan step 0): the 10 fps pattern that is
 # known to render, played back at a chosen rate with `pathb_ctl.sh play`.
 PATHB_FIX=../data/PATHB_20261026/pathb_base.264
 PATHB_FIX_WANT=a2a78e2ede7d5d9b8d3392625926c75a
 checkpin(){ # checkpin <path> <want-md5>
   local got; got="$(md5of "$1")"
+  if [ -z "$2" ]; then
+    echo "[i] $1 staged UN-PINNED (deliberate NEW build): md5 $got -- record this md5"
+    return 0
+  fi
   if [ "$got" != "$2" ]; then
     echo "[!] PRE-FLIGHT: $1 md5 $got != want $2 -- rebuild with: sh build.sh && sh tools/build.sh"
     exit 1
@@ -56,13 +110,13 @@ echo "[i] pre-flight pins OK: shim $SHIM_WANT / v4l2_seq $V4L2_WANT / mib3egl $E
 
 ssh "$HOST" 'mkdir -p /tmp/kit'
 
-FILES="mib3shim.so mib3clusterhelper \
+FILES="mib3shim.so \
   inject/inject.py inject/inject_shim.py inject/target_env.py inject/run_inject.sh \
   live_kit/deliver_ctl.sh live_kit/chain_up.sh live_kit/chain_down.sh \
   live_kit/transition_ctl.sh \
   live_kit/v4l2_run.sh live_kit/v4l2_sweep.sh \
   live_kit/start_mss_log.sh live_kit/patha_deliver.sh live_kit/patha_auto.sh \
-  live_kit/start_cluster_helper.sh live_kit/probe.sh \
+  live_kit/probe.sh \
   live_kit/wheel_zoom.sh live_kit/night_watch.sh live_kit/usb_diag.sh live_kit/viewarea.sh \
   live_kit/calib.sh tools/calib_grid.py live_kit/bring_up.sh \
   live_kit/fps_probe.sh live_kit/res_probe.sh live_kit/stream_fps.sh \
@@ -71,7 +125,16 @@ FILES="mib3shim.so mib3clusterhelper \
   live_kit/pathb_ctl.sh live_kit/pathb/msport.py live_kit/pathb/fake_shim.py \
   live_kit/pathb/sniff.py tools/pathb_report.py tools/pes_frames.py \
   tools/pes_extract.py tools/au_boundary.py tools/sps_dump.py tools/wire_diff.py \
+  tools/mib3clusterstream \
   $PATHB_FIX"
+
+# 2026-10-29 (redteam refactor): mib3clusterhelper + start_cluster_helper.sh
+# are NO LONGER STAGED.  They existed to host the in-process Cinemo decode
+# (the Path A chain) and the shim exports they drive were removed from
+# mib3shim.c -- staging them would ship a binary that cannot run.  Path B's
+# AU-socket consumer is tools/mib3clusterstream (added to the list above,
+# explicitly, so the sender is always on the unit even when MIB3_SHIP_PATH
+# copies a pinned generation over it).
 
 # WHY the delivery scripts are listed (they were NOT, and it cost a whole trip
 # on 2026-10-17): start_mss_log.sh is the ORACLE -- MS-S's own log on port 54321.

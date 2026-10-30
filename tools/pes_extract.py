@@ -97,7 +97,12 @@ def main(argv):
         if a == '--max-gap' and k + 1 < len(argv):
             max_gap = float(argv[k + 1])
 
-    d = open(cap, 'rb').read()
+    # BYTE-ITERATION COMPATIBILITY (logging audit 2026-10-29).  The unit has only
+    # Python 2.7; indexing a py2 str yields a 1-char string, so `d[o] == 0x47` is
+    # always False and this tool printed "no video" for EVERY capture -- the false
+    # verdict that sent a whole session chasing a non-existent sender bug.
+    # bytearray indexes as int in BOTH 2.7 and 3.x.
+    d = bytearray(open(cap, 'rb').read())
     pkts = ts_packets(d)
     units = pes_units(pkts)
     if not units:

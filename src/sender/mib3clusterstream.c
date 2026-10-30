@@ -126,6 +126,10 @@ extern int   inet_pton(int, const char *, void *);
 extern unsigned if_nametoindex(const char *);
 extern int   clock_gettime(int, void *);
 extern int   poll(void *, unsigned long, int);
+/* ppoll: nanosecond poll timeout.  Verified to be a real export of THIS image's
+ * libc.so.6 (R8830L_ROOTFS/lib64/libc.so.6, GLIBC <= 2.23), so the deadline can
+ * be the poll timeout without a timerfd and without a new DT_NEEDED. */
+extern int   ppoll(void *, unsigned long, const void *, const void *);
 extern int   usleep(unsigned);
 extern u16   htons(u16);
 extern void  _exit(int);
@@ -415,6 +419,33 @@ typedef struct {
     u32      ssrc;
     int      tsid, pmt_pid, es_pid, pcr_pid;
     u64      nulls;              /* TS null packets emitted to end AUs on a boundary */
+    u64      wfail;              /* datagram writes that did not complete (was silent) */
+    u32      rtp_ts;             /* 90 kHz media clock for the RTP header (see mux_flush) */
+
+    /* ---- LOOP-DRIVEN EMISSION (2026-10-30) -------------------------------
+     * See "INTRA-FRAME RELEASE" below.  An access unit is muxed COMPLETE into
+     * `dbuf` -- byte-identical to what the old write path produced, because the
+     * muxer still runs in one pass at one instant, so the PSI/PCR decisions that
+     * depend on now_ms() are made exactly as before -- and is then RELEASED one
+     * datagram at a time by the main loop, on a deadline proportional to the
+     * CUMULATIVE PAYLOAD BYTES delivered (not to a guessed datagram count).
+     *
+     * au_iv_ms == 0 means "do not pace": mux_flush writes immediately and this
+     * whole mechanism is inert, which is the pre-2026-10-30 behaviour exactly
+     * (the --no-jit path, the catch-up path, and file mode). */
+    u8      *dbuf;               /* AU datagrams, `drow` bytes each              */
+    u32     *dlen;               /* bytes in datagram i                          */
+    u32     *dcum;               /* cumulative AU payload bytes through dgram i  */
+    int      dcap, dndg, dcursor, drow;
+    u64      au_t0_ns;           /* CLOCK_MONOTONIC ns when this AU started      */
+    u64      au_iv_ms;           /* slot to spread it over (0 = unspaced)        */
+    u64      au_payload;         /* announced AU payload size (the budget)       */
+    u64      au_done;            /* payload bytes handed to the muxer so far     */
+    int      overrun_seen;       /* counted the collapse for this AU already     */
+    u64      spread_overruns;    /* spreads that ran past their slot             */
+    u64      spread_skipped;     /* AUs emitted UNSPACED on purpose (--no-jit)   */
+    u64      deferred_arms;      /* release ticks that waited for a frame to finish */
+    u64      pace_oom;           /* AUs that fell back to immediate (no buffer)  */
 } Mux;
 
 static u64 now_ms(void)
@@ -423,11 +454,191 @@ static u64 now_ms(void)
     return (u64)ts.SEC_ * 1000u + (u64)ts.NSEC_ / 1000000u;
 }
 
+/* A NANOSECOND CLOCK FOR THE EMITTER ONLY (2026-10-30).  now_ms() stays the
+ * clock of the release loop, the PTS step, the arrival meter and everything else
+ * that was settled earlier -- those are deliberately untouched.  The emitter uses
+ * ns because a datagram's deadline is ~3.2 ms out and now_ms() would quantise it
+ * to a whole millisecond, i.e. 30% of the spacing. */
+static u64 now_ns(void)
+{
+    tspec_t ts; clock_gettime(CLOCK_MONOTONIC_, &ts);
+    return (u64)ts.SEC_ * 1000000000ull + (u64)ts.NSEC_;
+}
+
+/* ---------------------------------------------- emission timing (--stats-timing)
+ * WHY THIS EXISTS.  The `--out file:` capture format is length-framed but carries
+ * NO timestamps, so a capture can prove WHAT we sent and can never prove WHEN we
+ * sent it.  Every pacing claim made so far ("307 idle windows > 20 ms", "longest
+ * 105 ms") is therefore a MODEL of the code, not a measurement of it.  This
+ * records the monotonic timestamp of every write() and reports the distribution at
+ * exit, so a desk run can assert the wire's continuity directly -- on any
+ * destination, file or socket.  Off by default: zero behaviour change. */
+#define TM_RING  512
+#define TM_HIST  12
+static struct {
+    u64 n, last_ns, longest_ns, over20;
+    u64 hist[TM_HIST];
+    u64 ring[TM_RING];
+    int rhead, rcount;
+    u64 peak25;
+    int ignore;        /* set during the teardown drain (see timing_ignore) */
+} g_tm;
+static int g_timing_on;
+
+static void timing_sample(void)
+{
+    static const u64 edges[TM_HIST - 1] = {
+        500000ull, 1000000ull, 2000000ull, 4000000ull, 8000000ull, 16000000ull,
+        20000000ull, 40000000ull, 80000000ull, 160000000ull, 320000000ull
+    };
+    u64 t = now_ns();
+    if (g_tm.ignore) { g_tm.last_ns = t; return; }
+    if (g_tm.last_ns) {
+        u64 g = t - g_tm.last_ns;
+        int b = 0;
+        if (g > g_tm.longest_ns) g_tm.longest_ns = g;
+        if (g > 20000000ull) {
+            g_tm.over20++;
+            /* Name the long gaps while they happen: on the car this says WHICH
+             * datagram the wire went quiet at, which the histogram alone cannot.
+             * Capped so a pathological run cannot flood the log. */
+            if (g_tm.over20 <= 32) {
+                say("timing: idle "); say_int("", (long)(g / 1000));
+                say(" us before write "); say_int("", (long)g_tm.n);
+                say(" (gap "); say_int("", (long)g_tm.over20); say(")\n");
+            }
+        }
+        while (b < TM_HIST - 1 && g > edges[b]) b++;
+        g_tm.hist[b]++;
+    }
+    g_tm.last_ns = t;
+    g_tm.n++;
+    /* peak density: datagrams inside ANY 25 ms window.  The car's own peak is 61
+     * (measured on the same interface), so this number is directly comparable. */
+    g_tm.ring[g_tm.rhead] = t;
+    g_tm.rhead = (g_tm.rhead + 1) % TM_RING;
+    if (g_tm.rcount < TM_RING) g_tm.rcount++;
+    { u64 c = 0;
+      for (int k = 1; k <= g_tm.rcount; k++) {
+          int i2 = (g_tm.rhead - k + TM_RING) % TM_RING;
+          if (t - g_tm.ring[i2] <= 25000000ull) c++; else break;
+      }
+      if (c > g_tm.peak25) g_tm.peak25 = c; }
+}
+
+static void timing_report(void)
+{
+    static const char *lbl[TM_HIST] = {
+        "<0.5ms", "<1ms", "<2ms", "<4ms", "<8ms", "<16ms",
+        "<20ms", "<40ms", "<80ms", "<160ms", "<320ms", ">=320ms"
+    };
+    if (!g_timing_on) return;
+    say("timing: writes="); say_int("", (long)g_tm.n);
+    say("  longest-gap="); say_int("", (long)(g_tm.longest_ns / 1000));
+    say(" us  gaps>20ms="); say_int("", (long)g_tm.over20);
+    say("  peak-dg/25ms="); say_int("", (long)g_tm.peak25); say("\n");
+    say("timing: inter-datagram gap histogram (count per bucket)\n");
+    for (int i = 0; i < TM_HIST; i++) {
+        if (!g_tm.hist[i]) continue;
+        say("  timing:   "); say(lbl[i]); say(" ");
+        say_int("", (long)g_tm.hist[i]); say("\n");
+    }
+}
+
+/* One phone session is one connection, so these numbers are reported (and reset)
+ * at every connection close as well as at exit: a live run ends by kill(1), which
+ * never reaches the exit path, and the per-session wire shape is exactly what a
+ * car session needs to record. */
+static void timing_reset(void)
+{
+    usize_t i;
+    u8 *p = (u8 *)&g_tm;
+    for (i = 0; i < sizeof g_tm; i++) p[i] = 0;
+}
+
+/* One datagram hits the destination.  THE ONLY WRITE SITE (2026-10-30): both the
+ * unpaced path and the paced pump come through here, so --stats-timing measures
+ * the real emission shape whichever route produced it. */
+static void mux_dg_write(Mux *m, const u8 *p, int total)
+{
+    /* LOGGING AUDIT 2026-10-29: this write's return value used to be ignored --
+     * a failing UDP write (ENOBUFS on a congested qdisc, EPIPE, EINVAL) would
+     * silently lose a whole datagram with no trace anywhere.  Behaviour is
+     * unchanged (we still send it once); we now COUNT it and say so. */
+    long w = write(m->out_fd, p, (usize_t)total);
+    if (g_timing_on) timing_sample();
+    if (w != (long)total) {
+        m->wfail++;
+        if (m->wfail <= 3 || (m->wfail & 0xff) == 0) {
+            say("mux: WRITE FAILED (datagram lost) count=");
+            say_int("", (long)m->wfail);
+        }
+    }
+}
+
+/* Make room for one more buffered datagram.  The three arrays are grown
+ * independently and the committed state is only advanced when the LAST of them
+ * succeeds, so a partial failure can never leave dcap ahead of a short array. */
+static int mux_dg_reserve(Mux *m)
+{
+    if (m->dndg < m->dcap) return 1;
+    int ncap = m->dcap ? m->dcap * 2 : 64;
+    if (ncap > 2048) return 0;
+    { u8  *nb = (u8 *)realloc(m->dbuf, (usize_t)ncap * (usize_t)m->drow);
+      if (!nb) return 0;
+      m->dbuf = nb; }
+    { u32 *nl = (u32 *)realloc(m->dlen, (usize_t)ncap * sizeof(u32));
+      if (!nl) return 0;
+      m->dlen = nl; }
+    { u32 *nc = (u32 *)realloc(m->dcum, (usize_t)ncap * sizeof(u32));
+      if (!nc) return 0;
+      m->dcum = nc; }
+    m->dcap = ncap;
+    return 1;
+}
+
+/* Hold a finished datagram for the pump instead of writing it.  au_done is the
+ * CUMULATIVE PAYLOAD BYTE count at the moment this datagram closed -- that is the
+ * whole point: the deadline is derived from bytes actually delivered, so a wrong
+ * packet estimate can no longer switch pacing off (which is what happened when
+ * the old code guessed `(len+183)/184 + 2` and the muxer emitted a few more). */
+static void mux_dg_buffer(Mux *m, int total)
+{
+    if (!mux_dg_reserve(m)) {
+        /* Never lose a datagram to a memory shortage: send it now and stop
+         * pretending to pace this AU.  Counted, so a silent degradation cannot
+         * masquerade as a paced stream. */
+        mux_dg_write(m, m->dg, total);
+        m->au_iv_ms = 0;
+        m->pace_oom++;
+        return;
+    }
+    memcpy(m->dbuf + (usize_t)m->dndg * (usize_t)m->drow, m->dg, (usize_t)total);
+    m->dlen[m->dndg] = (u32)total;
+    m->dcum[m->dndg] = (u32)(m->au_done > 0xFFFFFFFFull ? 0xFFFFFFFFull : m->au_done);
+    m->dndg++;
+}
+
 static void mux_flush(Mux *m)
 {
     if (m->ndg == 0) return;
     int total = RTP_LEN + m->ndg * TS_LEN;
-    u32 t = (u32)(now_ms() & 0xFFFFFFFFu);
+    /* RTP TIMESTAMP = THE MEDIA CLOCK, NOT THE WALL CLOCK (2026-10-30).
+     *
+     * This used to be `(u32)(now_ms() & 0xFFFFFFFF)`.  For MPEG-TS over RTP
+     * (RFC 2250) the RTP timestamp is a 90 kHz presentation clock, tied to the
+     * PES/PCR time base.  Ours advanced in MILLISECONDS, i.e. 90x slower than
+     * every other clock in the stream, and it disagreed with the PTS/PCR we put
+     * in the transport stream itself.  Measured on a live capture from this
+     * build: RTP ts 666648 -> 676449 over 9.80 s of wall time, while the PES
+     * clock in the same datagrams advanced 8.82 s.  A receiver that estimates
+     * its jitter buffer from RTP timestamps is therefore being told a stream is
+     * running 90x slower than it is, while PCR says something else again.
+     *
+     * Every datagram of one access unit now carries THAT access unit's PTS in
+     * 90 kHz units, which is what the muxer already had in hand (pts90k) and
+     * what the car's own sender does.  One clock, one rate, no disagreement. */
+    u32 t = m->rtp_ts;
     m->dg[0] = 0x80;
     m->dg[1] = 0x21;                                    /* PT 33 = MPEG-TS */
     m->dg[2] = (u8)(m->seq >> 8); m->dg[3] = (u8)(m->seq & 0xFF);
@@ -436,7 +647,10 @@ static void mux_flush(Mux *m)
     m->dg[8]  = (u8)(m->ssrc >> 24); m->dg[9]  = (u8)(m->ssrc >> 16);
     m->dg[10] = (u8)(m->ssrc >> 8);  m->dg[11] = (u8)m->ssrc;
     m->seq++;
-    write(m->out_fd, m->dg, (usize_t)total);
+    /* THE ONLY BRANCH THAT THE PACING CHANGE ADDS.  au_iv_ms == 0 (file mode,
+     * --no-jit, every catch-up path) writes here and now, exactly as before. */
+    if (m->au_iv_ms) mux_dg_buffer(m, total);
+    else             mux_dg_write(m, m->dg, total);
     m->ndg = 0;
 }
 
@@ -444,6 +658,178 @@ static void mux_push(Mux *m, const u8 *pkt)
 {
     memcpy(m->dg + RTP_LEN + m->ndg * TS_LEN, pkt, TS_LEN);
     if (++m->ndg >= m->npk) mux_flush(m);
+}
+
+/* ============================ INTRA-FRAME RELEASE ===========================
+ * 2026-10-30 -- THE ONE THING THE MUXER NEVER DID.
+ *
+ * `mux_au` looped packets into `mux_push` with NO delay of any kind, and
+ * `mux_flush` wrote the moment a datagram filled.  So an access unit left the
+ * machine as one instantaneous clump: a 111 KB keyframe is ~98 datagrams in
+ * ~zero time, and the measured wire confirmed it -- 144 datagrams inside any
+ * 25 ms window, against the car's own 61 (measured on the same interface, the
+ * same night).  MS-S's own spacing is ~1 ms between datagrams, because it is
+ * paced by an encoder ticking every 100 ms.
+ *
+ * That is not cosmetic.  A receiver with a finite ring buffer sees a 2.4x
+ * instantaneous overshoot and drops; the decoder then paints garbage over the
+ * macroblocks whose bits were lost.  It does NOT show up at a passive tap,
+ * because the tap is not the ECU -- which is exactly how "the wire is lossless"
+ * and "the picture is blocky" were both true at once.
+ *
+ * MHI2 does not have this problem by construction: /dev/mlb/isoTX2 is a MOST
+ * ISOCHRONOUS channel, and the hardware hands over a fixed slice per frame.  We
+ * have to provide that ourselves.
+ *
+ * DEADLINE PACING, NOT PER-DATAGRAM SLEEP -- AND NOW NOT A SLEEP AT ALL
+ * (2026-10-30, second pass).  The first attempt slept in the write path with
+ * usleep().  That works, and it is why this comment used to justify it with
+ * "HZ=100 => usleep(700) can round to ~10 ms".  That justification was WRONG:
+ * this kernel has CONFIG_HIGH_RES_TIMERS=y + TICK_ONESHOT=y, so usleep() lands on
+ * an hrtimer and is not tick-quantised at all.  The real defects were different:
+ *
+ *   1. It slept INSIDE the write path, so the AU reader was blind for up to a
+ *      whole slot (~94 ms) while the phone was delivering every ~69 ms.  Both
+ *      feedback sensors (the PTS-step EWMA and the arrival-rate meter) are fed by
+ *      arrival timestamps taken at READ time, so the loop was measuring its own
+ *      latency -- a feedback loop fed by its own error.
+ *   2. It spread over a GUESSED datagram count, `(len+183)/184 + 2`, taken before
+ *      muxing.  The muxer really emits optional PAT/PMT, a PES-start packet, the
+ *      `n == 183 -> 182` re-splits and the null padding -- a few MORE than that.
+ *      Once its index passed the guess it switched itself off, so the tail of
+ *      every access unit still left as a clump.
+ *   3. Its clock was now_ms(): a 1 ms grid for a ~3.2 ms spacing, i.e. 30% jitter
+ *      before any kernel behaviour entered the picture.
+ *
+ * So the emitter is now driven by the MAIN LOOP instead.  mux_au still muxes the
+ * whole AU in one pass -- so PSI/PCR decisions, RTP sequence numbers and every
+ * byte on the wire are IDENTICAL to the unpaced build -- but the datagrams land
+ * in `dbuf` instead of on the socket, and the loop releases them:
+ *
+ *     deadline(i) = t0 + iv * (cumulative PAYLOAD bytes through datagram i) / AU size
+ *
+ * Byte-proportional deadlines cannot run out of budget the way an estimate can:
+ * the last datagram carries cum == AU size, so its deadline is exactly the end of
+ * the slot, and the null padding rides that same cursor.  `ppoll` then takes the
+ * time remaining as its TIMEOUT, so the wait happens between poll iterations
+ * rather than inside a write, and the deadline is nanosecond-granular.
+ *
+ * 0 = disabled (file mode, --no-jit, catch-up drains), which reproduces the old
+ * behaviour exactly. */
+
+/* Deadline, in ns, at which datagram `i` of the in-flight AU is due.
+ *
+ * The MIDPOINT of the datagram's byte range, not its end.  Using the end pushed
+ * every AU's tail to the very last microsecond of the slot (racing the next AU's
+ * arm) and, worse, put a single-datagram AU at the END of its slot with a whole
+ * slot of silence in front of it.  With midpoints, n equal datagrams land at
+ * t0 + slot*(i+0.5)/n -- evenly spaced and centred -- and the last one finishes
+ * ~1/n of a slot early, which is the headroom that keeps it clear of the next
+ * arm without throwing away any of the slot. */
+static u64 emit_due_ns(const Mux *m, int i)
+{
+    u64 total = m->au_payload ? m->au_payload : 1;
+    u64 lo = (i > 0) ? m->dcum[i - 1] : 0;
+    u64 hi = m->dcum[i];
+    u64 mid;
+    if (hi > total) hi = total;
+    if (lo > hi) lo = hi;
+    mid = lo + (hi - lo) / 2;
+    return m->au_t0_ns + (m->au_iv_ms * 1000000ull * mid) / total;
+}
+
+/* Publish every datagram of the in-flight AU whose deadline has passed.
+ * NEVER blocks: writes at most EMIT_BURST datagrams (~9 KB, ~70 us) per call, so
+ * the reader is never held off.  Returns 1 while datagrams remain. */
+#define EMIT_BURST 8
+static int emit_pump(Mux *m, u64 now)
+{
+    int n = 0;
+    if (m->dcursor >= m->dndg) {
+        m->dndg = m->dcursor = 0;
+        m->au_iv_ms = 0;
+        return 0;                            /* nothing in flight */
+    }
+    /* DUE FIRST.  A datagram whose deadline has arrived is normal traffic even if
+     * that deadline is the last microsecond of the slot -- checking the slot
+     * BEFORE the deadline is what turned every frame's tail into a "collapse". */
+    while (m->dcursor < m->dndg && n < EMIT_BURST) {
+        if (now < emit_due_ns(m, m->dcursor)) break;
+        mux_dg_write(m, m->dbuf + (usize_t)m->dcursor * (usize_t)m->drow,
+                     (int)m->dlen[m->dcursor]);
+        m->dcursor++; n++;
+    }
+    /* OVERRUN: the slot has passed and datagrams are still queued.
+     *
+     * IT MUST NOT DUMP (2026-10-30, measured on the car).  Collapsing the rest of
+     * a frame to immediate emission was described here as "being LATE is worse
+     * than being dense".  The capture says otherwise: during the zoom/guidance
+     * burst a 192 KB frame went out as 169 datagrams inside one 25 ms window,
+     * while the same stream runs at 28 per 25 ms when calm and the car's own
+     * stream peaks at 61.  The clump IS the artifact.
+     *
+     * So keep the RATE and extend the slot instead: recompute the slot from the
+     * bytes still to send, at the same bytes-per-millisecond the AU was armed
+     * with.  A frame then simply takes two or three frame-times to leave -- which
+     * is exactly what the working sender does (the car's own keyframe occupies
+     * ~430 ms of wire against a 100 ms frame interval) -- and the release clock
+     * waits for it rather than flushing it. */
+    if (m->dcursor < m->dndg && m->au_iv_ms &&
+        now > m->au_t0_ns + m->au_iv_ms * 1000000ull) {
+        if (!m->overrun_seen) { m->spread_overruns++; m->overrun_seen = 1; }
+        { u64 total = m->au_payload ? m->au_payload : 1;
+          u64 done  = (m->dcursor > 0) ? m->dcum[m->dcursor - 1] : 0;
+          u64 rem   = (done < total) ? (total - done) : 0;
+          u64 extra = (rem * m->au_iv_ms) / total;
+          if (!extra) extra = 1;
+          m->au_t0_ns = now;              /* re-anchor: same rate, more time */
+          m->au_iv_ms = extra;
+        }
+    }
+    if (m->dcursor >= m->dndg) {
+        m->dndg = m->dcursor = 0;
+        m->au_iv_ms = 0;                     /* the slot is over */
+        m->overrun_seen = 0;
+        return 0;
+    }
+    return 1;
+}
+
+/* Push the remainder out NOW.  Used at connection close, and when a new AU is
+ * armed while the previous one is still in flight (which only happens when the
+ * release clock has fallen behind -- i.e. the collapse path above).  AU ORDER AND
+ * BOUNDARIES ARE PRESERVED: this never interleaves two access units. */
+static void emit_drain(Mux *m, int counted)
+{
+    if (m->dcursor >= m->dndg) {
+        m->dndg = m->dcursor = 0;
+        m->au_iv_ms = 0;
+        return;
+    }
+    if (counted) m->spread_overruns++;
+    while (m->dcursor < m->dndg) {
+        mux_dg_write(m, m->dbuf + (usize_t)m->dcursor * (usize_t)m->drow,
+                     (int)m->dlen[m->dcursor]);
+        m->dcursor++;
+    }
+    m->dndg = m->dcursor = 0;
+    m->au_iv_ms = 0;
+    m->overrun_seen = 0;
+}
+
+/* How long the loop may block, in ns: the NEXT DATAGRAM'S DEADLINE is the poll
+ * timeout.  Capped at the loop's old 2 ms cadence so the release clock and EOF
+ * detection keep exactly their previous timing when nothing is in flight. */
+static u64 emit_timeout_ns(Mux *m)
+{
+    const u64 cap = 2000000ull;              /* the loop's historical 2 ms */
+    u64 now, due;
+    if (m->dcursor >= m->dndg) return cap;
+    now = now_ns();
+    if (m->au_iv_ms && now > m->au_t0_ns + m->au_iv_ms * 1000000ull) return 0;
+    due = emit_due_ns(m, m->dcursor);
+    if (due <= now) return 0;                /* due now: do not block at all */
+    return (due - now) < cap ? (due - now) : cap;
 }
 
 /* TS null packet (PID 0x1FFF).  A receiver MUST ignore these; the payload is
@@ -489,6 +875,7 @@ static void mux_au(Mux *m, const u8 *au, int len, u64 pts90k)
 {
     u8 pkt[TS_LEN];
     u64 ms = now_ms();
+    m->rtp_ts = (u32)pts90k;     /* RFC 2250: RTP ts is the media time of this AU */
     if (m->last_psi_ms == 0 || ms - m->last_psi_ms >= 500) {
         pack_pat(pkt, m->tsid, m->pmt_pid, m->cc_pat++ & 0x0F);
         mux_push(m, pkt);
@@ -509,6 +896,11 @@ static void mux_au(Mux *m, const u8 *au, int len, u64 pts90k)
     memcpy(es + hn, au, (usize_t)first);
     pack_ts(pkt, m->es_pid, 1, m->cc_es++ & 0x0F, es, hn + first, want_pcr, pts90k, 1);
     if (want_pcr) m->last_pcr_ms = ms;
+    /* CUMULATIVE PAYLOAD BYTES, counted BEFORE the push that may close a
+     * datagram -- so a datagram records the AU bytes it actually carried, and the
+     * emitter's deadline is proportional to real progress rather than to a guess.
+     * PSI packets contribute nothing (they are container, not payload). */
+    m->au_done += (u64)(unsigned)first;
     mux_push(m, pkt);
 
     int off = first;
@@ -517,6 +909,7 @@ static void mux_au(Mux *m, const u8 *au, int len, u64 pts90k)
         if (n > 184) n = 184;
         if (n == 183) n = 182;           /* 183 has no legal TS encoding */
         pack_ts(pkt, m->es_pid, 0, m->cc_es++ & 0x0F, au + off, n, 0, 0, 0);
+        m->au_done += (u64)(unsigned)n;
         mux_push(m, pkt);
         off += n;
     }
@@ -766,6 +1159,25 @@ typedef struct { u8 addr[16]; unsigned idx; } mreq_t;
  * <poll.h>).  Used by the pacer loop and by probe's wall-clock bound. */
 typedef struct { int fd_; short ev_, rev_; } pfd_t;
 
+/* ppoll() gives a NANOSECOND timeout, which is what lets the emit deadline be
+ * the poll timeout instead of a usleep().  The unit's libc exports it (verified
+ * against R8830L_ROOTFS/lib64/libc.so.6), so this is libc-only, no timerfd and no
+ * new DT_NEEDED.  Every other build (the macOS desk build, which has no ppoll)
+ * rounds the timeout up to poll()'s millisecond: the deadline ARITHMETIC is
+ * identical, only the wait granularity differs, and that difference is stated
+ * with any desk measurement. */
+#if defined(MIB3_UNIT_AARCH64)
+#define PPOLL_(p, n, ts) ppoll((void *)(p), (unsigned long)(n), (const void *)(ts), 0)
+#else
+static int mib3_ppoll(pfd_t *p, usize_t n, const tspec_t *ts)
+{
+    int ms = 0;
+    if (ts) ms = (int)(ts->SEC_ * 1000 + (ts->NSEC_ + 999999) / 1000000);
+    return poll((void *)p, n, ms);
+}
+#define PPOLL_(p, n, ts) mib3_ppoll((p), (n), (ts))
+#endif
+
 static int probe(const char *dst, int port, const char *out, int count, int seconds, int video_only)
 {
     char host[128]; const char *ifname = "eth0.5";
@@ -797,7 +1209,7 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
     u8 buf[4096];
     long n = 0; u64 first_seq = 0, last_seq = 0, ssrc = 0; int have = 0;
     u64 t_start = now_ms(); u64 skipped = 0;
-    while (n < count) {
+    while (count < 0 || n < count) {
         /* A COUNT-ONLY bound is a trap: while the nav is parked the idle PT=98
          * beacon alone can fill every slot before the phone ever connects, so the
          * capture ends holding zero video (cost a whole session 2026-10-27).  So
@@ -833,7 +1245,21 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
             hx[k++] = '\n'; write(STDERR_, hx, k);
         }
     }
-    say("probe: datagrams="); say_int("", n);
+    { u64 el = now_ms() - t_start;
+      say("probe: datagrams="); say_int("", n);
+      say("probe: elapsed_ms="); say_int("", (long)el);
+      if (el > 0) {
+          say("probe: datagrams per second=");
+          say_int("", (long)((n * 1000ull) / el));
+      }
+      /* LOGGING AUDIT 2026-10-29: this mode used to stop at --probe-count
+       * (default 200) and print "datagrams=200" with NO elapsed time.  That
+       * number was then read as a rate, and produced a whole session of wrong
+       * "the wire is dark / decaying" conclusions.  Say it out loud instead. */
+      if (seconds > 0 && el + 50 < (u64)seconds * 1000ull) {
+          say("probe: COUNT CAP HIT before the window elapsed -- TRUNCATED; do not read the count as a rate\n");
+      }
+    }
     if (video_only) { say("probe: skipped non-video="); say_int("", (long)skipped); }
     say("probe: seq first="); say_int("", (long)first_seq);
     say("probe: seq last=");  say_int("", (long)last_seq);
@@ -878,16 +1304,40 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
  * fill was meant to cover: an AU's tail used to wait in the buffer for the next
  * AU, so the last picture of every burst sat incomplete on the wire.
  */
-#define QCAP 8
+/* THE QUEUE IS THE JITTER BUFFER (2026-10-30).  8 entries was a latency bound
+ * for a pass-through pacer; it is not a buffer.  A jitter buffer has to hold
+ * the phone's worst measured hole (486 ms, ~9 AUs at 17 fps) plus its bursts,
+ * and --jit-ms converts that to entries at run time.  64 is a generous ceiling
+ * (~3 MB worst case at 48 KB/frame) and the maxq drain below keeps the depth
+ * near the target rather than letting it walk up to the ceiling. */
+#define QCAP 64
+#define QMAXDRAIN 40
+/* OUTPUT RATE CEILING (2026-10-30).  Used ONLY when draining a backlog.  The
+ * car's own stream peaks at 61 datagrams in 25 ms = 1140*61/25 = 2,782 bytes/ms,
+ * so 2,000 B/ms (~16 Mbit/s) is deliberately BELOW the reference sender: a
+ * catch-up may be fast, never faster than the stream this ECU already renders.
+ * It is the bound that lets us drain proportionally without recreating the
+ * 169-datagram clump that caused the artifacts. */
+#define OUT_RATE_B_PER_MS 2000u
+/* LATENCY CAP: if the oldest queued frame is older than this, drain at the
+ * ceiling above.  This is the number the owner actually feels. */
+#define LAT_CAP_MS 400u
 
 typedef struct {
     Mux *m; u64 t0; u64 frame; u64 last_emit;
     u8 *ref; usize_t ref_len, ref_cap;
-    u64 step;                 /* nominal PTS step per AU (90 kHz), from arrival EWMA */
+    u64 step;                 /* the COMMITTED PTS step per AU (90 kHz) */
+    u64 step_ewma;            /* the sensor: arrival-interval EWMA (ms*90) */
+    u64 step_commit_ms;       /* when the sensor was last committed to step */
+    u64 wall0, pts0;          /* slew reference: wall ms and PTS at anchor */
+    u64 iv_ms;                /* release interval to spread the AU over (0=no) */
 } Pace;
 
-static int au_is_ref(const u8 *d, usize_t n)
-{
+/* (car-declared helper removed 2026-10-30: the release interval is now a
+ * time-window rate measurement inside the clock block, not an average of gaps --
+ * see "ARRIVAL RATE METER" there for why the gap average was 15% too fast.) */
+
+static int au_is_ref(const u8 *d, usize_t n){
     usize_t i = 0;
     while (i + 3 <= n) {
         if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 1) {
@@ -944,10 +1394,83 @@ static void pace_emit(Pace *p, const u8 *au, usize_t len)
      * cannot freeze or race the clock. */
     u64 step = p->step;
     if (step < 1800) step = 1800;             /* 20 ms  floor */
-    if (step > 9000) step = 9000;             /* 100 ms ceiling */
+    /* THE CEILING USED TO BE 100 ms, AND IT SILENTLY BROKE THE CLOCK (2026-10-30).
+     *
+     * The step is an estimate of the arrival interval, committed once a second.
+     * Capping it at 9000 ticks (100 ms) meant that the moment the phone fell
+     * below 10 AU/s, the media clock advanced slower than real time -- and the
+     * cap has no way to catch up afterwards, because every later AU also gets
+     * the capped step.  Measured on a live capture from this build: the PES
+     * clock advanced 8.82 s while 9.80 s of wall time passed, i.e. the stream's
+     * own timeline ran at 0.90x and slid further behind for the whole session.
+     * To a receiver that schedules on PTS/PCR that is a permanently-late
+     * stream: buffering grows during the quiet stretches and never recovers,
+     * which is exactly the "gets laggy" symptom.  The old comment here justified
+     * the cap as "lagging is strictly better than resynchronising" -- true for a
+     * one-off jump, false for a systematic 10% debt.
+     *
+     * So the ceiling is now a sanity bound, not a rate limit: 1 s is the
+     * slowest cadence we will believe (1 fps), and the slew correction below
+     * makes the integrated media time track wall time from then on. */
+    if (step > 90000) step = 90000;           /* 1 s   sanity bound */
+    /* SLEW, DON'T JUMP.  The committed step is still an estimate, so integrate
+     * the error against the wall clock and correct it by at most 10% per access
+     * unit.  The timeline therefore stays monotonic and smooth (no step ever
+     * changes by more than a tenth), while the long-run rate stays locked to
+     * real time.  A genuine silence (the phone paused for seconds) is NOT drift:
+     * past REBASE_MS we re-anchor instead of racing to catch up. */
+    if (!p->wall0) { p->wall0 = now_ms(); p->pts0 = p->m->pts_last; }
+    else {
+        u64 wall  = now_ms() - p->wall0;
+        u64 media = (p->m->pts_last - p->pts0) / 90u;
+        long err  = (long)wall - (long)media;
+        if (err > 2000 || err < -2000) {          /* a pause, not a drift */
+            p->wall0 = now_ms(); p->pts0 = p->m->pts_last;
+        } else if (err > 50 || err < -50) {
+            long adj  = (long)(step / 10);
+            long corr = (err > 0) ? adj : -adj;
+            if (corr > 0 && (u64)corr > step - 1800) corr = (long)(step - 1800);
+            if (corr < 0 && (u64)(-corr) > 90000 - step) corr = -(long)(90000 - step);
+            step = (u64)((long)step + corr);
+        }
+    }
     p->m->pts_last += step;
     u64 pts = p->m->pts_last;
+
+    /* SPREAD THE ACCESS UNIT ACROSS ITS INTERVAL (see INTRA-FRAME RELEASE).
+     * iv_ms == 0 means "no pacing": the catch-up/drain paths, and --no-jit,
+     * which must reproduce the old unthrottled behaviour byte for byte.
+     *
+     * ONE AU IN FLIGHT, ALWAYS.  If the previous one is still being released the
+     * release clock has fallen behind, so its remainder is pushed out now and
+     * counted -- two access units must never interleave on the wire, and one AU's
+     * spread must never make the next AU late. */
+    if (!p->iv_ms) p->m->spread_skipped++;   /* catch-up: whole AU goes at once */
+    if (p->m->dndg) {
+        /* Publish what is already due first: the tail of the previous AU is
+         * normally due at exactly this moment, and draining it as a "collapse"
+         * would misreport a healthy session.  Only a genuine remainder is one. */
+        emit_pump(p->m, now_ns());
+        if (p->m->dndg) emit_drain(p->m, 1);
+    }
+    p->m->dndg = p->m->dcursor = 0;
+    p->m->overrun_seen = 0;
+    p->m->au_t0_ns   = now_ns();
+    p->m->au_iv_ms   = (u64)p->iv_ms;
+    /* RATE CEILING: a frame may never leave faster than OUT_RATE_B_PER_MS, no
+     * matter how urgently the release clock wants it gone.  This is what makes a
+     * late frame SPREAD instead of CLUMP. */
+    { u64 floor_ms = (u64)len / (u64)OUT_RATE_B_PER_MS;
+      if (floor_ms < 1) floor_ms = 1;
+      if (p->m->au_iv_ms < floor_ms) p->m->au_iv_ms = floor_ms; }
+    p->m->au_payload = (u64)len;
+    p->m->au_done    = 0;
+
     mux_au(p->m, au, (int)len, pts);
+    /* au_iv_ms is deliberately NOT cleared here: it is the budget the pump needs
+     * until the last datagram is out (emit_pump/emit_drain clear it).  Every path
+     * that muxes without pace_emit (file mode) leaves it 0, so it writes
+     * immediately exactly as before. */
     p->frame++;
     if (au_is_ref(au, len)) {                 /* remember a fill frame */
         if (len > p->ref_cap) {
@@ -960,7 +1483,12 @@ static void pace_emit(Pace *p, const u8 *au, usize_t len)
 }
 
 /* -------------------------------------------------------------------- main */
-#define MAXAU (1 << 18)
+/* File-mode AU table.  1<<14 AUs = ~9 minutes at 30 fps of *synthetic* input
+ * (this table is only used by --in <file>, never by the live unix path); the
+ * old 1<<18 was 3 MB of BSS in the freestanding unit binary for a bench path.
+ * A file with more AUs than this is truncated by split_annexb's maxau guard
+ * (as it always was) -- nothing silently misbehaves. */
+#define MAXAU (1 << 14)
 static const u8 *aus[MAXAU];
 static int alen[MAXAU];
 
@@ -968,9 +1496,13 @@ int mib3_run(int argc, char **argv) __attribute__((used));
 int mib3_run(int argc, char **argv)
 {
     const char *in = "-", *dst = DEF_DST, *src = 0, *out = 0, *infmt = "annexb";
-    int port = DEF_PORT, loop = 0, realtime = 0, fps = 30, do_probe = 0, probe_n = 200;
+    int port = DEF_PORT, loop = 0, realtime = 0, fps = 30, do_probe = 0, probe_n = -1;
     int probe_secs = 0, probe_video = 0;
     int pace_ms = 10, ka_ms = 0;   /* output shape: see the pacer block */
+    int jit_ms = 300;              /* jitter buffer depth (the isochronous clock);
+                                  * 2026-10-30: 500 -> 300 ms.  With the pacer
+                                  * fixed the wire is smooth, and buffer depth is
+                                  * now pure ADDED LATENCY on every interaction. */
     int gap_ms = 0, gap_every = 0; /* --gap-ms/--gap-every: simulate the phone's silence */
     u64 gaps_sent = 0;
     int sport = 0;
@@ -1008,18 +1540,27 @@ int mib3_run(int argc, char **argv)
         else if (!strcmp(a, "--probe")) do_probe = 1;
         else if (!strcmp(a, "--no-fold")) nofold = 1;   /* bench comparison only */
         else if (!strcmp(a, "--no-idr-gate")) noidr = 1;/* bench comparison only */
-        else if (!strcmp(a, "--probe-count") && v) { probe_n = atoi(v); i++; }
+        else if (!strcmp(a, "--probe-count") && v) { probe_n = atoi(v); i++; }  /* -1 = unlimited (default) */
         else if (!strcmp(a, "--probe-secs") && v) { probe_secs = atoi(v); i++; }
         else if (!strcmp(a, "--probe-video-only")) probe_video = 1;
         else if (!strcmp(a, "--pace-ms") && v) { pace_ms = atoi(v); i++; }
         else if (!strcmp(a, "--no-pace")) pace_ms = 0;
         else if (!strcmp(a, "--ka-ms") && v) { ka_ms = atoi(v); i++; }
         else if (!strcmp(a, "--no-ka")) ka_ms = 0;
+        /* Record the monotonic timestamp of every write() and report the
+         * inter-datagram gap distribution at exit.  The capture format has no
+         * timestamps, so this is the ONLY way to prove the wire is continuous. */
+        else if (!strcmp(a, "--stats-timing")) g_timing_on = 1;
+        else if (!strcmp(a, "--jit-ms") && v) { jit_ms = atoi(v); i++; }
+        else if (!strcmp(a, "--no-jit")) jit_ms = 0;
         else if (!strcmp(a, "--gap-ms") && v) { gap_ms = atoi(v); i++; }
         else if (!strcmp(a, "--gap-every") && v) { gap_every = atoi(v); i++; }
         else { say("unknown arg"); return 2; }
     }
     if (m.npk < 1 || m.npk > MAX_PKTS) { say("bad --pkts-per-dgram"); return 2; }
+    /* Stride of one buffered datagram for the emitter (see LOOP-DRIVEN EMISSION).
+     * Set before anything can call the pump. */
+    m.drow = RTP_LEN + m.npk * TS_LEN;
     if (do_probe) return probe(dst, port, out, probe_n, probe_secs, probe_video);
 
     if (out && !strncmp(out, "file:", 5)) {
@@ -1118,7 +1659,7 @@ int mib3_run(int argc, char **argv)
      * display...").  So: carry the header only when it is NEW (a real SPS/PPS
      * change, or the first frame of a connection) or when the AU is an IDR. */
     int hdr_pending = 1;
-    u64 held = 0, backlog = 0;
+    u64 held = 0, backlog = 0, backlog_aus = 0;
 
     if (!uni_mode) {
         /* --gap-ms / --gap-every: SIMULATE THE PHONE'S SILENCE (2026-10-27).
@@ -1166,33 +1707,306 @@ int mib3_run(int argc, char **argv)
          * live in Mux and therefore continue across connections: a reset there
          * would look like a new stream to the receiver mid-flight. */
         say("pacer: floor="); say_int("", pace_ms); say(" ms/group  idle-fill=");
-        say_int("", ka_ms); say(" ms\n");
+        say_int("", ka_ms); say(" ms  jitter-buffer=ADAPTIVE (start ");
+        say_int("", jit_ms); say(" ms, grows on starvation, shrinks when idle)");
+        say("  intra-frame release=ON (loop/ppoll, byte-proportional)\n");
         for (;;) {
             int uni = accept(ls, 0, 0);
             if (uni < 0) { say("accept failed -- stopping\n"); break; }
             m.last_psi_ms = 0;          /* PSI first: let the receiver re-acquire */
             cfg_reset(&cfg);            /* a fresh connection owes us a header   */
             hdr_pending = 1;            /* ...which must ride its next VCL AU     */
+            /* A NEW CONNECTION IS A NEW STREAM (P0-4, REVIEW_PATHB_2026-10-28 --
+             * applied to the tree now).  The shim closes the AU socket when the
+             * phone's stream ends, so a close here usually means the reference
+             * chain is dead; the start gate therefore re-arms per connection.
+             * (The pre-2026-10-26 decode path once lost 1749 AUs to a gate reset
+             * on a TRANSIENT reconnect -- but that path re-decoded from scratch;
+             * here the ECU keeps its chain and a stale one is poison.)  Cost
+             * bound: the shim's IDR pump asks every 500 ms, so a session that
+             * opens mid-GOP is held at most ~0.5 s -- measured benign, and
+             * strictly better than muxing a new session's P-slices onto the dead
+             * chain of the session before it. */
+            streaming = 0;
             say("conn open  frame=");   say_int("", (long)frame);
 
             /* ---- PACER + IDLE FILL (see the block above) ---------------------- */
             u8 *qb[QCAP]; usize_t ql[QCAP]; usize_t qcap[QCAP];
+            u64 qarr[QCAP];      /* arrival ms per queued AU (latency measurement) */
             int qh = 0, qn = 0;         /* ring head + count: never shift pointers */
             for (int k = 0; k < QCAP; k++) { qb[k] = 0; ql[k] = 0; qcap[k] = 0; }
             Pace pc; memset(&pc, 0, sizeof pc);
             pc.m = &m; pc.t0 = m.t0_ms; pc.frame = frame;
             u64 next_emit = 0, ka_count = 0, gaps = 0, last_arrive = 0;
+            /* isochronous clock state (see the block in the poll loop) */
+            u64 jit_started = 0, conn_t0 = 0, underruns = 0, overflow_drains = 0;
+            int jit_tgt = 0;                     /* target depth, frames -- ADAPTIVE */
+            int jit_min = 2, jit_max = 10;
+            u64 rt_t0 = 0, rt_n = 0, iv_out = 0; /* arrival rate meter                */
+            u64 starve_at = 0, last_shrink = 0, last_grow = 0;
+            u64 lat_ring[64]; u64 lat_i = 0, lat_n = 0, lat_max = 0, lat_log_ms = 0;
 
             for (;;) {
                 pfd_t pf; pf.fd_ = uni; pf.ev_ = 1; pf.rev_ = 0;
-                int pr = poll((void *)&pf, 1, 2);
+                /* THE NEXT DATAGRAM'S DEADLINE IS THE POLL TIMEOUT (2026-10-30).
+                 * ppoll takes a nanosecond timespec, so a datagram due in 0.4 ms
+                 * is waited for exactly instead of being rounded up to poll()'s
+                 * millisecond, and nothing is slept for inside a write.  Capped at
+                 * the loop's historical 2 ms so the release clock, the arrival
+                 * meter and EOF detection keep their previous cadence. */
+                tspec_t pto;
+                { u64 to = emit_timeout_ns(&m);
+                  pto.SEC_  = (long)(to / 1000000000ull);
+                  pto.NSEC_ = (long)(to % 1000000000ull); }
+                int pr = PPOLL_(&pf, 1, &pto);
                 int ready = (pr > 0 && (pf.rev_ & 1));
+
+                /* ================== ISOCHRONOUS RELEASE CLOCK ==================
+                 * WHY THIS EXISTS (2026-10-30, measured on the car).
+                 *
+                 * Path B forwarded the phone's timing along with its pictures.
+                 * Measured on the live phone stream: 17.15 fps, cadence stray
+                 * 83 % p95, and FOURTEEN complete silences of 350-490 ms in 20
+                 * seconds.  The car's own stream -- which this ECU renders for
+                 * ever -- has ZERO gaps over 20 ms in the same window, because
+                 * MS-S re-encodes a surface on a ~100 ms clock and MHI2 writes
+                 * to a MOST ISOCHRONOUS channel.  Both guarantee the receiver is
+                 * never starved; neither forwards the source's silence.
+                 *
+                 * Path B deleted that layer (that was the point -- no decode, no
+                 * re-encode, real frame rate), and deleted its two guarantees
+                 * with it.  This provides them in software:
+                 *
+                 *   clock  = the phone's LONG-RUN average interval (jit_iv), so
+                 *            the buffer neither drains nor grows over time;
+                 *   buffer = absorbs the phone's SHORT-RUN variance (its bursts
+                 *            and its holes) up to --jit-ms.
+                 *
+                 * Get those two the right way round and a bursty source produces
+                 * a metronomic wire.  Swap them (clock = latest interval) and the
+                 * buffer walks to empty or to maximum latency.
+                 *
+                 * It MUST run every poll iteration -- the whole bug was that
+                 * emission sat inside the arrival branch.
+                 *
+                 * A LONG pause (>--jit-ms: measured 1.5-2.3 s at guidance
+                 * start/stop) drains the buffer and the wire genuinely goes
+                 * quiet.  Deliberate: repeating the last frame was measured and
+                 * refuted (429 byte-identical repeats, and a repeated P-frame
+                 * re-uses its frame_num, which a strict decoder latches as an
+                 * error).  Recovery is the shim's 500 ms recovery-point pump.
+                 * ----------------------------------------------------------------- */
+                { u64 now2 = now_ms();
+
+                  /* ---- ARRIVAL RATE METER ------------------------------------
+                   * The clock must follow the phone's LONG-RUN rate.  A mean of
+                   * gaps cannot do that on a bursty source: the many short gaps
+                   * dominate and the few holes barely count, so it reads fast.
+                   * Measured on the car: gap-average said 65 ms while the stream
+                   * truly sustained 74.6 ms -- we released 15% too fast, drained
+                   * the buffer and starved, which is exactly the 4 remaining
+                   * stalls.  Counting arrivals over a time window gives the rate
+                   * the source actually sustained. */
+                  if (rt_n && rt_t0) {
+                      u64 win = now2 - rt_t0;
+                      if (win >= 1000) {
+                          u64 ivm = win / rt_n;
+                          iv_out = iv_out ? (iv_out * 3 + ivm) / 4 : ivm;
+                          if (iv_out < 10)  iv_out = 10;    /* 100 fps */
+                          if (iv_out > 125) iv_out = 125;   /*   8 fps */
+                          rt_t0 = now2; rt_n = 0;
+                      }
+                  }
+                  /* Initial target: a SEED from the gap estimate only, because
+                   * the first frames arrive before a rate window has closed.  The
+                   * clock itself never uses this estimator (see above), and
+                   * grow/shrink corrects the target within seconds. */
+                  if (!jit_tgt) {
+                      u64 est = pc.step_ewma ? pc.step_ewma / 90 : 40;
+                      if (est < 10)  est = 10;
+                      if (est > 125) est = 125;
+                      jit_tgt = (int)((u64)(jit_ms ? jit_ms : 250) / est);
+                  }
+                  if (jit_tgt < 2)  jit_tgt = 2;
+                  if (jit_tgt > jit_max) jit_tgt = jit_max;
+
+                  /* ---- DEPTH CONTROLLER --------------------------------------
+                   * Depth is held by the RATE, not by the queue: emitting at
+                   * exactly the source's rate holds whatever depth we have.  So
+                   * the target is maintained by nudging the clock:
+                   *   below target -> release 12% slower (refill; and during a
+                   *                   phone hole this also stretches our frames
+                   *                   across the silence, which is the point)
+                   *   above target -> release 12% faster (drain a burst)
+                   * That is a P-controller on buffer depth, and it is what makes
+                   * the buffer ADAPTIVE instead of a permanent latency tax. */
+                  /* PROPORTIONAL DRAIN + HARD LATENCY CAP (2026-10-30, measured).
+                   *
+                   * Latency was measured at p50 317 ms calm and 1.5 s during a
+                   * zoom.  The cause is the queue: after a scene change the phone
+                   * flushes a burst, and releasing it at the SOURCE rate takes
+                   * queue_depth x interval to clear -- 25 frames x 60 ms = 1.5 s,
+                   * which is exactly what was measured.  Halving the interval when
+                   * the queue is merely "over target" is far too timid.
+                   *
+                   * So: release faster in proportion to how deep the queue is, and
+                   * if the oldest frame is older than LAT_CAP_MS, go flat out.
+                   * "Flat out" is bounded by OUT_RATE_B_PER_MS inside pace_emit,
+                   * so draining can never recreate the clump that caused the
+                   * artifacts. */
+                  u64 iv = iv_out ? iv_out : 40;
+                  if (jit_tgt && qn > jit_tgt) {
+                      u64 scaled = (iv_out ? iv_out : 40) * (u64)jit_tgt / (u64)qn;
+                      if (scaled < 2) scaled = 2;
+                      iv = scaled;
+                  } else if (jit_tgt && qn < jit_tgt) {
+                      iv = iv + iv / 8 + 1;
+                  }
+                  if (qn > 0 && (now2 - qarr[qh]) > (u64)LAT_CAP_MS) iv = 2;
+
+                  if (!streaming) { jit_started = 0; conn_t0 = 0; }
+                  if (streaming && !conn_t0) conn_t0 = now2;
+                  if (!next_emit) next_emit = now2;
+
+                  /* PRE-ROLL: fill to the target before the first emit.  Bounded
+                   * in wall time, so a slow-starting phone cannot hold the
+                   * picture off the screen for ever. */
+                  if (jit_ms && qn > 0 && !jit_started && qn >= jit_tgt) {
+                      jit_started = 1;
+                      say("jit: pre-roll reached target "); say_int("", jit_tgt);
+                      say(" AU(s) ~"); say_int("", (long)((iv_out ? iv_out : 40) * (u64)jit_tgt));
+                      say(" ms, interval "); say_int("", (long)(iv_out ? iv_out : 40));
+                      say(" ms\n");
+                  }
+                  if (!jit_ms) jit_started = 1;          /* --no-jit: legacy   */
+                  if (now2 - lat_log_ms >= 2000 && lat_n) {
+                      u64 tmp[64]; int k2, kk;
+                      for (k2 = 0; k2 < (int)lat_n; k2++) tmp[k2] = lat_ring[k2];
+                      for (k2 = 1; k2 < (int)lat_n; k2++) { u64 v = tmp[k2]; kk = k2 - 1;
+                          while (kk >= 0 && tmp[kk] > v) { tmp[kk+1] = tmp[kk]; kk--; }
+                          tmp[kk+1] = v; }
+                      lat_log_ms = now2;
+                      say("lat: ours p50="); say_int("", (long)tmp[lat_n/2]);
+                      say(" p95="); say_int("", (long)tmp[(lat_n*95)/100]);
+                      say(" max="); say_int("", (long)lat_max);
+                      say(" ms  qn="); say_int("", (long)qn);
+                      say(" tgt="); say_int("", jit_tgt);
+                      say(" iv="); say_int("", (long)iv); say(" ms\n");
+                  }
+                  if (jit_ms && !jit_started && conn_t0 &&
+                      now2 - conn_t0 >= (u64)jit_ms) {
+                      jit_started = 1;
+                      say("jit: pre-roll TIMED OUT with "); say_int("", (long)qn);
+                      say(" of "); say_int("", jit_tgt); say(" AU(s)\n");
+                  }
+
+                  if (streaming && jit_started && qn > 0 && now2 >= next_emit) {
+                      /* ONE FRAME ON THE WIRE AT A TIME (2026-10-30, measured).
+                       * Arming the next AU while the previous one is still being
+                       * released used to flush the remainder instantly -- the same
+                       * clump as the overrun path.  Wait for it instead: it keeps
+                       * its rate, and the next release is deferred by half a slot
+                       * (deferred, never dropped). */
+                      if (m.dndg) {
+                          emit_pump(&m, now_ns());
+                          if (m.dndg) {
+                              m.deferred_arms++;
+                              next_emit = now2 + (iv > 2 ? iv / 2 : 1);
+                          }
+                      }
+                      if (!m.dndg) {
+                          /* CATCH-UP MEANS "FASTER", NOT "UNSPACED".  Emitting a
+                           * whole frame at once because the queue is over target
+                           * is what produced 169 datagrams inside one 25 ms
+                           * window.  When behind, halve the interval and keep
+                           * spreading.  --no-jit stays the UNSPACED control. */
+                          pc.iv_ms = !jit_ms ? 0
+                                   : ((jit_tgt && qn > jit_tgt + 3)
+                                          ? (iv > 2 ? iv / 2 : iv) : iv);
+                          /* LATENCY, MEASURED (2026-10-30): how long this frame sat
+                           * in OUR buffer before it reached the wire.  This is the
+                           * share of the "it takes a second to react" complaint
+                           * that belongs to us -- everything else is the phone's
+                           * re-render and its own encoder queue. */
+                          { u64 l = now2 - qarr[qh];
+                            lat_ring[lat_i & 63] = l;
+                            lat_i++;
+                            if (lat_i > 63) lat_n = 64; else if (lat_n < 64) lat_n++;
+                            if (l > lat_max) lat_max = l; }
+                          pace_emit(&pc, qb[qh], ql[qh]);
+                          pc.iv_ms = 0;
+                          qh = (qh + 1) % QCAP;
+                          qn--;
+                          next_emit = now2 + iv;
+                      }
+                  } else if (streaming && jit_started && qn == 0 &&
+                             now2 >= next_emit) {
+                      /* STARVED TICK: the buffer could not cover a hole.  Count
+                       * it, keep the clock's phase, and GROW the target -- a hole
+                       * we failed to cover is the only honest evidence that the
+                       * buffer is too shallow for this phone session. */
+                      underruns++;
+                      starve_at = now2;
+                      next_emit = now2 + iv;
+                      if (now2 - last_grow > 500 && jit_tgt < jit_max) {
+                          jit_tgt++;
+                          last_grow = now2;
+                          say("jit: grow -> "); say_int("", jit_tgt);
+                          say(" AU(s) after a starved tick (total ");
+                          say_int("", (long)underruns); say(")\n");
+                      }
+                  } else if (streaming && jit_started && jit_tgt > jit_min &&
+                             now2 - starve_at > 4000 && now2 - last_shrink > 2000) {
+                      /* ...and give latency back once the phone behaves. */
+                      jit_tgt--;
+                      last_shrink = now2;
+                      say("jit: shrink -> "); say_int("", jit_tgt);
+                      say(" AU(s) after 4 s without starvation\n");
+                  }
+
+                  /* DEPTH BOUND: drain ahead of the clock rather than let the
+                   * buffer walk up towards QCAP (which would be seconds of
+                   * latency).  It still SPREADS at the faster interval -- a deep
+                   * queue is not a reason to clump. */
+                  if (qn > QMAXDRAIN) {
+                      pc.iv_ms = !jit_ms ? 0 : (iv > 2 ? iv / 2 : iv);
+                      while (qn > QMAXDRAIN) {
+                          pace_emit(&pc, qb[qh], ql[qh]);
+                          qh = (qh + 1) % QCAP;
+                          qn--;
+                          overflow_drains++;
+                      }
+                      pc.iv_ms = 0;
+                  }
+                }
+
+                /* ================= LOOP-DRIVEN EMISSION ======================
+                 * Runs EVERY iteration, sits BEFORE the read side, and never
+                 * blocks (bounded writes), so arrivals are still read while the
+                 * wire is paced -- which is the whole reason the sleep moved out
+                 * of the write path.  Placed after the release clock so an AU
+                 * armed in this iteration can publish immediately. */
+                emit_pump(&m, now_ns());
 
                 if (ready) {
                 u8 hdr[MIB3_HELP_HDRLEN];
-                long r = read(uni, hdr, MIB3_HELP_HDRLEN);
-                if (r <= 0) break;
-                if (r != (long)MIB3_HELP_HDRLEN) { say("short header\n"); break; }
+                /* LOOP THE 16 HEADER BYTES (P1-8, REVIEW_PATHB_2026-10-28 -- was
+                 * never applied to the tree until now).  A stream socket may
+                 * split them across reads; the old single read() treated any
+                 * short read as a dead connection and threw away a healthy
+                 * session (and its reference chain) for nothing.  The body below
+                 * already loops exactly like this. */
+                long r = 0; usize_t gh = 0;
+                while (gh < MIB3_HELP_HDRLEN) {
+                    r = read(uni, hdr + gh, MIB3_HELP_HDRLEN - gh);
+                    if (r > 0) { gh += (usize_t)r; continue; }
+                    break;
+                }
+                if (gh == 0 && r < 0) continue;   /* spurious poll wakeup: re-arm */
+                if (gh != MIB3_HELP_HDRLEN) {     /* EOF, or short with no recovery */
+                    if (gh) say("short header -- connection lost\n");
+                    break;
+                }
                 u32 magic, len; u64 rseq;
                 memcpy(&magic, hdr, 4); memcpy(&len, hdr + 4, 4); memcpy(&rseq, hdr + 8, 8);
                 (void)rseq;
@@ -1213,14 +2027,30 @@ int mib3_run(int argc, char **argv)
                 /* arrival-gap accounting: this is the evidence the pacer acts on */
                 u64 nar = now_ms();
                 if (last_arrive && nar - last_arrive > 250) gaps++;
-                /* CALIBRATE THE PTS STEP from the phone's own cadence (EWMA).
-                 * This is what makes the emitted timeline constant instead of
-                 * lumpy -- see pace_emit.  Ignore silences (they are not the
-                 * frame interval) and absurd samples. */
+                /* CALIBRATE THE PTS STEP from the phone's own cadence (EWMA),
+                 * but COMMIT it only once per second (P1-7 / N2, REVIEW
+                 * PATHB_2026-10-28 -- the per-frame commit the tree shipped
+                 * until now is exactly the "breathing clock" that review
+                 * measured: our wire min/med/max 1800/2464/5043 ticks against
+                 * the car's constant 9000 +-3%).  The sensor follows every
+                 * arrival; the emitted timeline changes at most 1x/s, which is
+                 * what a fixed-rate encoder looks like to a demuxer.  Ignore
+                 * silences (they are not the frame interval) and absurd samples. */
                 if (last_arrive) {
                     u64 d = nar - last_arrive;
-                    if (d >= 5 && d <= 200)
-                        pc.step = pc.step ? (pc.step * 7 + d * 90) / 8 : d * 90;
+                    /* The upper gate was 200 ms, which silently IGNORED the very
+                     * cadences that need measuring: anything slower than 5 AU/s
+                     * left the step frozen at whatever it was, so the media
+                     * clock stopped tracking the stream at all (see the slew
+                     * correction in pace_emit).  Real silences are caught by the
+                     * 250 ms gap counter above and by the rebase there; this
+                     * gate now covers 1 fps .. 200 fps. */
+                    if (d >= 5 && d <= 1000)
+                        pc.step_ewma = pc.step_ewma ? (pc.step_ewma * 7 + d * 90) / 8 : d * 90;
+                    if ((!pc.step || !pc.step_ewma) && pc.step_ewma)
+                        { pc.step = pc.step_ewma; pc.step_commit_ms = nar; }
+                    else if (pc.step_ewma && nar - pc.step_commit_ms >= 1000)
+                        { pc.step = pc.step_ewma; pc.step_commit_ms = nar; }
                 }
                 last_arrive = nar;
 
@@ -1234,6 +2064,12 @@ int mib3_run(int argc, char **argv)
                 }
 
                 /* START GATE: hold until params + an IDR are both in hand. */
+                /* ARRIVAL-RATE METER sample.  It MUST be here, after the fold
+                 * check above: parameter-set records are not frames, and counting
+                 * them would inflate the rate for exactly the streams that carry
+                 * their headers on every keyframe. */
+                if (!rt_t0) rt_t0 = nar;
+                rt_n++;
                 if (!noidr && !streaming) {
                     if (!au_has_idr(uo, (usize_t)len)) {
                         held++;
@@ -1278,37 +2114,32 @@ int mib3_run(int argc, char **argv)
                     qb[qi] = nb; qcap[qi] = tot;
                 }
                 memcpy(qb[qi], fo, tot);
-                ql[qi] = tot; qn++;
+                ql[qi] = tot; qarr[qi] = nar; qn++;
 
                 /* pending bytes on the socket are the real backlog signal */
                 if (!noidr && qn > 3) {
                     long pend = pending_bytes(uni);
                     if (pend > (long)MAX_PENDING) {
+                        /* COUNT WHAT WE DISCARD (P1-9): resetting the queue used
+                         * to drop up to QCAP access units with no counter
+                         * anywhere -- a high-drain session could masquerade as
+                         * lossless.  The AUs are the number that reconciles
+                         * against the shim's `helper AUs total`. */
+                        backlog_aus += (u64)qn;
                         qh = 0; qn = 0;
                         streaming = 0;
                         backlog++;
                         say("gate: backlog "); say_int("", pend);
-                        say(" bytes -- draining forward to the next IDR\n");
+                        say(" bytes -- drained "); say_int("", (long)backlog_aus);
+                        say(" AUs forward to the next IDR\n");
                     }
                 }
                 }   /* end: a record was ready */
 
-                /* Emit at most one group per pace_ms, and fill silence with the
-                 * last reference frame so the ECU's pipeline is never starved. */
-                u64 now2 = now_ms();
-                if (qn > 0) {
-                    if (now2 >= next_emit) {
-                        pace_emit(&pc, qb[qh], ql[qh]);
-                        qh = (qh + 1) % QCAP;
-                        qn--;
-                        next_emit = now2 + (u64)pace_ms;
-                    }
-                } else if (streaming && pc.ref_len && ka_ms && pc.last_emit &&
-                           now2 - pc.last_emit >= (u64)ka_ms) {
-                    pace_emit(&pc, pc.ref, pc.ref_len);      /* idle fill: same picture */
-                    ka_count++;
-                    next_emit = now2 + (u64)pace_ms;
-                }
+                /* THE EMIT CLOCK IS NOT HERE ANY MORE.  Emission used to live
+                 * inside this arrival branch, which is exactly why the wire went
+                 * silent whenever the phone did.  It now runs at the top of the
+                 * poll loop -- see "ISOCHRONOUS RELEASE CLOCK" there. */
             }
             frame = pc.frame;
             close(uni);
@@ -1319,6 +2150,12 @@ int mib3_run(int argc, char **argv)
              * entries, ~80 ms of picture -- and strictly better than dropping
              * them: a receiver that is handed the tail keeps a complete chain. */
             { int drained = 0;
+              /* TEARDOWN IS NOT THE STREAM.  The queue is drained unspaced here
+               * (deliberately: the socket is closing), which is a real burst on
+               * the wire but it says nothing about the delivered stream's shape.
+               * Excluded from --stats-timing's peak/gap numbers, and reported on
+               * its own as `drained-at-close`. */
+              g_tm.ignore = 1;
               while (qn > 0) {
                 pace_emit(&pc, qb[qh], ql[qh]);
                 qh = (qh + 1) % QCAP;
@@ -1326,23 +2163,51 @@ int mib3_run(int argc, char **argv)
                 drained++;
               }
               frame = pc.frame;
+              /* The emitter may still hold the tail of the last AU: push it out
+               * before the socket closes, for the same reason the queue is
+               * drained.  Counted, because on a healthy session this should only
+               * ever fire here (once per connection), not per AU. */
+              emit_drain(&m, 0);
               mux_flush(&m);            /* never leave a partial datagram behind */
               say("conn close frame=");   say_int("", (long)frame);
               if (drained) { say("  pacer: drained-at-close="); say_int("", drained); }
+              g_tm.ignore = 0;
             }
             say("  pacer: idle-fills="); say_int("", (long)ka_count);
-            say("  arrival-gaps>250ms="); say_int("", (long)gaps); say("\n");
+            say("  arrival-gaps>250ms="); say_int("", (long)gaps);
+            /* The numbers that say whether the emulation is working.  starved
+             * ticks and depth-drains measure the isochronous clock; spread-
+             * overruns is the new one -- a spread that ran past its slot and had
+             * to be collapsed.  All should be ~0 on a healthy session. */
+            say("  jit: starved-ticks="); say_int("", (long)underruns);
+            say("  depth-drains="); say_int("", (long)overflow_drains);
+            say("  spread-overruns="); say_int("", (long)m.spread_overruns);
+            say("  spread-skipped="); say_int("", (long)m.spread_skipped);
+            say("  spread-overruns="); say_int("", (long)m.spread_overruns);
+            say("  deferred-arms="); say_int("", (long)m.deferred_arms);
+            if (m.pace_oom) { say("  PACE-OOM="); say_int("", (long)m.pace_oom); }
+            say("\n");
+            timing_report();      /* --stats-timing: this session's wire shape */
+            timing_reset();
             { int k2; for (k2 = 0; k2 < QCAP; k2++) { free(qb[k2]); } }
             free(pc.ref); pc.ref = 0; pc.ref_len = pc.ref_cap = 0;
             if (held || backlog) {
                 say("  gate: held=");   say_int("", (long)held);
                 say("  backlog drains="); say_int("", (long)backlog);
+                say("  backlog AUs discarded="); say_int("", (long)backlog_aus);
                 say("  streaming=");    say_int("", (long)streaming);
             }
         }
     }
+    emit_drain(&m, 0);
     mux_flush(&m);
     say("datagrams: "); say_int("", m.seq);
+    { u64 el = now_ms() - m.t0_ms;
+      say("elapsed_ms: "); say_int("", (long)el);
+      say("write-failures: "); say_int("", (long)m.wfail);
+      if (el > 0) { say("datagrams/sec: "); say_int("", (long)((m.seq * 1000ull) / el)); }
+    }
+    timing_report();          /* --stats-timing: the WIRE's own continuity */
     if (ls >= 0) close(ls);
     close(m.out_fd);
     return 0;

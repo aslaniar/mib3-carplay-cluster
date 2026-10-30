@@ -1,5 +1,20 @@
 # shim/ — the CarPlay cluster shim (MIB3 LG / R8830L)
 
+> **STATUS 2026-10-29 — PATH B ONLY (redteam refactor).** The in-process Path A
+> machinery is REMOVED from `mib3shim.c`: the Cinemo decode bridge, the
+> EGL/Wayland surface module, the `dry`/`local` sink modes, the
+> `ScreenStreamProcessData` and `CarPlayAppFrameworkSetSurface` interposers, and
+> the `mib3clusterhelper` build. What ships now: the three seams (advert /
+> SETUP / /info), the self-contained type-111 receiver with chacha/AES decrypt,
+> the AU-socket hop (`MIB3_SHIM_SINK=helper` -> `tools/mib3clusterstream`), the
+> command channel (showUI/forceKeyFrame/updateViewArea/zoom/appearance), the
+> control inbox + wheel lane, and the crash guard. `MIB3_SHIM_SINK` is `off` |
+> `helper` only; anything else is refused with a loud log line. The notes below
+> that describe surface/bridge/local/dry describe the REMOVED code and stay as
+> the historical record (sources also preserved in
+> `../artifacts/PATH_A_WORKING_20261026/src/`). See
+> `../REDTEAM_REFACTOR_2026-10-29.md`.
+
 > **STATUS 2026-10-16 — PROVEN LIVE on the car.** The cluster stream **connected** on port 5000 and
 > the receiver **decrypted real H.264** — see `../LANE_CLUSTER_LIVE_2026-10-16.md`.
 
@@ -25,8 +40,9 @@ process; no LG binary is modified.
 - `mib3shim.c` — the shim (interposes three seams + the Part-B receiver + the sink dispatcher).
 - `mib3clusterhelper.c` — the **out-of-process delivery helper** (the safe sink; see Route-B).
 - `mib3helper.h` — the shim↔helper frame protocol.
-- `build.sh` — cross-builds `mib3shim.so` **and** `mib3clusterhelper` (needs `brew llvm` + `brew lld`).
-- `mib3shim.so` / `mib3clusterhelper` — the built artifacts (aarch64, glibc-2.23-compatible).
+- `build.sh` — cross-builds `mib3shim.so` (needs `brew llvm` + `brew lld`; the
+  `mib3clusterhelper` build step was removed 2026-10-29 with the Path A code).
+- `mib3shim.so` — the built artifact (aarch64, glibc-2.23-compatible).
 - `shim_deploy.sh` / `shim_revert.sh` — optional wrappers (the raw commands are below).
 
 ## What it hooks (verified against R8830L, `libAirPlay.so` 320.17.4)

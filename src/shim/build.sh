@@ -30,14 +30,11 @@ for s in AirPlayInfoArrayAddScreenDisplay AirPlayReceiverSessionSetup AirPlayCop
 done
 
 # ---------------------------------------------------------------------------
-# The OUT-OF-PROCESS delivery helper (mib3clusterhelper).  A standalone aarch64
-# program (entry _start, no crt) linked against the unit's own libc/libdl; it
-# dlopen()s mib3shim.so and drives its sink exports.  See mib3clusterhelper.c.
+# mib3clusterhelper (the out-of-process CINEMO DECODE host) is NOT BUILT any
+# more (2026-10-29 redteam refactor): it exists to decode the cluster stream
+# via the shim's bridge/surface exports, which were the PATH A machinery and
+# are deleted from mib3shim.c.  Path B's AU-socket consumer is
+# tools/mib3clusterstream --in unix:... (the RTP/TS sender), which speaks the
+# same mib3helper.h framing.  The historical source stays in the tree as the
+# Path A record (it no longer matches the shim's exports and will not run).
 # ---------------------------------------------------------------------------
-echo
-echo "building mib3clusterhelper (out-of-process delivery helper)"
-$CC --target=aarch64-linux-gnu -O2 -nostdlib -fPIE -fuse-ld=$LLD -pie \
-    -Wall -Wextra -Wno-unused-parameter -o mib3clusterhelper \
-    mib3clusterhelper.c "$LIBC" "$LIBDL" -Wl,-e,_start
-echo "built mib3clusterhelper ($(wc -c < mib3clusterhelper) bytes)"
-$READELF -h mib3clusterhelper | grep -E "Class|Machine|Type"
