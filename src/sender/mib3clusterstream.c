@@ -248,6 +248,48 @@ static void say_int(const char *tag, long v)
 #define DEF_ES_PID     17
 #define DEF_PCR_PID    17
 #define DEF_NDGRAM     6
+#define DEF_CONN_STATE "/dev/shm/pathb_conn.state"
+
+/* ------------------------------------------------- connection-state publisher
+ * WHY THIS EXISTS (owner, 2026-10-30).  The cluster must be handed back on the
+ * EVENT "the phone's stream ended", not on an idle timer.  That event is the EOF
+ * this loop sees when the shim closes the AU socket, and NOBODY OUTSIDE THIS
+ * PROCESS can observe it with the same precision:
+ *   - /proc/<pid>/fd + /proc/net/unix races us: an accepted AF_UNIX socket that
+ *     has been read to EOF still sits in our fd table until we close it, which is
+ *     microseconds later but not before an outside sampler can look;
+ *   - the stderr line "conn close" can be caught half-written, and it is emitted
+ *     after the pacer drain.
+ * So publish it.  One line, rewritten in place, on connect and on close:
+ *     conn=<0|1> seq=<n>
+ * Cost: one open+write+close per SESSION, never per frame.  It writes no byte to
+ * the wire and changes nothing about pacing, framing or the access units.
+ * `--conn-state <path>` overrides the path; `--conn-state off` disables it.
+ *
+ * The reader (shim/live_kit/pathb_guard.sh) treats a 1->0 transition as THE
+ * disconnect event, and a 0->1 as "reconnected, cancel the grace".
+ */
+static char g_conn_path[112];
+static unsigned long g_conn_seq;
+
+static void conn_state(int c)
+{
+    if (!g_conn_path[0]) return;
+    char b[64]; int k = 0;
+    const char *p = "conn=";
+    while (*p) b[k++] = *p++;
+    b[k++] = (char)('0' + (c ? 1 : 0));
+    p = " seq=";
+    while (*p) b[k++] = *p++;
+    g_conn_seq++;
+    { unsigned long v = g_conn_seq; char t[24]; int j = 0;
+      if (!v) t[j++] = '0';
+      while (v) { t[j++] = (char)('0' + (int)(v % 10)); v /= 10; }
+      while (j--) b[k++] = t[j]; }
+    b[k++] = '\n';
+    int fd = open(g_conn_path, O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0644);
+    if (fd >= 0) { write(fd, b, (usize_t)k); close(fd); }
+}
 
 #define MIB3_HELP_MAGIC   0x4d334331u
 #define MIB3_HELP_HDRLEN  16u
@@ -1506,6 +1548,7 @@ int mib3_run(int argc, char **argv)
     int gap_ms = 0, gap_every = 0; /* --gap-ms/--gap-every: simulate the phone's silence */
     u64 gaps_sent = 0;
     int sport = 0;
+    const char *conn_path = DEF_CONN_STATE;   /* see conn_state() above */
     int nofold = 0;      /* regression switch ONLY: pre-2026-10-26 framing */
     int noidr = 0;       /* regression switch ONLY: no start gate */
     Mux m; memset(&m, 0, sizeof m);
@@ -1529,6 +1572,7 @@ int mib3_run(int argc, char **argv)
             sport = atoi(v); i++;
         }
         else if (!strcmp(a, "--out") && v) { out = v; i++; }
+        else if (!strcmp(a, "--conn-state") && v) { conn_path = v; i++; }
         else if (!strcmp(a, "--pkts-per-dgram") && v) { m.npk = atoi(v); i++; }
         else if (!strcmp(a, "--ssrc") && v) { m.ssrc = (u32)atoi(v); i++; }
         else if (!strcmp(a, "--tsid") && v) { m.tsid = atoi(v); i++; }
@@ -1558,6 +1602,13 @@ int mib3_run(int argc, char **argv)
         else { say("unknown arg"); return 2; }
     }
     if (m.npk < 1 || m.npk > MAX_PKTS) { say("bad --pkts-per-dgram"); return 2; }
+    /* arm the connection-state publisher (see conn_state() above).  "off" leaves
+     * g_conn_path empty and the publisher becomes a no-op. */
+    if (conn_path && *conn_path && strcmp(conn_path, "off") != 0) {
+        usize_t cn = strlen(conn_path);
+        if (cn < sizeof g_conn_path) { memcpy(g_conn_path, conn_path, cn); g_conn_path[cn] = 0; }
+        else say("--conn-state: path too long, publisher disabled\n");
+    }
     /* Stride of one buffered datagram for the emitter (see LOOP-DRIVEN EMISSION).
      * Set before anything can call the pump. */
     m.drow = RTP_LEN + m.npk * TS_LEN;
@@ -1710,9 +1761,14 @@ int mib3_run(int argc, char **argv)
         say_int("", ka_ms); say(" ms  jitter-buffer=ADAPTIVE (start ");
         say_int("", jit_ms); say(" ms, grows on starvation, shrinks when idle)");
         say("  intra-frame release=ON (loop/ppoll, byte-proportional)\n");
+        conn_state(0);              /* nothing is connected yet, say so at once */
         for (;;) {
             int uni = accept(ls, 0, 0);
             if (uni < 0) { say("accept failed -- stopping\n"); break; }
+            /* THE CONNECT EVENT.  Published before a single AU is read, so the
+             * guard's "reconnected, cancel the grace" is never later than the
+             * first frame. */
+            conn_state(1);
             m.last_psi_ms = 0;          /* PSI first: let the receiver re-acquire */
             cfg_reset(&cfg);            /* a fresh connection owes us a header   */
             hdr_pending = 1;            /* ...which must ride its next VCL AU     */
@@ -2143,6 +2199,11 @@ int mib3_run(int argc, char **argv)
             }
             frame = pc.frame;
             close(uni);
+            /* THE DISCONNECT EVENT.  Deliberately BEFORE the drain below: the
+             * drain can push up to QCAP (~80 ms of) already-accepted frames onto
+             * the wire, and an event that trails the last byte it describes is a
+             * worse event. */
+            conn_state(0);
             /* DRAIN WHAT WE ALREADY ACCEPTED.  The pacer holds up to QCAP access
              * units; closing with them still queued silently discarded the phone's
              * last frames (measured: 7 AUs of a 2077-AU feed never reached the

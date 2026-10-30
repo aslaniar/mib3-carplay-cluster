@@ -68,7 +68,17 @@ elif [ "$SHIP_PATH" = "B" ]; then
   cp -f "$BBIN/mib3shim.so" mib3shim.so
   PATHB_WANT=fc923b446505c83ae23ad2bccd5a0513
   PATHB_BIN="$(cd "$SHIM" && pwd)/tools/mib3clusterstream"
+  # 2026-10-30: this copy REPLACES the tree's build.  If tools/mib3clusterstream was
+  # rebuilt from a newer source (the connection-state publisher the switch-back
+  # guard uses), this silently downgrades it and the guard loses the event file.
+  # It is not an error -- this generation is pinned to its committed artifact -- but
+  # it must be visible.
+  _pre="$(md5of "$PATHB_BIN" 2>/dev/null || echo none)"
   cp -f "$BBIN/mib3clusterstream" "$PATHB_BIN"
+  _post="$(md5of "$PATHB_BIN" 2>/dev/null || echo none)"
+  [ "$_pre" = "$_post" ] || echo "[i] NOTE: tools/mib3clusterstream replaced ($_pre -> $_post)."
+  [ "$_pre" = "$_post" ] || echo "[i]       The tree build had the conn-state publisher (guard event);"
+  [ "$_pre" = "$_post" ] || echo "[i]       this generation falls back to the sender's 'conn open/close' log."
 else
   GEN_DIR="$ABIN"
   cp -f "$ABIN/mib3shim.so"  mib3shim.so
@@ -81,7 +91,10 @@ else
   NIGHT_WANT=acaf614dbb7211963dcbca1bea7013d2
   PATHB_WANT=fc923b446505c83ae23ad2bccd5a0513     # the lab sender, for experiments
   PATHB_BIN="$(cd "$SHIM" && pwd)/tools/mib3clusterstream"
+  _pre="$(md5of "$PATHB_BIN" 2>/dev/null || echo none)"
   cp -f "$BBIN/mib3clusterstream" "$PATHB_BIN"
+  _post="$(md5of "$PATHB_BIN" 2>/dev/null || echo none)"
+  [ "$_pre" = "$_post" ] || echo "[i] NOTE: tools/mib3clusterstream replaced ($_pre -> $_post); the tree build had the guard's conn-state publisher."
 fi
 echo "[i] generation: Path $SHIP_PATH (from $GEN_DIR)"
 # the synthetic rate-test file (field plan step 0): the 10 fps pattern that is
