@@ -2,6 +2,13 @@
 # ============================================================================
 # start_cluster_helper.sh -- start the OUT-OF-PROCESS cluster delivery helper.
 #
+# *** RETIRED 2026-10-29 (redteam refactor): DO NOT RUN.  The helper hosted the
+# PATH A Cinemo decode; the shim exports it drives (mib3shim_bridge_* /
+# mib3shim_surface_*) were removed from mib3shim.c, the binary is no longer
+# built or staged, and this script will fail.  PATH B's AU-socket consumer is
+# tools/mib3clusterstream, started by live_kit/pathb_ctl.sh.  Kept only as the
+# historical record of the Path A flow. ***
+#
 # Run ON THE UNIT, over the live foothold, AFTER the shim is injected
 # (run_inject.sh).  This is the SAFE delivery path: the helper owns the surface +
 # decode in its OWN process; the shim inside carplay only forwards frames over a
