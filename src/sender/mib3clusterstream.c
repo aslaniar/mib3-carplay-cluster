@@ -1263,13 +1263,22 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
          * datagram arrived -- i.e. `verify` on a dark group hung for ever. */
         pfd_t pfd; pfd.fd_ = fd; pfd.ev_ = 1; pfd.rev_ = 0;
         int pr = poll((void *)&pfd, 1, 200);
-        if (pr == 0) {
-            if (seconds > 0 && now_ms() - t_start >= (u64)seconds * 1000ull) {
-                say("probe: window elapsed ("); say_int("", seconds); say(" s)\n");
-                break;
-            }
-            continue;
+        /* THE DEADLINE IS CHECKED EVERY ITERATION, NOT ONLY ON A TIMEOUT
+         * (2026-11-01, found on the car and it cost the whole switch-back).
+         *
+         * This used to sit inside `if (pr == 0)`, i.e. it only ran when poll
+         * TIMED OUT.  The idle beacon on this group is ~750 datagrams/s, so poll
+         * never times out -- and `--probe-secs` therefore never fired.  The
+         * remedy this repo documents for a count-bounded probe ("use
+         * --probe-secs") was itself broken whenever ANY traffic was present,
+         * which on this group is always.  Measured: a probe with a 3 s window was
+         * still running after 8 s, and the hand-back guard was found parked in
+         * pipe_wait behind one that had been alive for two minutes. */
+        if (seconds > 0 && now_ms() - t_start >= (u64)seconds * 1000ull) {
+            say("probe: window elapsed ("); say_int("", seconds); say(" s)\n");
+            break;
         }
+        if (pr == 0) continue;
         if (pr < 0) break;
         long r = read(fd, buf, sizeof buf);
         if (r <= 0) break;
