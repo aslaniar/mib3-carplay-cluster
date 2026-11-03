@@ -1,0 +1,199 @@
+#!/bin/sh
+# ============================================================================
+# pathbctl -- the operator's interface to the Path B daemon (2026-11-02).
+#
+# DESIGN RULE, INHERITED FROM THE REFERENCE: this is NOT in the control path.
+# It reads the daemon's state file and writes marker files.  It never talks to
+# the RSI, never touches the sender, never parses a log to decide anything.
+# If the daemon is dead, `pathbctl status` says so and nothing else happens.
+#
+#   pathbctl status            what the daemon is doing, and why
+#   pathbctl log [n]           the last n decision lines (default 20)
+#   pathbctl pause             do not take the cluster over (survives sessions)
+#   pathbctl resume            allow it again
+#   pathbctl release           hand the cluster back NOW (one-shot, safe)
+#   pathbctl start | stop      the daemon itself (boot starts it for you)
+#
+# There is deliberately no `up`: taking the cluster is the daemon's decision,
+# triggered by the phone actually streaming pictures, and there is no operator
+# action that can make that true.
+# ============================================================================
+set -u
+
+HERE=$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo /tmp/kit)
+RAM=${PATHB_RAM:-/dev/shm}
+STATE=$RAM/pathb_daemon.state
+LOG=$RAM/pathb_daemon.log
+PIDF=$RAM/pathb_daemon.pid
+CMDF=$RAM/pathb_daemon.cmd
+PAUSEF=$RAM/pathb_daemon.pause
+DAEMON=$HERE/pathb_daemon.sh
+[ -f "$DAEMON" ] || DAEMON=/tmp/kit/pathb_daemon.sh
+
+# Same clock as the daemon: /proc/uptime (10 ms, no fork) then perl then date.
+now_ms(){
+  _uf=${MIB3_DLV_UPTIME:-/proc/uptime}
+  if [ -r "$_uf" ]; then
+    _u=$(cut -d' ' -f1 "$_uf" 2>/dev/null)
+    _s=${_u%%.*}; case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
+    case "$_u" in *.*) _f=${_u#*.} ;; *) _f="" ;; esac
+    _f=${_f}000; _f=${_f%"${_f#???}"}; _f=${_f#0}; _f=${_f#0}; _f=${_f#0}
+    printf '%s' "$(( _s * 1000 + ${_f:-0} ))"; return 0
+  fi
+  if command -v perl >/dev/null 2>&1; then
+    _p=$(perl -MTime::HiRes=time -e 'printf "%d", time()*1000' 2>/dev/null)
+    case "${_p:-}" in ''|*[!0-9]*) ;; *) printf '%s' "$_p"; return 0 ;; esac
+  fi
+  _n=$(date +%s 2>/dev/null); case "${_n:-}" in ''|*[!0-9]*) _n=0 ;; esac
+  printf '%s' "$(( _n * 1000 ))"
+}
+
+dur(){  # ms -> "1.8s" | "2m14s" | "1h02m"
+  case "${1:-}" in ''|*[!0-9]*) echo "?"; return ;; esac
+  if [ "$1" -lt 10000 ]; then
+    printf '%d.%ds' "$(( $1 / 1000 ))" "$(( ($1 % 1000) / 100 ))"
+  elif [ "$1" -lt 600000 ]; then
+    printf '%dm%02ds' "$(( $1 / 60000 ))" "$(( ($1 % 60000) / 1000 ))"
+  else
+    printf '%dh%02dm' "$(( $1 / 3600000 ))" "$(( ($1 % 3600000) / 60000 ))"
+  fi
+}
+
+alive(){
+  _p=$(cat "$PIDF" 2>/dev/null)
+  case "${_p:-}" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$_p" 2>/dev/null || return 1
+  printf '%s' "$_p"
+  return 0
+}
+
+read_state(){
+  S_STATE="?"; S_SINCE=0; S_STARTED=0; S_REASON="?"; S_PORT="-"
+  S_BOUND=0; S_CONN=0; S_READY=0; S_AU=0; S_OUT=0; S_PAUSED="?"; S_SENDER="-"
+  [ -r "$STATE" ] || return 1
+  _l=""; read -r _l <"$STATE" 2>/dev/null || true
+  for _kv in $_l; do
+    case "$_kv" in
+      state=*)     S_STATE=${_kv#state=} ;;
+      since_ms=*)  S_SINCE=${_kv#since_ms=} ;;
+      started_ms=*)S_STARTED=${_kv#started_ms=} ;;
+      reason=*)    S_REASON=${_kv#reason=} ;;
+      port=*)      S_PORT=${_kv#port=} ;;
+      bound=*)     S_BOUND=${_kv#bound=} ;;
+      conn=*)      S_CONN=${_kv#conn=} ;;
+      ready=*)     S_READY=${_kv#ready=} ;;
+      au=*)        S_AU=${_kv#au=} ;;
+      out=*)       S_OUT=${_kv#out=} ;;
+      paused=*)    S_PAUSED=${_kv#paused=} ;;
+      sender=*)    S_SENDER=${_kv#sender=} ;;
+    esac
+  done
+  return 0
+}
+
+case "${1:-status}" in
+  status)
+    echo "Path B -- cluster lease"
+    _p=$(alive)
+    if [ -n "${_p:-}" ]; then
+      read_state || true
+      if [ "${S_STARTED:-0}" -gt 0 ] 2>/dev/null; then
+        echo "  daemon     running (pid $_p), up $(dur $(( $(now_ms) - S_STARTED )))"
+      else
+        echo "  daemon     running (pid $_p)"
+      fi
+      _age=$(( $(now_ms) - ${S_SINCE:-0} ))
+      [ "$_age" -lt 0 ] 2>/dev/null && _age=0
+      echo "  state      ${S_STATE:-?} for $(dur "$_age")  (${S_REASON:-?})"
+      if [ "${S_BOUND:-0}" != "0" ]; then
+        echo "  cluster    OURS -- udp/${S_BOUND} (showing the phone's map)"
+      else
+        echo "  cluster    the car's nav (port ${S_PORT:-?})"
+      fi
+      if [ "${S_CONN:-0}" = "1" ]; then
+        echo "  shim       attached, decodable=${S_READY:-?}"
+      else
+        echo "  shim       not attached"
+      fi
+      echo "  phone      ${S_AU:-0} access units in, ${S_OUT:-0} sent"
+      echo "  sender     ${S_SENDER:--}, bound=${S_BOUND:-0}"
+      echo "  pause      ${S_PAUSED:-?}$( [ -f "$PAUSEF" ] && echo ' (marker present)' )"
+      echo "  log        $LOG"
+      if [ -r "$LOG" ]; then
+        echo "  last:"
+        tail -n 5 "$LOG" | sed 's/^/    /'
+      fi
+    else
+      echo "  daemon     not running"
+      [ -f "$PIDF" ] && echo "  note       a stale pidfile exists ($(cat "$PIDF" 2>/dev/null)); it names nothing"
+      [ -r "$STATE" ] && echo "  last state $(cat "$STATE")"
+    fi
+    ;;
+
+  log)
+    _n=${2:-20}
+    case "$_n" in ''|*[!0-9]*) _n=20 ;; esac
+    [ -r "$LOG" ] || { echo "pathbctl: no log at $LOG"; exit 1; }
+    tail -n "$_n" "$LOG"
+    ;;
+
+  pause)
+    : >"$PAUSEF"
+    echo "pathbctl: paused -- the daemon will not take the cluster over"
+    echo "          (it still releases anything it already holds)"
+    ;;
+
+  resume)
+    rm -f "$PAUSEF"
+    echo "pathbctl: resumed"
+    ;;
+
+  release)
+    if ! alive >/dev/null; then
+      echo "pathbctl: the daemon is not running -- nothing owns the cluster to release"
+      exit 1
+    fi
+    printf 'release\n' >"$CMDF"
+    echo "pathbctl: asked the daemon to hand the cluster back (it unbinds, proves"
+    echo "          the port is free, then restores the car's map)"
+    ;;
+
+  start)
+    if _p=$(alive); then echo "pathbctl: already running (pid $_p)"; exit 0; fi
+    [ -f "$DAEMON" ] || { echo "pathbctl: daemon not found at $DAEMON"; exit 1; }
+    nohup sh "$DAEMON" run >/dev/null 2>&1 &
+    _i=0
+    while [ "$_i" -lt 25 ]; do
+      sleep 0.2 2>/dev/null || sleep 1
+      if alive >/dev/null; then echo "pathbctl: started (pid $(cat "$PIDF"))"; exit 0; fi
+      _i=$((_i+1))
+    done
+    echo "pathbctl: did not come up -- see $LOG"
+    exit 1
+    ;;
+
+  stop)
+    if ! _p=$(alive); then echo "pathbctl: not running"; rm -f "$PIDF"; exit 0; fi
+    kill "$_p" 2>/dev/null
+    _i=0
+    while [ "$_i" -lt 60 ]; do
+      kill -0 "$_p" 2>/dev/null || { echo "pathbctl: stopped"; exit 0; }
+      sleep 0.1 2>/dev/null || sleep 1
+      _i=$((_i+1))
+    done
+    kill -9 "$_p" 2>/dev/null
+    echo "pathbctl: killed (it did not stop in 6s) -- run 'pathbctl status'"
+    ;;
+
+  restart)
+    # `sh "$0"`, never `"$0"`: push_kit stages this file 0644, so the exec bit is
+    # not guaranteed (measured on the car 2026-11-02: Permission denied).
+    sh "$0" stop >/dev/null 2>&1
+    sh "$0" start
+    ;;
+
+  *)
+    echo "usage: $0 {status|log [n]|pause|resume|release|start|stop|restart}"
+    exit 2
+    ;;
+esac

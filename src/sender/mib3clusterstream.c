@@ -104,6 +104,7 @@ extern long  read(int, void *, usize_t);
 extern long  write(int, const void *, usize_t);
 extern int   close(int);
 extern int   unlink(const char *);
+extern int   rename(const char *, const char *);
 extern int   chmod(const char *, unsigned);
 extern int   ioctl(int, unsigned long, ...);
 extern int   socket(int, int, int);
@@ -239,6 +240,23 @@ static void say_int(const char *tag, long v)
     write(STDERR_, b, k);
 }
 
+/* say_int() terminates the line -- it appends '\n' to every call.  That is fine
+ * for the one-value-per-line messages it was written for, but it fragments any
+ * multi-field line (the existing `lat:` line has always been split across
+ * several physical log lines because of it).  The cadence line is a dozen
+ * values, so it needs a writer that does NOT terminate.  say_int is left
+ * untouched on purpose: its output is what the benches assert on. */
+static void say_num(long v)
+{
+    char b[24]; int k = 0, j;
+    int neg = 0;
+    if (v < 0) { neg = 1; v = -v; }
+    do { b[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+    if (neg) b[k++] = '-';
+    for (j = 0; j < k / 2; j++) { char c = b[j]; b[j] = b[k-1-j]; b[k-1-j] = c; }
+    write(STDERR_, b, k);
+}
+
 /* ------------------------------------------------------------------ defaults */
 #define DEF_DST        "ff14::2:4%eth0.5"
 #define DEF_PORT       42800
@@ -249,6 +267,7 @@ static void say_int(const char *tag, long v)
 #define DEF_PCR_PID    17
 #define DEF_NDGRAM     6
 #define DEF_CONN_STATE "/dev/shm/pathb_conn.state"
+#define DEF_CTL        "/dev/shm/pathb_sender.ctl"
 
 /* ------------------------------------------------- connection-state publisher
  * WHY THIS EXISTS (owner, 2026-10-30).  The cluster must be handed back on the
@@ -270,25 +289,93 @@ static void say_int(const char *tag, long v)
  * disconnect event, and a 0->1 as "reconnected, cancel the grace".
  */
 static char g_conn_path[112];
-static unsigned long g_conn_seq;
+
+/* ---- THE SUPERVISOR'S VIEW OF THIS PROCESS (2026-11-02) --------------------
+ * `conn=0|1` was enough for the switch-back guard.  A resident supervisor needs
+ * more, for a reason measured on the car the same day: on WIRELESS CarPlay the
+ * phone's TCP connection to the head unit STAYS ESTABLISHED after the phone
+ * leaves (no keepalive timer, see AGENTS.md), so "the socket is open" is not
+ * "a session exists".  What is a session is PICTURES ARRIVING.  Hence counters
+ * rather than a flag:
+ *
+ *   conn   1 while the shim is attached to our AU socket
+ *   ready  1 once the start gate opened (params + IDR in hand) -- decodable
+ *   bound  the UDP source port we hold, 0 while we own nothing
+ *   au     access units RECEIVED from the shim     (monotone, this process)
+ *   out    access units EMITTED to the group       (monotone, this process)
+ *   ms     monotonic ms at the moment of writing
+ *   seq    write counter, so a reader can tell a rewrite from a stale file
+ *
+ * `au` is the health signal a supervisor cannot get anywhere else: a log line
+ * can be half-written, /proc races the reader, and the wire is what we are
+ * trying to measure from the outside.  One open+write+close, at most every
+ * 200 ms (never per frame), and not one byte on the wire.
+ *
+ * The line still STARTS with `conn=`, so the 2026-10-30 guard that matches
+ * `conn=1*` keeps working unchanged.
+ * ------------------------------------------------------------------------- */
+static u64 g_au_in, g_au_out;
+static int g_conn, g_ready, g_bound;
+static u64 g_state_last_ms;
+static unsigned long g_state_seq;
+
+static u64 now_ms(void);                       /* defined further down */
+
+#define PUB_INT(v) do { unsigned long long v_ = (unsigned long long)(v); \
+                        char t_[24]; int j_ = 0;                             \
+                        if (!v_) t_[j_++] = '0';                             \
+                        while (v_) { t_[j_++] = (char)('0' + (int)(v_ % 10)); v_ /= 10; } \
+                        while (j_--) b[k_++] = t_[j_]; } while (0)
+#define PUB_STR(s) do { const char *q_ = (s); while (*q_) b[k_++] = *q_++; } while (0)
+
+static void state_publish(void)
+{
+    if (!g_conn_path[0]) return;
+    char b[160]; int k_ = 0;
+    PUB_STR("conn=");  PUB_INT(g_conn);
+    PUB_STR(" ready="); PUB_INT(g_ready);
+    PUB_STR(" bound="); PUB_INT(g_bound);
+    PUB_STR(" au=");    PUB_INT(g_au_in);
+    PUB_STR(" out=");   PUB_INT(g_au_out);
+    PUB_STR(" ms=");    PUB_INT(now_ms());
+    g_state_seq++;
+    PUB_STR(" seq=");   PUB_INT(g_state_seq);
+    b[k_++] = '\n';
+    /* PUBLISH ATOMICALLY (2026-11-02, found on the car).
+     * This used to truncate the file in place and then write it.  A reader that
+     * looked in that window saw an EMPTY file -- and an empty file reads as
+     * "no connection, nothing bound", which is a state the supervisor acts on.
+     * Measured result: one 3.5 s blink of the car's map mid-session.  Write a
+     * sibling and rename() it into place instead: rename is atomic within a
+     * filesystem, so a reader sees either the previous line or the new one, and
+     * never a blank.  The supervisor ALSO verifies any "port gone" claim against
+     * the kernel, so this is the cause fixed and the decision hardened. */
+    { char tp[128]; int j = 0;
+      while (g_conn_path[j] && j < (int)sizeof tp - 5) { tp[j] = g_conn_path[j]; j++; }
+      { const char *sfx = ".tmp"; int m = 0; while (sfx[m]) { tp[j + m] = sfx[m]; m++; } tp[j + m] = 0; }
+      int fd = open(tp, O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0644);
+      if (fd >= 0) {
+          long wr = write(fd, b, (usize_t)k_);
+          close(fd);
+          if (wr == (long)k_) rename(tp, g_conn_path);
+          else unlink(tp);
+      } }
+    g_state_last_ms = now_ms();
+}
+
+/* Transitions publish immediately; steady state publishes on a 200 ms clock.
+ * Called from the loops, never from the packet path. */
+static void state_maybe(int force)
+{
+    if (!force && now_ms() - g_state_last_ms < 200) return;
+    state_publish();
+}
 
 static void conn_state(int c)
 {
-    if (!g_conn_path[0]) return;
-    char b[64]; int k = 0;
-    const char *p = "conn=";
-    while (*p) b[k++] = *p++;
-    b[k++] = (char)('0' + (c ? 1 : 0));
-    p = " seq=";
-    while (*p) b[k++] = *p++;
-    g_conn_seq++;
-    { unsigned long v = g_conn_seq; char t[24]; int j = 0;
-      if (!v) t[j++] = '0';
-      while (v) { t[j++] = (char)('0' + (int)(v % 10)); v /= 10; }
-      while (j--) b[k++] = t[j]; }
-    b[k++] = '\n';
-    int fd = open(g_conn_path, O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0644);
-    if (fd >= 0) { write(fd, b, (usize_t)k); close(fd); }
+    g_conn = c ? 1 : 0;
+    if (!c) g_ready = 0;
+    state_publish();
 }
 
 #define MIB3_HELP_MAGIC   0x4d334331u
@@ -1403,8 +1490,71 @@ static int au_is_ref(const u8 *d, usize_t n){
     return 0;
 }
 
+/* ---------------------------------------------------------------- CADENCE
+ * WHY THIS EXISTS (2026-11-02).
+ *
+ * We log LATENCY (how old a frame is when it leaves) and DEPTH (how many are
+ * waiting), but we have never logged RHYTHM -- the gap between one emission and
+ * the next.  Rhythm is what the eye reads as judder, and it is the statistic the
+ * MHI2 reference optimises and we never measured: refs/rgi pins its present to
+ * the panel's vsync (`pipeline_timing.h`, EP_SWAP_INTERVAL 2) and subtracts the
+ * time already spent drawing so it cannot double-wait, which makes the output
+ * cadence independent of how the source behaves.
+ *
+ * We have no vsync to lock to (the ECU's refresh is invisible to us), so the
+ * transferable part is the MEASUREMENT, not the mechanism.  Two rings, both ms:
+ *
+ *   cad_arr[]  gap between AUs as the SHIM hands them to us.  This is the source
+ *              rhythm measured after the shim -- not inferred from the phone's
+ *              own telemetry, which reports over an unknown window and is
+ *              window-scaled in some records (FINDINGS_CLUSTER_FPS_CEILING).
+ *   cad_emi[]  gap between the STARTS of two emissions.  If emi is wider than
+ *              arr, the pacer is adding the jitter; if they match, it is not.
+ *
+ * Percentiles use the same insertion sort as the `lat:` ring so the two lines
+ * are directly comparable.
+ */
+#define CAD_N 128
+static u64 cad_arr[CAD_N]; static int cad_arr_i, cad_arr_n;
+static u64 cad_emi[CAD_N]; static int cad_emi_i, cad_emi_n;
+static u64 cad_last_emi_ms;
+static u64 cad_seq_last, cad_seq_gaps, cad_seq_lost;
+static u32 g_spread_pct = 60;   /* --spread-pct: % of the interval to spread an AU over */
+
+static void cad_push(u64 *ring, int *idx, int *cnt, u64 v)
+{
+    ring[*idx & (CAD_N - 1)] = v;
+    (*idx)++;
+    if (*idx > CAD_N - 1) *cnt = CAD_N; else if (*cnt < CAD_N) (*cnt)++;
+}
+
+/* p50/p95/max over the *cnt populated slots (a wrapped ring is still the right
+ * SET of values; percentiles need no order). */
+static void cad_pct(const u64 *ring, int cnt, u64 *p50, u64 *p95, u64 *mx)
+{
+    u64 t[CAD_N]; int i, j;
+    if (cnt <= 0) { *p50 = *p95 = *mx = 0; return; }
+    for (i = 0; i < cnt; i++) t[i] = ring[i];
+    for (i = 1; i < cnt; i++) {
+        u64 v = t[i]; j = i - 1;
+        while (j >= 0 && t[j] > v) { t[j + 1] = t[j]; j--; }
+        t[j + 1] = v;
+    }
+    *p50 = t[cnt / 2];
+    *p95 = t[(cnt * 95) / 100];
+    *mx  = t[cnt - 1];
+}
+
 static void pace_emit(Pace *p, const u8 *au, usize_t len)
 {
+    {   /* emit-rhythm sample: this is called once per access unit, from every
+         * path (clock, catch-up, depth drain), so it sees what actually left. */
+        u64 nowe = now_ms();
+        if (cad_last_emi_ms && nowe >= cad_last_emi_ms && nowe - cad_last_emi_ms <= 1000)
+            cad_push(cad_emi, &cad_emi_i, &cad_emi_n, nowe - cad_last_emi_ms);
+        cad_last_emi_ms = nowe;
+    }
+    g_au_out++;                    /* published for the supervisor (see the state block) */
     /* A STEADY CLOCK, NOT A WALL CLOCK (2026-10-27, measured against the car).
      *
      * Our timestamps used to be `now_ms() - t0`, so every time the phone went
@@ -1507,7 +1657,33 @@ static void pace_emit(Pace *p, const u8 *au, usize_t len)
     p->m->dndg = p->m->dcursor = 0;
     p->m->overrun_seen = 0;
     p->m->au_t0_ns   = now_ns();
-    p->m->au_iv_ms   = (u64)p->iv_ms;
+    /* SPREAD BUDGET = A FRACTION OF THE INTERVAL, NOT THE WHOLE THING.
+     *
+     * WHY (2026-11-02, measured on the car).  The spread budget used to BE the
+     * release interval, so an access unit finished going out at the exact
+     * instant the next one was due.  The first session with the `cad:` line
+     * showed `deferred_arms` firing 2,488 times in 120 s -- about once per
+     * emitted frame -- i.e. at nearly every release tick the previous frame's
+     * datagrams were still due, so the clock deferred half a slot and tried
+     * again.  Consequence: zero margin.  Any scheduler hitch, any Wi-Fi
+     * retransmit, any unusually large frame lands directly on the output,
+     * because there is no early to absorb it.  Measured spread: 47 ms typical,
+     * 156 ms worst, on a stream whose input run average was 45 ms.
+     *
+     * Ending the frame early also matches the shape the ECU was designed for:
+     * the car's own nav delivers each frame compactly and then goes idle,
+     * rather than trickling right up to the next frame's deadline.
+     *
+     * The budget is a fraction so there is a cushion; the RATE CEILING below
+     * still bounds the instantaneous rate, so this cannot re-create a clump.
+     * Headroom check from the same session: ~10 KB frames over ~45 ms was
+     * ~220 B/ms against a 2000 B/ms ceiling, so compressing the spread costs
+     * nothing that the wire cannot absorb.
+     *
+     * `--spread-pct` sweeps it without a rebuild; the banner prints the value
+     * in force so a silent default cannot waste a session again. */
+    p->m->au_iv_ms   = p->iv_ms ? ((u64)p->iv_ms * (u64)g_spread_pct) / 100u : 0;
+    if (p->iv_ms && p->m->au_iv_ms < 1) p->m->au_iv_ms = 1;
     /* RATE CEILING: a frame may never leave faster than OUT_RATE_B_PER_MS, no
      * matter how urgently the release clock wants it gone.  This is what makes a
      * late frame SPREAD instead of CLUMP. */
@@ -1543,6 +1719,124 @@ static void pace_emit(Pace *p, const u8 *au, usize_t len)
 static const u8 *aus[MAXAU];
 static int alen[MAXAU];
 
+/* ===================== THE OUTPUT SOCKET, LATE-BOUND (2026-11-02) ==========
+ * WHY THIS IS A FUNCTION AND NOT A STARTUP BLOCK.  Path B used to bind the
+ * cluster's UDP source port once, at process start, which forced the whole
+ * lifecycle into "park multi-screen-server -> spawn a sender -> it binds ->
+ * on disconnect kill it and hand back".  A resident supervisor cannot work
+ * that way: it would re-spawn the sender for every phone session, and on
+ * WIRELESS CarPlay the phone's socket never closes, so there is no session
+ * edge to key on anyway.  Instead the sender lives for the life of the boot,
+ * is always attached to the shim's AU socket, and binds the port only when
+ * told -- which is also the exact moment the port becomes free.
+ *
+ *   <ctl> :  "bind <port>" | "unbind"
+ *
+ * Read at most every 100 ms, from the loops, and acted on only when the text
+ * CHANGES -- so a stale file cannot re-bind twice.
+ * ========================================================================= */
+static char g_host[128];
+static const char *g_ifname = "eth0.5";
+static int  g_dport = DEF_PORT;
+static int  g_sport = 0;
+static const char *g_src = 0;
+
+static int udp_open(void)
+{
+    int fd = socket(AF_INET6_, SOCK_DGRAM_, 0);
+    if (fd < 0) { say("socket() failed\n"); return -1; }
+    { unsigned idx = if_nametoindex(g_ifname);
+      if (idx) setsockopt(fd, IPPROTO_IPV6_, IPV6_MULTICAST_IF_, &idx, sizeof idx); }
+    { int hop = 1;  setsockopt(fd, IPPROTO_IPV6_, IPV6_MULTICAST_HOPS_, &hop, sizeof hop); }
+    { int lou = 1;  setsockopt(fd, IPPROTO_IPV6_, IPV6_MULTICAST_LOOP_, &lou, sizeof lou); }
+    if (g_ifname && *g_ifname)
+        setsockopt(fd, SOL_SOCKET_, SO_BINDTODEVICE_, g_ifname, (unsigned)strlen(g_ifname));
+    if (g_sport > 0 || (g_src && *g_src)) {
+        /* The receiver only accepts video from the port multi-screen-server
+         * uses, so this bind IS the takeover.  Deliberately NO SO_REUSEADDR:
+         * if MS-S still holds the port we must fail loudly here rather than
+         * silently share it and produce a contested group. */
+        in6_t s; memset(&s, 0, sizeof s);
+        s.FAMILY_ = AF_INET6_; s.PORT_ = htons((u16)g_sport); SLEN_SET6(s);
+        if (g_src && *g_src && inet_pton(AF_INET6_, g_src, &s.ADDR_) != 1) {
+            say("bad --src\n"); close(fd); return -1; }
+        if (bind(fd, (const void *)&s, sizeof s) < 0) {
+            say("SPORT_BUSY: cannot bind source port "); say_int("", g_sport);
+            say("  (multi-screen-server still holds it -- park it first)\n");
+            close(fd); return -2;
+        }
+        if (g_sport > 0) { say("bound source port "); say_int("", g_sport); say("\n"); }
+    }
+    { in6_t d; memset(&d, 0, sizeof d);
+      d.FAMILY_ = AF_INET6_; d.PORT_ = htons((u16)g_dport); SLEN_SET6(d);
+      if (inet_pton(AF_INET6_, g_host, &d.ADDR_) != 1) { say("bad --dst\n"); close(fd); return -1; }
+      if (connect(fd, (const void *)&d, sizeof d) < 0) {
+          say("connect failed\n"); close(fd); return -1; } }
+    say("-> "); say(g_host); say(" port "); say_int("", g_dport); say("\n");
+    return fd;
+}
+
+static char g_ctl_path[112];
+static char g_ctl_last[48];
+static u64  g_ctl_last_ms;
+static int  g_ctl_port;          /* the port named by the last "bind <port>" */
+
+/* 0 = nothing new, 1 = bind, 2 = unbind, -1 = unrecognised (never acted on) */
+static int ctl_poll(void)
+{
+    char b[48]; int fd; long n; int k; int action = 0;
+    if (!g_ctl_path[0]) return 0;
+    if (now_ms() - g_ctl_last_ms < 100) return 0;
+    g_ctl_last_ms = now_ms();
+    fd = open(g_ctl_path, O_RDONLY_);
+    if (fd < 0) return 0;
+    n = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    b[n] = 0;
+    for (k = 0; k < (int)n; k++) if (b[k] == '\n' || b[k] == '\r') b[k] = 0;
+    if (!strcmp(b, g_ctl_last)) return 0;
+    { int m; for (m = 0; m < (int)sizeof g_ctl_last - 1 && b[m]; m++) g_ctl_last[m] = b[m];
+      g_ctl_last[m] = 0; }
+    if (!strncmp(b, "bind", 4)) {
+        /* The port travels WITH the command, so a supervisor that discovers a
+         * new MS-S port never has to restart this process. */
+        int pv = atoi(b + 4);
+        if (pv > 0 && pv < 65536) { g_ctl_port = pv; action = 1; }
+        else { say("ctl: 'bind' without a valid port -- ignored\n"); action = -1; }
+    }
+    else if (!strncmp(b, "unbind", 6)) action = 2;
+    else { say("ctl: unrecognised command -- ignored\n"); action = -1; }
+    return action;
+}
+
+static void output_bind(Mux *m)
+{
+    int fd;
+    if (m->out_fd >= 0) return;
+    if (g_ctl_port > 0) g_sport = g_ctl_port;
+    fd = udp_open();
+    if (fd < 0) { say("ctl: bind did not happen\n"); return; }
+    m->out_fd = fd;
+    m->dndg = m->dcursor = 0;
+    g_bound = g_sport;
+    g_ready = 0;                 /* the gate re-arms: start on a fresh IDR */
+    say("ctl: PORT OURS\n");
+    state_maybe(1);
+}
+
+static void output_unbind(Mux *m)
+{
+    if (m->out_fd < 0) return;
+    close(m->out_fd);
+    m->out_fd = -1;
+    m->dndg = m->dcursor = 0;
+    g_bound = 0;
+    g_ready = 0;
+    say("ctl: port released\n");
+    state_maybe(1);
+}
+
 int mib3_run(int argc, char **argv) __attribute__((used));
 int mib3_run(int argc, char **argv)
 {
@@ -1558,6 +1852,8 @@ int mib3_run(int argc, char **argv)
     u64 gaps_sent = 0;
     int sport = 0;
     const char *conn_path = DEF_CONN_STATE;   /* see conn_state() above */
+    const char *ctl_path = DEF_CTL;           /* "bind <port>" | "unbind"    */
+    int monitor = 0;      /* --monitor: own the AU socket, emit only when told */
     int nofold = 0;      /* regression switch ONLY: pre-2026-10-26 framing */
     int noidr = 0;       /* regression switch ONLY: no start gate */
     Mux m; memset(&m, 0, sizeof m);
@@ -1582,6 +1878,8 @@ int mib3_run(int argc, char **argv)
         }
         else if (!strcmp(a, "--out") && v) { out = v; i++; }
         else if (!strcmp(a, "--conn-state") && v) { conn_path = v; i++; }
+        else if (!strcmp(a, "--ctl") && v) { ctl_path = v; i++; }
+        else if (!strcmp(a, "--monitor")) monitor = 1;
         else if (!strcmp(a, "--pkts-per-dgram") && v) { m.npk = atoi(v); i++; }
         else if (!strcmp(a, "--ssrc") && v) { m.ssrc = (u32)atoi(v); i++; }
         else if (!strcmp(a, "--tsid") && v) { m.tsid = atoi(v); i++; }
@@ -1606,17 +1904,31 @@ int mib3_run(int argc, char **argv)
         else if (!strcmp(a, "--stats-timing")) g_timing_on = 1;
         else if (!strcmp(a, "--jit-ms") && v) { jit_ms = atoi(v); i++; }
         else if (!strcmp(a, "--no-jit")) jit_ms = 0;
+        /* Spread budget as a fraction of the release interval.  100 restores the
+         * pre-2026-11-02 behaviour exactly (budget == interval, zero cushion). */
+        else if (!strcmp(a, "--spread-pct") && v) { g_spread_pct = (u32)atoi(v); i++; }
         else if (!strcmp(a, "--gap-ms") && v) { gap_ms = atoi(v); i++; }
         else if (!strcmp(a, "--gap-every") && v) { gap_every = atoi(v); i++; }
         else { say("unknown arg"); return 2; }
     }
     if (m.npk < 1 || m.npk > MAX_PKTS) { say("bad --pkts-per-dgram"); return 2; }
+    /* Clamp the spread budget.  20% is the floor because below that the
+     * instantaneous rate approaches the wire ceiling and a drain burst would
+     * start to look like the clump that caused the artifacts; 100% is the
+     * historical behaviour. */
+    if (g_spread_pct < 20)  g_spread_pct = 20;
+    if (g_spread_pct > 100) g_spread_pct = 100;
     /* arm the connection-state publisher (see conn_state() above).  "off" leaves
      * g_conn_path empty and the publisher becomes a no-op. */
     if (conn_path && *conn_path && strcmp(conn_path, "off") != 0) {
         usize_t cn = strlen(conn_path);
         if (cn < sizeof g_conn_path) { memcpy(g_conn_path, conn_path, cn); g_conn_path[cn] = 0; }
         else say("--conn-state: path too long, publisher disabled\n");
+    }
+    if (ctl_path && *ctl_path) {
+        usize_t cn = strlen(ctl_path);
+        if (cn < sizeof g_ctl_path) { memcpy(g_ctl_path, ctl_path, cn); g_ctl_path[cn] = 0; }
+        else say("--ctl: path too long, control channel disabled\n");
     }
     /* Stride of one buffered datagram for the emitter (see LOOP-DRIVEN EMISSION).
      * Set before anything can call the pump. */
@@ -1628,39 +1940,26 @@ int mib3_run(int argc, char **argv)
         m.out_fd = open(out + 5, O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0644);
         if (m.out_fd < 0) { say("cannot open out"); return 1; }
     } else {
-        char host[128]; const char *ifname = "eth0.5";
-        usize_t dl = strlen(dst); if (dl >= sizeof host) dl = sizeof host - 1;
-        memcpy(host, dst, dl); host[dl] = 0;
-        for (usize_t k = 0; k < dl; k++) if (host[k] == '%') { host[k] = 0; ifname = host + k + 1; break; }
-
-        int fd = socket(AF_INET6_, SOCK_DGRAM_, 0);
-        if (fd < 0) { say("socket() failed"); return 1; }
-        unsigned idx = if_nametoindex(ifname);
-        if (idx) setsockopt(fd, IPPROTO_IPV6_, IPV6_MULTICAST_IF_, &idx, sizeof idx);
-        int hop = 1;  setsockopt(fd, IPPROTO_IPV6_, IPV6_MULTICAST_HOPS_, &hop, sizeof hop);
-        int lou = 1;  setsockopt(fd, IPPROTO_IPV6_, IPV6_MULTICAST_LOOP_, &lou, sizeof lou);
-        if (ifname && *ifname) setsockopt(fd, SOL_SOCKET_, SO_BINDTODEVICE_, ifname, (unsigned)strlen(ifname));
-        if (sport > 0 || (src && *src)) {
-            /* The receiver only accepts video from the port multi-screen-server
-             * uses, so this bind IS the takeover.  Deliberately NO SO_REUSEADDR:
-             * if MS-S still holds the port we must fail loudly here rather than
-             * silently share it and produce a contested group. */
-            in6_t s; memset(&s, 0, sizeof s);
-            s.FAMILY_ = AF_INET6_; s.PORT_ = htons((u16)sport); SLEN_SET6(s);
-            if (src && *src && inet_pton(AF_INET6_, src, &s.ADDR_) != 1) { say("bad --src"); return 2; }
-            if (bind(fd, (const void *)&s, sizeof s) < 0) {
-                say("SPORT_BUSY: cannot bind source port "); say_int("", sport);
-                say("  (multi-screen-server still holds it -- park it first)\n");
-                return 3;
-            }
-            if (sport > 0) { say("bound source port "); say_int("", sport); }
+        /* Destination as given: "%ifname" selects the egress interface. */
+        { usize_t dl = strlen(dst); if (dl >= sizeof g_host) dl = sizeof g_host - 1;
+          memcpy(g_host, dst, dl); g_host[dl] = 0;
+          for (usize_t k = 0; k < dl; k++)
+              if (g_host[k] == '%') { g_host[k] = 0; g_ifname = g_host + k + 1; break; } }
+        g_dport = port;
+        g_sport = sport;
+        g_src   = src;
+        if (monitor) {
+            /* The supervisor decides when the port is ours; until then this
+             * process only watches the shim's stream (see the ctl block). */
+            m.out_fd = -1;
+            say("monitor: AU socket only -- the port is taken on 'bind <port>'\n");
+        } else {
+            /* MONITOR MODE IS THE SUPERVISOR'S; this is the old behaviour,
+             * kept byte-identical for `play`, the bench and pathb_ctl. */
+            int fd = udp_open();
+            if (fd < 0) return (fd == -2) ? 3 : 1;
+            m.out_fd = fd;
         }
-        in6_t d; memset(&d, 0, sizeof d);
-        d.FAMILY_ = AF_INET6_; d.PORT_ = htons((u16)port); SLEN_SET6(d);
-        if (inet_pton(AF_INET6_, host, &d.ADDR_) != 1) { say("bad --dst"); return 2; }
-        if (connect(fd, (const void *)&d, sizeof d) < 0) { say("connect failed"); return 1; }
-        m.out_fd = fd;
-        say("-> "); say(host); say(" port "); say_int("", port);
     }
 
     int uni_mode = 0, ls = -1;
@@ -1770,10 +2069,28 @@ int mib3_run(int argc, char **argv)
         say_int("", ka_ms); say(" ms  jitter-buffer=ADAPTIVE (start ");
         say_int("", jit_ms); say(" ms, grows on starvation, shrinks when idle)");
         say("  intra-frame release=ON (loop/ppoll, byte-proportional)\n");
-        conn_state(0);              /* nothing is connected yet, say so at once */
+        say("  spread-pct="); say_int("", (long)g_spread_pct);
+        say("  (each AU is spread over this % of its interval; the remainder is\n"
+            "   cushion so the next frame can start on time -- 100 = no cushion)\n");
+        state_publish();            /* nothing is connected yet, say so at once */
         for (;;) {
-            int uni = accept(ls, 0, 0);
-            if (uni < 0) { say("accept failed -- stopping\n"); break; }
+            int uni = -1;
+            /* NEVER BLOCK IN accept().  In monitor mode a 'unbind' must be
+             * honoured even while no phone is connected -- that is the whole
+             * difference between owning a port for a session and owning it for
+             * a boot.  200 ms is the supervisor's own tick, so nothing is lost
+             * by matching it. */
+            { pfd_t lp; tspec_t lts;
+              lp.fd_ = ls; lp.ev_ = 1; lp.rev_ = 0;
+              lts.SEC_ = 0; lts.NSEC_ = 200000000L;
+              int pr = PPOLL_(&lp, 1, &lts);
+              if (pr > 0 && (lp.rev_ & 1)) uni = accept(ls, 0, 0);
+              { int act = ctl_poll();
+                if (act == 1) output_bind(&m);
+                else if (act == 2) output_unbind(&m); }
+              state_maybe(0);
+            }
+            if (uni < 0) continue;
             /* THE CONNECT EVENT.  Published before a single AU is read, so the
              * guard's "reconnected, cancel the grace" is never later than the
              * first frame. */
@@ -1803,6 +2120,11 @@ int mib3_run(int argc, char **argv)
             Pace pc; memset(&pc, 0, sizeof pc);
             pc.m = &m; pc.t0 = m.t0_ms; pc.frame = frame;
             u64 next_emit = 0, ka_count = 0, gaps = 0, last_arrive = 0;
+            /* cadence window state (2026-11-02): see the CADENCE block */
+            int  iv_band = 0;              /* consecutive out-of-band rate samples */
+            u64 cad_win_ms = 0;
+            u64 cad_prev_ov = 0, cad_prev_sk = 0, cad_prev_df = 0;
+            u64 cad_prev_in = 0, cad_prev_out = 0;
             /* isochronous clock state (see the block in the poll loop) */
             u64 jit_started = 0, conn_t0 = 0, underruns = 0, overflow_drains = 0;
             int jit_tgt = 0;                     /* target depth, frames -- ADAPTIVE */
@@ -1825,6 +2147,36 @@ int mib3_run(int argc, char **argv)
                   pto.NSEC_ = (long)(to % 1000000000ull); }
                 int pr = PPOLL_(&pf, 1, &pto);
                 int ready = (pr > 0 && (pf.rev_ & 1));
+
+                /* THE SUPERVISOR'S HAND ON THE PORT (2026-11-02).  Polled here
+                 * because this is where the queue lives: a bind must start from
+                 * a clean queue and a fresh IDR, and an unbind must not leave a
+                 * half-emitted frame behind. */
+                /* PUBLISH ON EVERY TICK, BOUND OR NOT (2026-11-02, found on the
+                 * car).  `au` was only published from the UNBOUND branch, so while
+                 * we owned the port the state file froze: the supervisor saw "no
+                 * access unit" for its whole grace, handed the cluster back, and
+                 * the unbind published the accumulated jump -> it took it again.
+                 * Measured flap on the glass: takeover 1.1-1.8 s, ACTIVE 2.0 s,
+                 * release 2.0-2.6 s, repeat, with `au` jumping ~170 per cycle.
+                 * state_maybe() is its own 200 ms gate, so this is at most 5
+                 * writes/s and never per frame. */
+                state_maybe(0);
+                { int act = ctl_poll();
+                  if (act == 1) {
+                      output_bind(&m);
+                      if (m.out_fd >= 0) {
+                          m.last_psi_ms = 0;     /* PSI first, as on a reconnect */
+                          streaming = 0;         /* gate re-arms on a fresh IDR   */
+                          hdr_pending = 1;
+                          qh = qn = 0;
+                      }
+                  } else if (act == 2) {
+                      output_unbind(&m);
+                      streaming = 0;
+                      qh = qn = 0;
+                  }
+                }
 
                 /* ================== ISOCHRONOUS RELEASE CLOCK ==================
                  * WHY THIS EXISTS (2026-10-30, measured on the car).
@@ -1876,7 +2228,37 @@ int mib3_run(int argc, char **argv)
                       u64 win = now2 - rt_t0;
                       if (win >= 1000) {
                           u64 ivm = win / rt_n;
-                          iv_out = iv_out ? (iv_out * 3 + ivm) / 4 : ivm;
+                          /* HYSTERESIS ON THE CLOCK (2026-11-02).
+                           *
+                           * This used to adopt every window unconditionally, so
+                           * the release interval moved at least once a second
+                           * for no reason but measurement noise -- and the
+                           * interval is exactly what the eye reads as judder.
+                           * The reference project's cadence cannot wobble because
+                           * it IS the panel's vsync; we have no vsync, so the
+                           * equivalent is a clock that only moves when it must:
+                           *
+                           *   within +/-10%  -> ordinary variation, ignore it
+                           *   outside that   -> must persist for TWO windows
+                           *   then adopt by blending, so it cannot jump
+                           *
+                           * The 2-window rule costs up to ~2 s to follow a
+                           * genuine rate change.  Deliberate: the phone's rate
+                           * changes slowly, and transients are handled by the
+                           * depth controller and the latency cap, not here.
+                           */
+                          if (!iv_out) {
+                              iv_out = ivm;
+                          } else {
+                              u64 lo = iv_out - iv_out / 10;
+                              u64 hi = iv_out + iv_out / 10;
+                              if (ivm >= lo && ivm <= hi) {
+                                  iv_band = 0;          /* noise: leave the clock alone */
+                              } else if (++iv_band >= 2) {
+                                  iv_out = (iv_out + ivm) / 2;   /* sustained shift */
+                                  iv_band = 0;
+                              }
+                          }
                           if (iv_out < 10)  iv_out = 10;    /* 100 fps */
                           if (iv_out > 125) iv_out = 125;   /*   8 fps */
                           rt_t0 = now2; rt_n = 0;
@@ -1920,12 +2302,24 @@ int mib3_run(int argc, char **argv)
                    * so draining can never recreate the clump that caused the
                    * artifacts. */
                   u64 iv = iv_out ? iv_out : 40;
-                  if (jit_tgt && qn > jit_tgt) {
-                      u64 scaled = (iv_out ? iv_out : 40) * (u64)jit_tgt / (u64)qn;
-                      if (scaled < 2) scaled = 2;
-                      iv = scaled;
-                  } else if (jit_tgt && qn < jit_tgt) {
-                      iv = iv + iv / 8 + 1;
+                  /* HYSTERESIS ON THE DEPTH CORRECTION (2026-11-02).
+                   * Near the target, target/queue hovers around 1.0 and its NOISE
+                   * is multiplied straight into the interval: qn of 9/10/11 used
+                   * to produce three different intervals in three consecutive
+                   * frames.  Correct only when the queue is more than 20% off
+                   * target.  For a small target the band is small, which is
+                   * right -- a 2-frame buffer cannot afford to react slowly. */
+                  if (jit_tgt > 0) {
+                      u64 tgt     = (u64)jit_tgt;
+                      u64 hi_band = tgt + tgt / 5;
+                      u64 lo_band = tgt > (tgt / 5) ? tgt - tgt / 5 : 1;
+                      if ((u64)qn > hi_band) {
+                          u64 scaled = (iv_out ? iv_out : 40) * tgt / (u64)qn;
+                          if (scaled < 2) scaled = 2;
+                          iv = scaled;
+                      } else if ((u64)qn < lo_band) {
+                          iv = iv + iv / 8 + 1;
+                      }
                   }
                   if (qn > 0 && (now2 - qarr[qh]) > (u64)LAT_CAP_MS) iv = 2;
 
@@ -1957,6 +2351,57 @@ int mib3_run(int argc, char **argv)
                       say(" ms  qn="); say_int("", (long)qn);
                       say(" tgt="); say_int("", jit_tgt);
                       say(" iv="); say_int("", (long)iv); say(" ms\n");
+                  }
+                  /* ---- CADENCE WINDOW (2026-11-02) --------------------------
+                   * One line every 2 s answering the question we have never been
+                   * able to answer: what rhythm are we actually delivering, and
+                   * what did it cost to deliver it.
+                   *
+                   *   arr  gap between AUs as the shim handed them to us
+                   *   emi  gap between our emissions; wider than arr = the pacer
+                   *        is the source of the jitter, equal = it is not
+                   *   seqgap/lost  frames the shim sent that never arrived here
+                   *   ovr/skip/defer  catch-up paths taken THIS window.  These
+                   *        used to print only when the AU socket closed, which
+                   *        never happens in a live session, so the field value
+                   *        was never once read (PATHB_STABLE_20261030).
+                   * `au`/`out` are window deltas too: they are the accounting
+                   * that reconciles against the shim's own `helper AUs total`.
+                   */
+                  if (now2 - cad_win_ms >= 2000) {
+                      u64 a50, a95, amx, e50, e95, emx;
+                      u64 d_ov = m.spread_overruns - cad_prev_ov;
+                      u64 d_sk = m.spread_skipped  - cad_prev_sk;
+                      u64 d_df = m.deferred_arms   - cad_prev_df;
+                      u64 d_in = g_au_in  - cad_prev_in;
+                      u64 d_ot = g_au_out - cad_prev_out;
+                      cad_pct(cad_arr, cad_arr_n, &a50, &a95, &amx);
+                      cad_pct(cad_emi, cad_emi_n, &e50, &e95, &emx);
+                      say("cad: arr p50="); say_num((long)a50);
+                      say(" p95=");         say_num((long)a95);
+                      say(" max=");         say_num((long)amx);
+                      say(" | emi p50=");   say_num((long)e50);
+                      say(" p95=");         say_num((long)e95);
+                      say(" max=");         say_num((long)emx);
+                      say(" | au=");        say_num((long)d_in);
+                      say(" out=");         say_num((long)d_ot);
+                      say(" seqgap=");      say_num((long)cad_seq_gaps);
+                      say(" lost=");        say_num((long)cad_seq_lost);
+                      say(" ovr=");         say_num((long)d_ov);
+                      say(" skip=");        say_num((long)d_sk);
+                      say(" defer=");       say_num((long)d_df);
+                      say(" | qn=");        say_num((long)qn);
+                      say(" tgt=");         say_num((long)jit_tgt);
+                      say(" iv=");          say_num((long)(iv_out ? iv_out : 40));
+                      say(" ms\n");
+                      cad_prev_ov  = m.spread_overruns;
+                      cad_prev_sk  = m.spread_skipped;
+                      cad_prev_df  = m.deferred_arms;
+                      cad_prev_in  = g_au_in;
+                      cad_prev_out = g_au_out;
+                      cad_win_ms   = now2;
+                      cad_arr_i = cad_arr_n = 0;
+                      cad_emi_i = cad_emi_n = 0;
                   }
                   if (jit_ms && !jit_started && conn_t0 &&
                       now2 - conn_t0 >= (u64)jit_ms) {
@@ -2074,7 +2519,22 @@ int mib3_run(int argc, char **argv)
                 }
                 u32 magic, len; u64 rseq;
                 memcpy(&magic, hdr, 4); memcpy(&len, hdr + 4, 4); memcpy(&rseq, hdr + 8, 8);
-                (void)rseq;
+                /* SEQ GAPS = FRAMES LOST ON THE SHIM->SENDER HOP (2026-11-02).
+                 * The shim already stamps a monotone sequence per AU and we used
+                 * to discard it (`(void)rseq`).  A jump > 1 is a picture the shim
+                 * sent that never arrived here.  This is the one hop with no
+                 * counter on the far side, so counting it closes the accounting
+                 * chain: phone -> shim (shim's own AU count) -> us (here) ->
+                 * wire (RTP loss).  Every frame is now accounted for at every
+                 * boundary, which is what "did the phone send it or did we lose
+                 * it" actually requires. */
+                if (rseq) {
+                    if (cad_seq_last && rseq > cad_seq_last + 1) {
+                        cad_seq_gaps++;
+                        cad_seq_lost += rseq - cad_seq_last - 1;
+                    }
+                    cad_seq_last = rseq;
+                }
                 if (magic != MIB3_HELP_MAGIC || len > MIB3_HELP_MAXLEN) { say("bad helper frame\n"); break; }
                 if ((usize_t)len > ucap) {
                     u8 *nb = (u8 *)realloc(uo, len);
@@ -2092,6 +2552,13 @@ int mib3_run(int argc, char **argv)
                 /* arrival-gap accounting: this is the evidence the pacer acts on */
                 u64 nar = now_ms();
                 if (last_arrive && nar - last_arrive > 250) gaps++;
+                /* ...and the RHYTHM of those arrivals (2026-11-02), which is the
+                 * number we have never had.  A 1 s cap keeps a genuine pause out
+                 * of the distribution -- a silence is not a frame interval. */
+                if (last_arrive) {
+                    u64 d = nar - last_arrive;
+                    if (d <= 1000) cad_push(cad_arr, &cad_arr_i, &cad_arr_n, d);
+                }
                 /* CALIBRATE THE PTS STEP from the phone's own cadence (EWMA),
                  * but COMMIT it only once per second (P1-7 / N2, REVIEW
                  * PATHB_2026-10-28 -- the per-frame commit the tree shipped
@@ -2128,6 +2595,20 @@ int mib3_run(int argc, char **argv)
                     }
                 }
 
+                /* COUNT EVERY AU THE SHIM HANDS US, BOUND OR NOT (2026-11-02).
+                 * In monitor mode the phone is streaming but the cluster is not
+                 * ours yet; this counter is how the supervisor learns that a
+                 * session exists at all.  A SOCKET CANNOT TELL IT: on wireless
+                 * CarPlay the phone's TCP connection stays ESTABLISHED after the
+                 * phone leaves, so "open" outlives the session by hours. */
+                g_au_in++;
+                if (m.out_fd < 0) {
+                    /* Queueing while unbound would only build stale latency for
+                     * a port we do not own; drop it and keep the config. */
+                    state_maybe(0);
+                    continue;
+                }
+
                 /* START GATE: hold until params + an IDR are both in hand. */
                 /* ARRIVAL-RATE METER sample.  It MUST be here, after the fold
                  * check above: parameter-set records are not frames, and counting
@@ -2145,6 +2626,7 @@ int mib3_run(int argc, char **argv)
                         continue;
                     }
                     streaming = 1;
+                    g_ready = 1; state_maybe(1);
                     say("gate: IDR in hand after "); say_int("", (long)held);
                     say(" held AU(s) -- starting the stream\n");
                 }
@@ -2193,6 +2675,7 @@ int mib3_run(int argc, char **argv)
                         backlog_aus += (u64)qn;
                         qh = 0; qn = 0;
                         streaming = 0;
+                        g_ready = 0; state_maybe(1);
                         backlog++;
                         say("gate: backlog "); say_int("", pend);
                         say(" bytes -- drained "); say_int("", (long)backlog_aus);

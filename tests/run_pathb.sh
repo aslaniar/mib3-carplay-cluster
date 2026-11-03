@@ -647,6 +647,41 @@ chk ctl_skip_shim_check_works "$([ $rc = 0 ] && echo 1 || echo 0)" 0 "rc=$rc"
 killmux
 
 echo
+echo "############ T23-T25: MONITOR mode -- the port is taken on command ############"
+# The resident supervisor's whole contract: own the AU socket from boot, take the
+# cluster's UDP port only when told, and give it back on command.  Nothing here
+# needs a phone: the control file is the interface.
+MON="$OUT/mon"
+rm -f "$MON".state "$MON".ctl "$MON".log "$MON".sock
+"$NAT" --in "unix:$MON.sock" --dst "ff14::2:4%lo0" --port "$GPORT" --sport "$SPORT" \
+       --monitor --conn-state "$MON.state" --ctl "$MON.ctl" >"$MON.log" 2>&1 &
+MONPID=$!; track $MONPID
+sleep 0.6
+chk mon_starts_unbound "$(grep -q 'monitor: AU socket only' "$MON.log" && echo 1 || echo 0)" "no bind at start"
+chk mon_does_not_grab "$(grep -q 'bound source port' "$MON.log" && echo 0 || echo 1)" "port untouched"
+chk mon_state_unbound "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$MON.state" 2>/dev/null | grep -qx 0 && echo 1 || echo 0)" "bound=0"
+
+printf 'bind %s\n' "$SPORT" >"$MON.ctl"
+_i=0; while [ "$_i" -lt 40 ]; do
+  grep -q "PORT OURS" "$MON.log" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
+chk mon_bind_on_command "$(grep -q 'PORT OURS' "$MON.log" && echo 1 || echo 0)" "bound after 'bind'"
+chk mon_state_bound "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$MON.state" 2>/dev/null | grep -qx "$SPORT" && echo 1 || echo 0)" "bound=$SPORT"
+
+printf 'unbind\n' >"$MON.ctl"
+_i=0; while [ "$_i" -lt 40 ]; do
+  grep -q "port released" "$MON.log" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
+chk mon_unbind_on_command "$(grep -q 'port released' "$MON.log" && echo 1 || echo 0)" "released after 'unbind'"
+chk mon_state_unbound_again "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$MON.state" 2>/dev/null | grep -qx 0 && echo 1 || echo 0)" "bound=0"
+# PROOF, not a log line: the port is actually free for somebody else.
+$PY - "$SPORT" <<'PYBIND' >/dev/null 2>&1 && ok mon_port_really_free yes || no mon_port_really_free yes "still bound"
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("::", int(sys.argv[1])))
+s.close()
+PYBIND
+kill "$MONPID" 2>/dev/null
+
+echo
 echo "============================================================"
 echo "Path B bench: PASS=$P FAIL=$F   (artifacts in $OUT)"
 echo "============================================================"
