@@ -506,7 +506,7 @@ knobs_once(){   # once per carplay process, never per session (it is a ptrace)
     # A reboot must reproduce this exactly, so it is set from here every boot.
     for _kv in MIB3_SHIM_FPS=60 \
                MIB3_SHIM_VIEWAREAS=0 \
-               "MIB3_SHIM_URL=maps:/car/instrumentcluster/map?showETA=no&maneuverLayout=no&showSpeedLimit=no" \
+               "MIB3_SHIM_URL=maps:/car/instrumentcluster/map?showETA=no&maneuverLayout=topAligned&showSpeedLimit=no" \
                MIB3_SHIM_CMDACK=1; do
       /usr/bin/python /tmp/kit/target_env.py "$_cp" "$_kv" >/dev/null 2>&1
     done
