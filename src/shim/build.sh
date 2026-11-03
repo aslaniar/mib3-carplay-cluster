@@ -29,12 +29,7 @@ for s in AirPlayInfoArrayAddScreenDisplay AirPlayReceiverSessionSetup AirPlayCop
   $READELF --dyn-syms mib3shim.so | grep -q "GLOBAL.* $s\$" || { echo "MISSING SEAM: $s"; exit 1; }
 done
 
-# ---------------------------------------------------------------------------
-# mib3clusterhelper (the out-of-process CINEMO DECODE host) is NOT BUILT any
-# more (2026-10-29 redteam refactor): it exists to decode the cluster stream
-# via the shim's bridge/surface exports, which were the PATH A machinery and
-# are deleted from mib3shim.c.  Path B's AU-socket consumer is
-# tools/mib3clusterstream --in unix:... (the RTP/TS sender), which speaks the
-# same mib3helper.h framing.  The historical source stays in the tree as the
-# Path A record (it no longer matches the shim's exports and will not run).
-# ---------------------------------------------------------------------------
+# mib3clusterhelper (the out-of-process Cinemo decode host) is not built: it
+# belonged to Path A, whose shim exports were deleted on 2026-10-29.  The Path B
+# AU-socket consumer is tools/mib3clusterstream, which speaks the same
+# mib3helper.h framing.  The helper's source is kept in attic/path_a/.

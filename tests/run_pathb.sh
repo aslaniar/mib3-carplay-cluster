@@ -475,109 +475,9 @@ else
   echo "  (container CLI unavailable -- skipping the unit-loader run)"
 fi
 
-echo; echo "############ T13-T16: controller (pathb_ctl.sh) ordering + failure paths ############"
-CTL="$SHIMDIR/live_kit/pathb_ctl.sh"
-CRAM="$OUT/ram"; rm -rf "$CRAM"; mkdir -p "$CRAM"
-STUB="$OUT/deliver_stub.sh"
-cat > "$STUB" <<'SH'
-#!/bin/sh
-# records every RSI mutation the controller asks for, and can fail on demand
-echo "$1 $2" >> "$STUBLOG"
-case "$2" in
-  park) [ "${STUB_PARK_FAIL:-0}" = "1" ] && { echo "PARK WARN (stub)"; exit 1; } ;;
-  back) [ "${STUB_BACK_FAIL:-0}" = "1" ] && { echo "BACK FAIL (stub)"; exit 2; } ;;
-esac
-exit 0
-SH
-chmod +x "$STUB"
-cp "$NAT" "$OUT/muxpathb"
-ctl(){  # env via caller; $@ = verb
-  PATHB_MUXER="$OUT/muxpathb" PATHB_DELIVER="$STUB" PATHB_RAM="$CRAM" \
-  PATHB_SOCK="$CRAM/au.sock" PATHB_PROCFIX="$OUT/proc.ok" \
-  PATHB_DST="ff14::2:4%lo0" PATHB_GROUP_PORT="$GPORT" \
-  PATHB_MPY="$PY" STUBLOG="$OUT/stub.log" \
-  PATHB_CARPLAY_PID="${PATHB_CARPLAY_PID:-4242}" \
-  PATHB_MAPS="${PATHB_MAPS:-$OUT/maps.shim}" \
-  PATHB_CONN_WAIT="${PATHB_CONN_WAIT:-1}" \
-  sh "$CTL" "$@"
-}
-killmux(){ p=$(cat "$CRAM/pathb_mux.pid" 2>/dev/null); [ -n "${p:-}" ] && kill -9 "$p" 2>/dev/null; rm -f "$CRAM/pathb_mux.pid"; }
-
-# a /proc/<pid>/maps fixture that contains the shim (the injection pre-flight)
-mkdir -p "$OUT"; printf '7f00-7f10 r-xp 00000000 fd:00 1 /tmp/kit/mib3shim.so\n' > "$OUT/maps.shim"
-printf '7f00-7f10 r-xp 00000000 fd:00 1 /usr/lib/libc.so.6\n' > "$OUT/maps.noshim"
-
-# T13 happy path: park BEFORE bind, and the sender is left running
-rm -f "$OUT/stub.log" "$CRAM/pathb_ctl.log"
-out=$(ctl up 2>&1); rc=$?
-chk ctl_up_exit "$([ $rc = 0 ] && echo 1 || echo 0)" 0 "rc=$rc"
-grep -q "^handover park$" "$OUT/stub.log" 2>/dev/null && ok ctl_parks yes || no ctl_parks yes "$(cat "$OUT/stub.log" 2>/dev/null)"
-p=$(cat "$CRAM/pathb_mux.pid" 2>/dev/null)
-[ -n "${p:-}" ] && kill -0 "$p" 2>/dev/null && ok ctl_sender_running alive || no ctl_sender_running alive dead
-[ -S "$CRAM/au.sock" ] && ok ctl_au_socket_present yes || no ctl_au_socket_present yes no
-MODE2=$(perl -e 'printf "%04o", (stat($ARGV[0]))[2] & 07777' "$CRAM/au.sock" 2>/dev/null)
-[ "$MODE2" = "0777" ] && ok ctl_au_socket_mode 0777 || no ctl_au_socket_mode 0777 "$MODE2"
-PARKL=$(grep -n "park: OK" "$CRAM/pathb_ctl.log" 2>/dev/null | cut -d: -f1 | head -1)
-BINDL=$(grep -n "bind: OK" "$CRAM/pathb_ctl.log" 2>/dev/null | cut -d: -f1 | head -1)
-[ -n "$PARKL" ] && [ -n "$BINDL" ] && [ "$PARKL" -lt "$BINDL" ] \
-  && ok ctl_park_before_bind yes || no ctl_park_before_bind yes "park@$PARKL bind@$BINDL"
-echo "$out" | grep -q "source port 42989" && ok ctl_uses_discovered_port 42989 || no ctl_uses_discovered_port 42989 "$(echo "$out" | head -2 | tr '\n' ' ')"
-
-# T14 down: the sender stops BEFORE the hand-back (MS-S must re-bind our port)
-rm -f "$OUT/stub.log"
-ctl down >"$OUT/down.out" 2>&1
-STOPL=$(grep -n "sender: stopped" "$CRAM/pathb_ctl.log" | tail -1 | cut -d: -f1)
-BACKL=$(grep -n "handing the cluster back" "$CRAM/pathb_ctl.log" | tail -1 | cut -d: -f1)
-[ -n "$STOPL" ] && [ -n "$BACKL" ] && [ "$STOPL" -lt "$BACKL" ] \
-  && ok ctl_stop_before_handback yes || no ctl_stop_before_handback yes "stop@$STOPL back@$BACKL"
-grep -q "^handover back$" "$OUT/stub.log" 2>/dev/null && ok ctl_hands_back yes || no ctl_hands_back yes no
-p=$(cat "$CRAM/pathb_mux.pid" 2>/dev/null); [ -z "${p:-}" ] && ok ctl_pidfile_cleared yes || no ctl_pidfile_cleared yes "$p"
-killmux
-
-# T15 park failure: do NOT bind, and do NOT "hand back" something we never took
-rm -f "$OUT/stub.log"
-out=$(STUB_PARK_FAIL=1 ctl up 2>&1); rc=$?
-chk ctl_park_fail_exit "$([ $rc != 0 ] && echo 1 || echo 0)" nonzero "rc=$rc"
-[ -f "$CRAM/pathb_mux.pid" ] && no ctl_park_fail_no_sender yes started || ok ctl_park_fail_no_sender yes
-grep -q "^handover back$" "$OUT/stub.log" 2>/dev/null && no ctl_park_fail_no_undo yes back-called || ok ctl_park_fail_no_undo yes
-killmux
-
-# T16 bind failure AFTER a successful park: MUST hand the cluster back
-rm -f "$OUT/stub.log"
-$PY "$OUT/holder.py" 42989 >/dev/null 2>&1 &
-HB=$!; track $HB
-sleep 1.0
-out=$(PATHB_BIND_TRIES=2 ctl up 2>&1); rc=$?
-chk ctl_bind_fail_exit "$([ $rc != 0 ] && echo 1 || echo 0)" nonzero "rc=$rc"
-[ "$(echo "$out" | grep -c 'retrying')" -ge 1 ] && ok ctl_bind_retried yes || no ctl_bind_retried yes no
-grep -q "^handover back$" "$OUT/stub.log" 2>/dev/null && ok ctl_bind_fail_hands_back yes || no ctl_bind_fail_hands_back yes "no undo -- car left parked"
-kill $HB 2>/dev/null; killmux
-
-echo; echo "############ T14b: the pidfile is not evidence (car, 2026-10-27) ############"
-# EXACT FIELD FAILURE: `down` read a stale pidfile, reported "sender: was not
-# running", and left the real sender holding UDP 42989.  MS-S could not take its
-# own port, bound a different one, and the cluster went dark.  So: a live sender
-# the pidfile does not describe must still be found and stopped.
-rm -f "$OUT/stub.log" "$CRAM/pathb_mux.pid"
-"$OUT/muxpathb" --in "unix:$CRAM/orphan.sock" --out "file:$OUT/orphan.dgrams" 2>/dev/null &
-OP=$!
-for _ in $(seq 1 40); do [ -S "$CRAM/orphan.sock" ] && break; sleep 0.05; done
-echo 999999 >"$CRAM/pathb_mux.pid"          # stale: names nothing at all
-st=$(ctl status 2>&1)
-echo "$st" | grep -q "sender:      RUNNING" && ok ctl_finds_sender_without_pidfile yes \
-  || no ctl_finds_sender_without_pidfile yes "$(echo "$st" | grep 'sender:')"
-ctl down >"$OUT/down2.out" 2>&1
-if kill -0 "$OP" 2>/dev/null; then
-  no ctl_down_kills_by_process alive "still running"
-  kill -9 "$OP" 2>/dev/null
-else
-  ok ctl_down_kills_by_process alive
-fi
-grep -q "^handover back$" "$OUT/stub.log" 2>/dev/null && ok ctl_stale_pidfile_hands_back yes \
-  || no ctl_stale_pidfile_hands_back yes no
-grep -q "was not running" "$OUT/down2.out" && no ctl_no_false_not_running yes "claimed not running" \
-  || ok ctl_no_false_not_running yes
-killmux
+# T13-T16 tested the retired shell controller (live_kit/pathb_ctl.sh).  That
+# controller is superseded by pathb_daemon.sh, whose own bench (run_pathb_daemon.sh,
+# D1-D15) asserts the same ordering and failure invariants.  Archived 2026-11-02.
 
 echo; echo "############ T17-T18: START GATE -- hold until a decodable IDR ############"
 # a mid-GOP fixture: SPS/PPS kept, the first IDR removed, so the first VCL is a P-slice
@@ -625,28 +525,10 @@ else
 fi
 echo "  gate OFF: first PES nal types $NG_FIRST"
 
-echo; echo "############ T19-T22: pre-flight refusals ############"
-rm -f "$OUT/stub.log"
-out=$(PATHB_FAKE_RUNNING="v4l2_seq" ctl up 2>&1); rc=$?
-chk ctl_refuses_over_pipeline "$([ $rc != 0 ] && echo 1 || echo 0)" nonzero "rc=$rc"
-echo "$out" | grep -q "REFUSING" && ok ctl_says_why yes || no ctl_says_why yes no
-grep -q "^handover park$" "$OUT/stub.log" 2>/dev/null && no ctl_no_park_when_refusing yes "parked anyway" || ok ctl_no_park_when_refusing yes
-killmux
+# T19-T22 tested the retired controller's pre-flight refusals.  The supervisor
+# owns that behaviour now (single instance, pause marker, port ownership) and
+# run_pathb_daemon.sh asserts it: D8 pause, D9 single instance, D15 busy port.
 
-out=$(PATHB_FAKE_RUNNING="transition_ctl.sh" PATHB_TAKE=1 ctl up 2>&1); rc=$?
-chk ctl_take_flag_proceeds "$([ $rc = 0 ] && echo 1 || echo 0)" 0 "rc=$rc"
-killmux
-
-out=$(PATHB_MAPS="$OUT/maps.noshim" ctl up 2>&1); rc=$?
-chk ctl_refuses_without_shim "$([ $rc != 0 ] && echo 1 || echo 0)" nonzero "rc=$rc"
-echo "$out" | grep -qi "not mapped in carplay" && ok ctl_shim_message yes || no ctl_shim_message yes no
-killmux
-
-out=$(PATHB_SKIP_SHIM_CHECK=1 PATHB_MAPS="$OUT/maps.noshim" ctl up 2>&1); rc=$?
-chk ctl_skip_shim_check_works "$([ $rc = 0 ] && echo 1 || echo 0)" 0 "rc=$rc"
-killmux
-
-echo
 echo "############ T23-T25: MONITOR mode -- the port is taken on command ############"
 # The resident supervisor's whole contract: own the AU socket from boot, take the
 # cluster's UDP port only when told, and give it back on command.  Nothing here

@@ -247,7 +247,13 @@ while [ "$_i" -lt 80 ]; do
   grep -q back "$TMP/order.log" 2>/dev/null && break
   sleep 0.05; _i=$((_i+1))
 done
-chk d10_unbound "$( [ -n "$(first_line unbind "$TMP/order.log")" ] && echo 1 || echo 0 )" "released the orphaned port"
+# D10 asserts the INVARIANT, not the mechanism.  The supervisor stops the
+# orphaned sender first (a restarted daemon must never leave a pre-fix sender
+# running), and stopping it frees the port, so there is no live process left to
+# receive an "unbind" -- an assertion on that line was asserting a mechanism the
+# code no longer uses.  What must be true: the orphan is gone, the cluster is
+# handed back, and the decision is logged as a reconcile.
+chk d10_orphan_stopped "$( kill -0 "$_fpid" 2>/dev/null && echo 0 || echo 1 )" "stopped the orphaned sender"
 chk d10_handed_back "$( [ -n "$(first_line back "$TMP/order.log")" ] && echo 1 || echo 0 )" "handed the cluster back"
 chk d10_reconciled "$( has x 'reconcile' "$TMP/pathb_daemon.log" )" "logged as reconcile"
 reset_all
