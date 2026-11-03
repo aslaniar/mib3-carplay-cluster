@@ -3,24 +3,25 @@
 # inject.py -- load a .so into an ALREADY RUNNING process, via ptrace.
 #
 # WHY: restarting carplay.service reboots this head unit, so the shim cannot be
-# delivered by a restart. This attaches to the process that is ALREADY RUNNING
-# and dlopen()s the library into it. No restart -> no reboot -> retry freely.
+# delivered by a restart.  This attaches to the running process and dlopen()s the
+# library into it: no restart -> no reboot -> retry freely.
 #
 #   /usr/bin/python inject.py <pid> </path/to/lib.so>
 #
 # RAM only: the library lives in the target's address space; a reboot (or the
-# process exiting) erases it. Nothing is written to disk.
+# process exiting) erases it.  Nothing is written to disk.
 #
 # Things learned the hard way on the unit (each cost a run):
 #   * glibc 2.23 keeps dlopen in libdl, NOT libc (merged only in 2.34).
 #   * the real files are versioned: libdl-2.23.so, libc-2.23.so -- matching the
 #     soname finds no mapping.
 #   * this python2 has no os.pwrite -- use lseek+write.
-#   * carplay is MULTI-THREADED (10 threads): attach every thread or a stray
+#   * carplay is MULTI-THREADED (10 threads): attach every thread, or a stray
 #     thread stop gets reported instead of ours.
 #   * do NOT put a scratch BRK stub on the stack -- it is rw-, not x, and faults
-#     SEGV_ACCERR (si_code=2). Use lr=0 and accept the fault instead.
+#     SEGV_ACCERR (si_code=2).  Use lr=0 and accept the fault instead.
 #   * always restore registers and detach, even on error.
+#   * py2 only (the unit's interpreter): `print` statements, `except E, e`.
 # ============================================================================
 import ctypes, os, signal, struct, sys
 

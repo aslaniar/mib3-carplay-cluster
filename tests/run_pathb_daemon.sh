@@ -2,11 +2,11 @@
 # ============================================================================
 # run_pathb_daemon.sh -- desk bench for pathb_daemon.sh + pathbctl (2026-11-02)
 #
-# No car, no unit, no injection: the sender, the RSI handover and the kernel
-# port check are all replaced by seam scripts that keep a LOG OF WHAT HAPPENED
-# AND IN WHAT ORDER.  That order is the thing under test -- the two invariants
-# that were paid for on the car are "park before bind" and "unbind before hand
-# back", and an assertion on a state name cannot see either of them.
+# No car, no unit, no injection: the sender, the RSI handover and the kernel port
+# check are all replaced by seam scripts that keep a LOG OF WHAT HAPPENED AND IN
+# WHAT ORDER.  That order is the thing under test -- the two invariants paid for on
+# the car are "park before bind" and "unbind before hand back", and an assertion on
+# a state name cannot see either of them.
 #
 #   D0   both scripts are syntactically valid for /bin/sh
 #   D1   no phone -> nothing is touched (no park, no bind)
@@ -22,6 +22,8 @@
 #   D11  the sender dying while ACTIVE -> release, then a new sender
 #   D12  the state file carries the fields the CLI needs
 #   D13  the CLI reports the daemon and its state
+#   D14  a hand-back that fails must NOT report IDLE (it degrades, then recovers)
+#   D15  a takeover that fails before we bind leaves IDLE with the nav restored
 #
 # Usage: sh MIB3_RE/shim/harness/run_pathb_daemon.sh
 # ============================================================================

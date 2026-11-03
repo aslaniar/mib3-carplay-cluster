@@ -1,46 +1,45 @@
 /* ============================================================================
- * mib3wheel.c -- STEERING-WHEEL up/down -> CarPlay cluster zoom (2026-10-18).
+ * mib3wheel.c -- STEERING-WHEEL up/down -> CarPlay cluster zoom.
  *
  *   *** runs ON THE UNIT (aarch64); the same source is benchable on the desk ***
  *
  * WHY THIS TOOL EXISTS
  * --------------------
- * On this unit the steering-wheel roller never reaches CarPlay.  The wheel is a
- * CAN key (MFL_Tasten_Kon_01); it reaches the head unit as a BAP
- * `NavigationSd.MapScale` SetGet, and `navsd_app` (libMIBNavSDClientLib_CarIF,
- * Viwi::NavSd::FctMapScale) turns it into a POST of `{relativeSteps}` to the
- * car's own maprenderer ("/maprenderer/discreteInputs/<renderer>").  The car's
- * nav zooms, navsd reports the new BAP MapScale Status, and the CLUSTER paints
- * its own zoom/scale overlay.  Because our CarPlay video replaced that map, the
- * wheel today moves a map nobody is looking at.
+ * On this unit the steering-wheel roller never reaches CarPlay.  It is a CAN key
+ * (MFL_Tasten_Kon_01) that arrives as a BAP `NavigationSd.MapScale` SetGet, and
+ * `navsd_app` (libMIBNavSDClientLib_CarIF, Viwi::NavSd::FctMapScale) turns it into
+ * a POST of `{relativeSteps}` to the car's own maprenderer
+ * ("/maprenderer/discreteInputs/<renderer>"): the car's nav zooms, navsd reports
+ * the new BAP MapScale Status, and the CLUSTER paints its own scale overlay.
+ * Because our CarPlay video replaced that map, the wheel moves a map nobody sees.
  *
  * The CarPlay side has a first-class command for exactly this case:
  *     changeMapZoomLevel { uuid: <cluster display uuid>, zoomDirection: 0|1 }
  * (0 = zoom in, non-zero = zoom out; DashBoard turns it into
  * CRSUIClusterZoomAction for the cluster scene).  Only the CarPlay process can
  * send it, so the shim sends it -- see mib3shim.c "ZOOM: the STEERING-WHEEL
- * up/down mirror".  THIS tool is what tells the shim that the wheel moved: it
- * watches the unit's own renderer input and writes "+1"/"-1" lines into the
- * shim's AF_UNIX inbox (/dev/shm/mib3zoom.sock by default).
+ * up/down mirror".  THIS tool tells the shim the wheel moved: it watches the
+ * unit's own renderer input and writes "+1"/"-1" lines into the shim's AF_UNIX
+ * inbox (/dev/shm/mib3zoom.sock by default).
  *
- * TWO READ-ONLY TAPS (both are RSI/VIWI over localhost, no writes, no state)
- * ------------------------------------------------------------------------
+ * TWO READ-ONLY TAPS (both RSI/VIWI over localhost, no writes, no state)
+ * --------------------------------------------------------------------
  *  A. /maprenderer/discreteInputs  (AUTHORITATIVE) -- an element event when
  *     navsd posts relativeSteps.  `relativeSteps: -1|+1` is the step.
  *  B. /maprenderer/renderers       (BACKSTOP)      -- the renderer's own
- *     `distancePerPixel` changes when its map zooms.  Used only when
- *     `zoomMode` is NOT "auto", because with auto-zoom the scale moves with
- *     vehicle speed and would look like wheel input.
- * Both are subscriptions; nothing is consumed, so the car's nav keeps working
- * exactly as before and a wrong guess here cannot break it.
+ *     `distancePerPixel` changes when its map zooms.  Used only when `zoomMode`
+ *     is NOT "auto", because auto-zoom moves the scale with vehicle speed.
+ * Both are subscriptions; nothing is consumed, so the car's nav keeps working and
+ * a wrong guess here cannot break it.  (On this unit the renderers tap does not
+ * push -- see poll_renderers -- so a GET diff carries it.)
  *
  * MODE PROBE (start here on the car; zero risk, writes nothing)
  * ------------------------------------------------------------
  *   mib3wheel --probe          GET /maprenderer/renderers + /discreteInputs,
  *                              print the renderers (name/id/zoomMode/
  *                              distancePerPixel/discreteInput) and every
- *                              discreteInput element.  This is the evidence
- *                              that says WHICH tap the wheel shows up on.
+ *                              discreteInput element: the evidence that says
+ *                              WHICH tap the wheel shows up on.
  *   mib3wheel --probe-all      additionally sweep the RSI port range and the
  *                              known service names (finds `input`, if that
  *                              service is up; its rotaryEncoderStates would be
@@ -51,8 +50,8 @@
  *             [--socket PATH] [--dump] [--invert] [--min-gap-ms N]
  *             [--no-renderers] [--once N] [--selftest] [--quiet]
  *
- * SAFETY: read-only RSI.  No service is touched, nothing is restarted, no
- * display call is made.  Killing it stops all zoom mirroring instantly.
+ * SAFETY: read-only RSI.  No service is touched, nothing is restarted, no display
+ * call is made.  Killing it stops all zoom mirroring instantly.
  * ==========================================================================*/
 #define NULL ((void*)0)
 typedef unsigned int  u32;
@@ -292,12 +291,11 @@ static long ws_read(int fd, char *out, usize cap){
 }
 
 /* ---- JSON scanning (pragmatic: we only need a few scalars) --------------
- * Two rules learned the hard way in the bench:
- *  (1) a scan must ALWAYS START at a proper token boundary (the beginning of
- *      the text, or the start of an object).  Resuming in the middle of a
- *      value string flips the quote parity and the scanner then reads
- *      punctuation as keys -- it silently found only the FIRST renderer of a
- *      two-renderer array.
+ * Two rules learned on the bench:
+ *  (1) a scan must ALWAYS START at a proper token boundary (the beginning of the
+ *      text, or the start of an object).  Resuming mid-value flips the quote
+ *      parity and the scanner then reads punctuation as keys -- it silently found
+ *      only the FIRST renderer of a two-renderer array.
  *  (2) so the multi-object walk below enumerates the array's objects by brace
  *      depth and scans each object from ITS OWN START. */
 static const char *find_key(const char *j, const char *key){
@@ -632,13 +630,12 @@ static int tapb_element(const char *obj, int invert, int *accepted, int *steps){
   return 0;
 }
 
-/* ---- renderer POLL (added 2026-10-19, after measuring the car) ----------
- * WHY: on the unit, RSI answers GET for /maprenderer/renderers but does NOT
- * push these changes over the WS subscription.  Measured: the owner rolled the
- * wheel, the car's own `kombi` renderer went distancePerPixel 3.838 -> 26.312
- * and zoomMode auto -> manual, and mib3wheel logged NOTHING.  The subscription
- * is therefore the wrong instrument; a GET diff is the reliable one.  The WS
- * taps stay (they cost nothing and may push on another build). */
+/* ---- renderer POLL (added after measuring the car) ----------------------
+ * RSI answers GET for /maprenderer/renderers but does NOT push these changes over
+ * the WS subscription: the owner rolled the wheel, the car's own `kombi` renderer
+ * went distancePerPixel 3.838 -> 26.312 and zoomMode auto -> manual, and mib3wheel
+ * logged NOTHING.  A GET diff is the reliable instrument; the WS taps stay because
+ * they cost nothing and may push on another build. */
 static int poll_renderers(const char *host, int port, int invert, int *accepted, int *steps){
   static char buf[65536]; usize bl = 0; const char *arr; int k, handled = 0;
   if (http_get(host, port, "/maprenderer/renderers", buf, sizeof(buf), &bl) != 200 || !bl) return 0;

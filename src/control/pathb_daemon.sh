@@ -1,85 +1,74 @@
 #!/bin/sh
 # ============================================================================
-# pathb_daemon.sh -- Path B's resident supervisor (2026-11-02).
+# pathb_daemon.sh -- Path B's resident supervisor.
 #
 # WHAT IT IS.  One process, one loop, four states.  It owns the lease on the
-# cluster's video feed: either the car's own nav produces it, or we do.  It is
-# the only thing that decides, and it decides from EVENTS, never from a clock.
+# cluster's video feed: either the car's own nav produces it, or we do.  It is the
+# only thing that decides, and it decides from EVENTS, never from a clock.  Its
+# predecessor (`pathb_ctl.sh up|down`) was a chain of blocking verbs written for a
+# human at a terminal; every defect that shape produced -- sleeps as
+# synchronisation, a network probe as a boolean, log lines as control flow -- is
+# gone by construction here.
 #
-# WHY IT EXISTS.  `pathb_ctl.sh up|down` is a sequence of blocking verbs written
-# for a human at a terminal.  Everything it gets wrong (sleeps used as
-# synchronisation, a 2 s network probe used as a boolean, log lines used as
-# control flow, the same facts re-derived by four scripts) comes from that
-# shape, not from the problem.  This is the same logic as a state machine.
+# THE CONTRACT (all paths under <ram>, default /dev/shm):
+#   IN   pathb_conn.state    from mib3clusterstream: conn ready bound au out ms seq
+#                            `au` = access units RECEIVED from the shim, and THIS is
+#                            the session signal.  A socket is not: on wireless
+#                            CarPlay the phone's TCP connection stays ESTABLISHED
+#                            after the phone leaves, so "connected" outlives the
+#                            session by hours.
+#   IN   pathb_daemon.cmd    one-shot operator command ("release")
+#   IN   pathb_daemon.pause  present = never take over
+#   IN   /proc/net/udp{,6}   is the port free? THE proof, not a hint
+#   OUT  pathb_sender.ctl    "bind <port>" | "unbind"
+#   OUT  pathb_daemon.state  what the CLI reads
+#   OUT  pathb_daemon.log    one line per decision, monotonic ms
 #
-# THE CONTRACT WITH THE REST OF THE SYSTEM
-#
-#   IN   <ram>/pathb_conn.state     written by mib3clusterstream:
-#                                   conn ready bound au out ms seq
-#                                   `au` = access units RECEIVED from the shim.
-#                                   THIS is the session signal.  A socket is
-#                                   not: on wireless CarPlay the phone's TCP
-#                                   connection stays ESTABLISHED after the
-#                                   phone leaves, so "connected" outlives the
-#                                   session by hours.
-#   IN   <ram>/pathb_daemon.cmd     one-shot operator command ("release")
-#   IN   <ram>/pathb_daemon.pause   present = never take over
-#   IN   /proc/net/udp{,6}          is the port free? THE proof, not a hint
-#   OUT  <ram>/pathb_sender.ctl     "bind <port>" | "unbind"
-#   OUT  <ram>/pathb_daemon.state   what the CLI reads
-#   OUT  <ram>/pathb_daemon.log     one line per decision, monotonic ms
-#
-# THE STATES.  `owner` is the one resource everybody wants.
-#
-#   IDLE      owner=nav.  Watching `au`.  When frames have been arriving for
-#             READY_STABLE, the phone has a live cluster map and we take over.
-#   TAKEOVER  owner=nobody (transient).  Park the nav element, bind the port the
+# THE STATES (`owner` is the one resource everybody wants):
+#   IDLE      owner=nav.  Watching `au`; once frames have arrived for READY_STABLE
+#             the phone has a live cluster map and we take over.
+#   TAKEOVER  owner=nobody (transient): park the nav element, bind the port the
 #             instant the kernel says it is free, wait for one emitted AU.
-#   ACTIVE    owner=us.  Watch `au`.  When it stops advancing for GRACE, the
-#             session is over -- however healthy the socket still looks.
-#   RELEASE   owner=nobody (transient).  Unbind (which frees the port), prove it
-#             in the kernel, hand the nav element back, confirm.
+#   ACTIVE    owner=us.  When `au` stops advancing for GRACE the session is over,
+#             however healthy the socket still looks.
+#   RELEASE   owner=nobody (transient): unbind (which frees the port), prove it in
+#             the kernel, hand the nav element back, confirm.
+#   DEGRADED  a step did not complete: retry the release on a backoff, never arm.
 #
-# THE INVARIANTS (structural, not comments -- you cannot reach a state that
-# breaks them):
+# THE INVARIANTS (structural, not comments -- no state can break them):
 #   1. We are never the producer without a bound port (ACTIVE requires bound).
 #   2. We never hand the cluster back while we still hold the port: MS-S sets
 #      SO_REUSEPORT and on a failed bind it falls back to an EPHEMERAL port and
 #      sends into a void the ECU drops.  Measured 2026-10-27: cluster dark.
 #   3. We never leave the nav element deleted.  Every failure path runs RELEASE.
-#   4. Every wait is CONDITION or DEADLINE.  There is no sleep whose purpose is
-#      "give it time".
+#   4. Every wait is CONDITION or DEADLINE.  No sleep exists "to give it time".
 #
-# WHAT IT DOES NOT DO: no decode, no surface, no display call, no thread in
-# carplay, no log parsing as control flow, no pidfile as evidence, no probe of
-# the wire.  It reads files, writes files, and makes the RSI calls that already
-# exist in deliver_ctl.sh.
+# WHAT IT DOES NOT DO: no decode, no surface, no display call, no thread in carplay,
+# no log parsing as control flow, no pidfile as evidence, no probe of the wire.  It
+# reads files, writes files, and makes the RSI calls that already exist in
+# deliver_ctl.sh.
 #
-# USAGE (on the unit):
-#   sh pathb_daemon.sh run        # the loop (normally started at boot)
-#   sh pathb_daemon.sh once       # one tick, for a bench or a look
-#   sh pathb_daemon.sh status     # same text the CLI prints
-#   sh pathb_daemon.sh stop       # release (if we own it), then exit
+# USAGE (on the unit):  sh pathb_daemon.sh run|once|status|stop
 #
 # ENV (defaults are the live unit values; every wait has a deadline):
-#   PATHB_RAM               /dev/shm
-#   PATHB_SOCK              <ram>/mib3cluster.sock
-#   PATHB_MUXER             /tmp/kit/mib3clusterstream
-#   PATHB_DELIVER            deliver_ctl.sh (sibling by default)
+#   PATHB_RAM / PATHB_SOCK / PATHB_MUXER / PATHB_DELIVER
+#                           /dev/shm, <ram>/mib3cluster.sock,
+#                           /tmp/kit/mib3clusterstream, sibling deliver_ctl.sh
 #   PATHB_BENCH=1           skip the unit-only preparation steps
 #   PATHB_POLL_MS           200    loop tick
 #   PATHB_READY_STABLE_MS   400    frames must be arriving this long (debounce)
-#   PATHB_GRACE_MS          3500   no new AU this long -> the session is over.
-#                                  NOT 1.5 s: the phone stops sending for 1.5-2.3 s
-#                                  whenever its map is static or a scene changes, and at
-#                                  1.5 s every one of those was read as a disconnect
-#                                  (measured on the car 2026-11-02: release 3.3 s, re-take
-#                                  2.6 s, repeated = the "5 second" switch the owner saw).
+#   PATHB_GRACE_MS          4500   no new AU this long -> the session is over.
+#                                  The phone pauses 1.5-2.3 s whenever its map is
+#                                  static or a scene changes, and 3.1-4.1 s at
+#                                  guidance start/stop on WIRED CarPlay (measured
+#                                  2026-11-02); at 1.5 s every one of those read as
+#                                  a disconnect (release 3.3 s, re-take 2.6 s = the
+#                                  "5 second" switch the owner saw).
 #   PATHB_RETRY_MS          2000   backoff after a failed takeover
-#   PATHB_TAKEOVER_MS       9000   whole takeover deadlline (park + bind + emit)
-#   (the release has no deadline of its own: deliver_ctl.sh's handover gates
-#    are already bounded by MS-S's own 1 Hz clock -- see RELEASE below.)
-#   PATHB_LOG_MAX           65536  log is truncated to its last half beyond this
+#   PATHB_TAKEOVER_MS       9000   whole takeover deadline (park + bind + emit)
+#   (the release has no deadline of its own: deliver_ctl.sh's handover gates are
+#    already bounded by MS-S's own 1 Hz clock.)
+#   PATHB_LOG_MAX           65536  log truncated to its last half beyond this
 #   PATHB_D_PARK_CMD / PATHB_D_BACK_CMD / PATHB_D_PORTFREE_CMD   bench seams
 # ============================================================================
 set -u
@@ -494,16 +483,12 @@ knobs_once(){   # once per carplay process, never per session (it is a ptrace)
   [ "$KNOBS_PID" = "$_cp" ] && return 0
   [ -f /tmp/kit/target_env.py ] || return 0
   if /usr/bin/python /tmp/kit/target_env.py "$_cp" MIB3_SHIM_SINK=helper >/dev/null 2>&1; then
-    # THE SHIM'S CONFIGURATION LIVES HERE, NOT IN A ONE-OFF ENV POKE (2026-11-02).
-    # These are the reference project's settings, chosen deliberately:
-    #   SINK=helper        frames must leave the process at all
-    #   FPS=60             the phone uses this as its rate (26.6 fps delivered)
-    #   VIEWAREAS=0        the multi-area card advert was tried on the car and is
-    #                      buggy; the bare map scene is what ships
-    #   URL=...            the MHI2 reference's card-OFF scene (owner is A/B
-    #                      testing it on the car 2026-11-02 against our plain
-    #                      URL; both are one env flip apart).
-    # A reboot must reproduce this exactly, so it is set from here every boot.
+    # THE SHIM'S CONFIGURATION LIVES HERE, NOT IN A ONE-OFF ENV POKE, and a reboot
+    # must reproduce it exactly:
+    #   SINK=helper   frames must leave the process at all
+    #   FPS=60        the phone uses this as its rate (26.6 fps delivered)
+    #   VIEWAREAS=0   the multi-area card advert was tried on the car and is buggy
+    #   URL=...       map-only, no ETA, no speed limit, card top-aligned
     for _kv in MIB3_SHIM_FPS=60 \
                MIB3_SHIM_VIEWAREAS=0 \
                "MIB3_SHIM_URL=maps:/car/instrumentcluster/map?showETA=no&maneuverLayout=topAligned&showSpeedLimit=no" \
@@ -518,7 +503,7 @@ knobs_once(){   # once per carplay process, never per session (it is a ptrace)
 oracle_housekeeping(){
   # THE MS-S LOG IS AN ORACLE, NOT A DATABASE.  Every handover gate marks its
   # position in it with a `wc -c` over the WHOLE file, so an unrotated log makes
-  # each gate cost its size.  Measured on the car 2026-11-02: 142 MB -> mut_mark
+  # each gate cost its size: measured on the car 2026-11-02, 142 MB -> mut_mark
   # 1,440 ms, i.e. ~1.4 s of a 2.8 s takeover spent counting a log.  Rotate on a
   # timer (stop+start also re-opens the write side correctly; truncating in place
   # would leave curl writing at its old offset).
@@ -662,11 +647,11 @@ do_tick(){
           NEXT_RETRY=$(( $(now_ms) + RETRY )); FLOW_SINCE=0; DEAD_SINCE=0
         fi
       else
-        # TOLERATED SILENCE IS LOGGED.  The phone pauses at scene changes and we
-        # must not treat that as a disconnect; recording the size of every pause
-        # we sat through turns the next grace decision into data instead of a
-        # guess.  Measured on WIRED CarPlay 2026-11-02: 3.1-4.1 s at guidance
-        # start/stop (wireless was 1.5-2.3 s), which is why the grace is 6 s.
+        # TOLERATED SILENCE IS LOGGED: the phone pauses at scene changes and that is
+        # not a disconnect, so every pause we sat through is recorded and the next
+        # grace decision is data instead of a guess.  Measured on WIRED CarPlay
+        # 2026-11-02: 3.1-4.1 s at guidance start/stop (wireless 1.5-2.3 s), which
+        # is why GRACE is 4500 ms -- just above the worst pause.
         if [ "${DEAD_SINCE:-0}" != "0" ]; then
           _gap=$(( _now - DEAD_SINCE ))
           [ "$_gap" -ge 2000 ] && log "tolerated a ${_gap}ms silence (phone paused; not a disconnect)"
@@ -680,13 +665,12 @@ do_tick(){
           settle "sender-lost" "$_r"
           NEXT_RETRY=$(( $(now_ms) + RETRY )); FLOW_SINCE=0; DEAD_SINCE=0
         elif [ "${S_BOUND:-0}" = "0" ]; then
-          # THE KERNEL DECIDES OWNERSHIP, NOT THE FILE (2026-11-02).
-          # The sender rewrites its state file ~5x/s.  A reading that lands while
-          # it is being rewritten says "bound=0" and nothing else is true, and
-          # acting on it costs the driver the map for seconds -- measured on the
-          # car as one 3.5 s blink.  So a port claim of zero is only real if the
-          # KERNEL also says the port is free; if it is still bound, the sender
-          # is alive (checked above) and this is a bad read: ignore it.
+          # THE KERNEL DECIDES OWNERSHIP, NOT THE FILE.  The sender rewrites its
+          # state file ~5x/s, so a reading taken mid-write says "bound=0" and
+          # nothing else is true -- and acting on it costs the driver the map for
+          # seconds (measured on the car: one 3.5 s blink).  A port claim of zero is
+          # therefore only real if the KERNEL also says the port is free; if it is
+          # still bound, the sender is alive (checked above) and this was a bad read.
           if [ -n "${PORT:-}" ] && ! port_free; then
             log "ACTIVE: sender reported bound=0 but the kernel still holds udp/$PORT -- bad read, ignoring"
           else
@@ -732,11 +716,11 @@ do_run(){
   else
     trap 'rm -f "$PIDF"; exit 0' INT TERM HUP
   fi
-  # ONE SENDER, AND IT IS OURS.  A previous daemon's sender survives (it is
-  # nohup'd and orphaned) and an OLDER BINARY keeps running with the old
-  # behaviour while every counter looks right -- measured on the car
-  # 2026-11-02: a restarted daemon adopted a pre-fix sender and the flap
-  # continued.  Kill it first, then reconcile, then start a fresh one.
+  # ONE SENDER, AND IT IS OURS.  A previous daemon's sender survives (it is nohup'd
+  # and orphaned) and an OLDER BINARY then keeps running with the old behaviour
+  # while every counter looks right -- measured on the car 2026-11-02: a restarted
+  # daemon adopted a pre-fix sender and the flap continued.  So: kill it, reconcile,
+  # then start a fresh one.
   if sender_alive; then
     log "start: stopping a previous daemon's sender (pid $SENDER_PID)"
     sender_stop

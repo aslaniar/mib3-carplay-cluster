@@ -1,21 +1,23 @@
 /* ============================================================================
- * mib3shim.c -- LD_PRELOAD shim for the LG MIB3 CarPlay stack (R8830L).
+ * mib3shim.c -- the shim injected into the LG MIB3 CarPlay stack (R8830L).
  *
- * Purpose: make the head unit advertise a SECOND (instrument-cluster) display
- * to the iPhone, so iOS opens the type-111 Apple Maps cluster stream.
+ * Job: make the head unit advertise a SECOND (instrument-cluster) display to the
+ * iPhone, so iOS opens the type-111 Apple Maps cluster stream -- then hand the
+ * phone's own H.264 for it to the Path B sender.  Nothing here decodes or draws.
  *
  * Built with NO libc dependency (see build.sh): every symbol it needs (libc +
  * CoreFoundation + the real plugin functions) is resolved at runtime via
- * dlsym() from the host process.  That is why it links against glibc 2.23
- * without needing a matching toolchain -- see LANE_CARPLAY_SHIM.
+ * dlsym() from the host process, which is why it links against the unit's
+ * glibc 2.23 without a matching toolchain.
  *
- * Interposes:
+ * THREE SEAMS, and every feature below hangs off one of them (inject/
+ * inject_shim.py patches exactly these three GOT slots):
  *   AirPlayInfoArrayAddScreenDisplay  -- LG calls it once (main screen);
  *                                        we capture the args and call it AGAIN
  *                                        with cluster geometry.
- *   AirPlayReceiverSessionSetup       -- log + (optionally) inject the
+ *   AirPlayReceiverSessionSetup       -- log, optionally inject the
  *                                        "enabledFeatures" array into the
- *                                        session SETUP response; owns the
+ *                                        CONTROL SETUP response, and own the
  *                                        type-111 stream.
  *   AirPlayCopyServerInfo             -- complete the modern CarKit /info schema
  *                                        (uid/properties/initialVideoStreams +
@@ -26,18 +28,17 @@
  * Logs to /tmp/mib3shim.log (world-writable tmpfs; SMACK `_`).
  * Env knobs (the load-bearing ones; the RUN banner prints the live set):
  *   MIB3_SHIM_ADD=0/1         advertise the cluster display (default 1)
- *   MIB3_SHIM_W/H/FPS         cluster geometry (default 1280x480@15 -- FPS is
- *                             the advertised maxFPS and the phone uses it as
- *                             its RATE; 15 is the measured-clean value, see
- *                             the banner note)
+ *   MIB3_SHIM_W/H/FPS         cluster geometry (default 1280x480, FPS 60 -- FPS is
+ *                             the advertised maxFPS and the phone uses it as its
+ *                             RATE, so 60 delivers 26.6 fps; see the banner note)
  *   MIB3_SHIM_INFO=0/1        complete the modern /info schema (default 1)
  *   MIB3_SHIM_ENABLEDFEAT=0/1 inject enabledFeatures into the CONTROL SETUP (default 1)
  *   MIB3_SHIM_PORT=<n>        cluster data port (default: 5000, then 6031, then
- *                             ephemeral).  5000 is INSIDE the unit's own
- *                             firewall allowlist (GENERIC_PORT_IN_FILTER
+ *                             ephemeral).  5000 is the only one INSIDE the
+ *                             unit's firewall allowlist (GENERIC_PORT_IN_FILTER
  *                             "-i ncm0 -p tcp --dport 5000:5001"); 6031 and any
  *                             ephemeral port are FIREWALL-DROPPED on ncm0/wlap
- *                             (the phone's SYN never reaches us) and need
+ *                             -- the phone's SYN never reaches us -- and need
  *                             live_kit/cluster_port_fw.sh first.
  *   MIB3_SHIM_CMDS=0/1        send forceKeyFrame/showUI/setNightMode to the
  *                             phone once the 111 stream connects (default 1)
@@ -97,19 +98,14 @@ extern int    strncmp(const char *a, const char *b, unsigned long n);
 /* ---------------------------------------------------------------------------
  * Two-tier symbol resolution.
  *
- * RTLD_NEXT is correct when this shim is loaded BEFORE the real libraries
- * (LD_PRELOAD / DT_NEEDED ordering): it finds the next object after us.
- *
- * But when the shim is dlopen()ed into a process that is ALREADY RUNNING, it is
- * appended LAST in the search order -- so RTLD_NEXT finds nothing and EVERY
- * pointer in resolve() came back NULL. The shim then had no real function to
- * forward to and broke whatever call it intercepted.
- *
- * In that case RTLD_DEFAULT is correct: the real libraries are already in the
- * global scope and we are last, so the first definition found is the real one.
- *
- * Load-time behaviour is unchanged (RTLD_NEXT succeeds and wins); the fallback
- * only ever runs when RTLD_NEXT fails.
+ * RTLD_NEXT is correct when the shim is loaded BEFORE the real libraries
+ * (DT_NEEDED ordering): it finds the next object after us.  When the shim is
+ * injected into a process that is ALREADY RUNNING it is appended LAST, so
+ * RTLD_NEXT finds nothing, every pointer came back NULL, and each intercepted
+ * call was broken by the shim that meant to forward it.  RTLD_DEFAULT is
+ * correct there: the real libraries are in the global scope and the first
+ * definition found is the real one.  The fallback only runs when RTLD_NEXT
+ * fails, so load-time behaviour is unchanged.
  * ------------------------------------------------------------------------- */
 extern void *dlsym(void *handle, const char *name);
 static void *R(const char *name)
@@ -146,30 +142,22 @@ static void log_open(void){
   if (logfd < 0) logfd = open("/tmp/mib3shim.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
 }
 /* ---- opcode-5: the SENDER'S OWN TELEMETRY, not a keepalive (2026-10-20) -----
- * The body is a binary plist of the PHONE's counters: encoderCurrentFPS,
- * sinkOverflowDropFPS, rttAvg, txUsageAvg.  We used to log 64 bytes of it and
- * call it "keepalive" -- which threw away the only in-band evidence of WHY the
- * phone encodes ~15 fps when it is allowed 30: its own content rate control, a
- * thermal clamp (iOS DBThermalMonitor level 1 == exactly 15), or the sender
- * DROPPING frames because its queue backed up past 67 ms -- i.e. because we
- * drain too slowly.  `sinkOverflowDropFPS` is the number that separates them.
+ * The body is a binary plist of the PHONE's counters -- encoderCurrentFPS,
+ * sinkOverflowDropFPS, rttAvg, txUsageAvg -- the only in-band answer to "why does
+ * the phone encode ~15 fps when it is allowed 30": its own rate control, a thermal
+ * clamp (iOS DBThermalMonitor level 1 == exactly 15), or the sender DROPPING frames
+ * because we drain too slowly (sinkOverflowDropFPS).
  *
- *   MIB3_SHIM_CTL5_DUMP=/dev/shm/cl_ctl5.bin   destination (this is now the DEFAULT)
- *   MIB3_SHIM_CTL5_DUMP=off                    disable
- *   MIB3_SHIM_CTL5_MAX=8388608                 hard size cap, then it stops
+ *   MIB3_SHIM_CTL5_DUMP=<path>   destination (default /dev/shm/cl_ctl5.bin)
+ *   MIB3_SHIM_CTL5_DUMP=off      disable
+ *   MIB3_SHIM_CTL5_MAX=8388608   hard size cap, then it stops
  * Record format: <u32 LE length><body>, so a reader can split them.
  * THE LABEL TRAP: never pre-create that file as root -- a root-created file is
  * common::bin and carplay::app cannot write it.  Let the shim create it.
  *
- * 2026-10-27: this knob used to be opt-in and, unset, it said NOTHING -- so a
- * session ran with MIB3_SHIM_CTL5_DUMP "set with a good readback", 1156 opcode-5
- * telemetry records arrived, and no file appeared, with no line anywhere saying
- * why (the getenv had not reached the target).  The file is the only in-band
- * source of the phone's own encoderCurrentFPS, which is now the leading open
- * question, so: default ON to /dev/shm (RAM only, capped), state the decision in
- * the RUN banner as CTL5=, and log the reason the first time a record arrives.
- * A knob that silently does nothing is worse than no knob.
- */
+ * Default ON, deliberately: as an opt-in knob it once said NOTHING while 1156
+ * records arrived and no file appeared (the getenv never reached the target).  The
+ * RUN banner prints CTL5=, and the reason is logged when a record lands. */
 static int ctl5_fd = -2;                 /* -2 undecided, -1 disabled */
 static int ctl5_want = -1;               /* -1 unknown, 0 off, 1 on */
 static const char *ctl5_path = "";       /* destination while enabled */
@@ -236,11 +224,9 @@ static void logline(const char *tag, const char *msg){
 }
 
 /* ---------------------------------------------------------------------------
- * INSTRUMENTATION (2026-10-15).
- *
- * A raw entry marker that depends on NOTHING -- not resolve(), not the /tmp log
- * path, not any env. If /dev/shm/mib3shim_hit never appears, the shim was never
- * entered at all, and the call never reached us.
+ * INSTRUMENTATION: an entry marker that depends on NOTHING -- not resolve(),
+ * not the /tmp log path, not any env.  If /dev/shm/mib3shim_hit never appears,
+ * the shim was never entered at all and the call never reached us.
  * ------------------------------------------------------------------------- */
 #define O_TRUNC 01000
 static void hit(const char *tag, unsigned long n)
@@ -262,16 +248,12 @@ static void logkv(const char *tag, const char *key, u64 v, int hex){
 static u64 mono_ms(void);
 
 /* ==========================================================================
- * BREADCRUMBS (2026-10-16) -- evidence that SURVIVES A RESET.
+ * BREADCRUMBS -- evidence that SURVIVES A RESET.
  *
- * The 2026-10-16 live sink attempt blacked the centre screen and the unit
- * reset; the reset wipes /tmp and /dev/shm, so /tmp/mib3shim.log and the old
- * /dev/shm/mib3shim_hit entry marker both died -- the failing step was
- * UNDIAGNOSABLE.  The only storage that survives is the USB stick.
- *
- * So: before every risky display-touching call (and between sub-steps) append a
- * one-line marker to a file on the STICK with an explicit write()+fsync().
- * After a reset, the stick holds the exact last step reached.
+ * A reset wipes /tmp and /dev/shm, so the /tmp log and the entry marker both die
+ * and the failing step becomes UNDIAGNOSABLE (2026-10-16: the sink attempt that
+ * reset the unit).  The only storage that survives is the USB stick, so every
+ * risky step is appended with an explicit write()+fsync().
  *
  * The file MUST be created BY THE SHIM: a root-created file carries the wrong
  * SMACK label and carplay's writes vanish silently (THE LABEL TRAP).
@@ -280,7 +262,7 @@ static u64 mono_ms(void);
  *   else auto: <stick>/PART1/mib3shim.bc where <stick> is the same /tmp/USB/
  *         PORT<n> scan the activation gate uses; fallback /dev/shm/mib3shim.bc
  *         (RAM: best-effort only -- it does NOT survive a reset).
- * -------------------------------------------------------------------------*/
+ * ========================================================================*/
 extern int  fsync(int fd);
 extern int  access(const char *path, int mode);
 static int  bc_fd = -2;                 /* -2 = untried, -1 = unavailable */
@@ -328,19 +310,15 @@ static void bc(const char *step){
 }
 
 /* ==========================================================================
- * OUT-OF-PROCESS DELIVERY (the SAFE sink) -- shim side (2026-10-16).
+ * OUT-OF-PROCESS DELIVERY -- the only sink left (shim side).
  *
  * Forward each decrypted access unit, length-prefixed (mib3helper.h), to a
- * SEPARATE helper process over an AF_UNIX socket.  carplay performs NO
- * display-touching call at all, so a helper fault cannot black the centre
- * screen or trip carplay.service's FailureAction=reboot-immediate.
- *
- * Best-effort: if the helper is absent the connect fails once and we drop
- * frames (counted).  A bounded send timeout stops a wedged helper from
- * blocking the receiver thread.
+ * SEPARATE process over an AF_UNIX socket.  carplay performs NO display-touching
+ * call at all, so a helper fault cannot black the centre screen or trip
+ * carplay.service's FailureAction=reboot-immediate.
  *
  *   MIB3_SHIM_HELPER=<path>   default /dev/shm/mib3cluster.sock
- * -------------------------------------------------------------------------*/
+ * ========================================================================*/
 extern int socket(int, int, int);
 extern int connect(int, const void*, unsigned int);
 extern int setsockopt(int, int, int, const void*, unsigned int);
@@ -356,34 +334,26 @@ static u64 env_num(const char *name, u64 dflt); /* defined after the CF section 
 #define SO_SNDBUF_  7
 static int hlp_fd = -1;
 static unsigned long hlp_seq = 0, hlp_sent = 0, hlp_drop = 0, hlp_conns = 0;
-/* the granted SO_SNDBUF of the live helper socket (0 = unknown).  This hop is
- * the ONE unmeasured link in the chain (see the 2026-10-26 note at the top of
- * helper_connect) and the send-side buffer is what decides whether a decoder
- * that pauses ~100 ms turns into a dropped AU. */
+/* the granted SO_SNDBUF of the live helper socket (0 = unknown).  The send-side
+ * buffer is what decides whether a decoder that pauses ~100 ms turns into a
+ * dropped AU, and it is the one hop with no other counter. */
 static int hlp_sndbuf = 0;
-/* BOUNDED EAGAIN RECOVERY (2026-10-19).  A helper whose peer is gone (one-way:
- * nobody reading) makes every send() return EAGAIN with MSG_DONTWAIT.  The old
- * "keep the socket on EAGAIN" rule then held it FOREVER: every AU dropped, the
- * cluster frozen on an old frame while the shim kept logging "receiving video".
- * Track consecutive EAGAIN failures and the wall-clock of the last successful
- * send; close (and therefore reconnect on the next AU) once either bound trips.
- * A slow-but-alive helper resets the counter on every success and never trips it,
- * so only a truly wedged/one-way peer is torn down. */
+/* BOUNDED EAGAIN RECOVERY -- one rule, two bounds (2026-10-19, retimed 2026-10-28).
+ * A helper whose peer is gone (nobody reading) makes every send() return EAGAIN
+ * with MSG_DONTWAIT, and keeping the socket on EAGAIN held it FOREVER: every AU
+ * dropped, the cluster frozen on an old frame while the log said "receiving
+ * video".  So track consecutive EAGAINs and the clock of the last good send, and
+ * close (the next AU reconnects) when either bound trips.  A slow-but-alive
+ * helper resets the counter on every success and never trips it.
+ * The bounds are in MILLISECONDS, not attempts: with a bounded wait per failed
+ * record a dead consumer burns a full wait per attempt, so an attempt-count
+ * bound multiplied the wait into ~2-2.5 s of the cluster receiver thread.  Now
+ * MIB3_SHIM_HLP_WAIT default 60 ms plus MIB3_SHIM_HLP_STALL_MS default 600 ms --
+ * about one second.  A healthy sender holds <=8 queued AUs and drains at
+ * >=1 AU/10 ms, so the shorter wait changes only the failure SHAPE: the post-fix
+ * sessions measured zero EAGAINs and zero drops. */
 static int  hlp_eagain = 0;          /* consecutive EAGAINs since the last success */
 static u64  hlp_last_ok_ms = 0;      /* mono_ms() of the last fully-sent record */
-/* A5 (2026-10-28, P1): the dead-consumer bound in real time units.
- * The old bound was `hlp_eagain >= 32 || wall-clock (time(0)) > 2 s`.  With a
- * bounded WAIT per failed record (HLP_WAIT ms), a dead consumer burns one full
- * wait per attempt, so the record-serialised stall was ~max(32 * wait, 2 s) --
- * 2-2.5 s of the CLUSTER RECEIVER THREAD at the 250 ms default, and time(0)'s
- * 1 s granularity makes any sub-second cap meaningless anyway.
- * Now: MIB3_SHIM_HLP_WAIT default 60 ms (A5), and a millisecond stall cap
- * MIB3_SHIM_HLP_STALL_MS default 600 ms -- a dead consumer stalls the
- * receiver thread for roughly one second, not two and a half.  Mlib3 evidence
- * for the tighter wait: a healthy sender holds <=8 queued AUs and drains at
- * >=1 AU/10 ms, so its worst-case queue-clearing is well under 100 ms; and the
- * post-fix sessions measured ZERO EAGAINs with zero drops, so the shorter wait
- * changes only the failure shape, never the lossless behaviour. */
 static long hlp_wait_ms(void){       /* the shared per-record WAIT budget */
   static long cached = -1;
   if (cached < 0){ cached = (long)env_num("MIB3_SHIM_HLP_WAIT", 60); if (cached < 0) cached = 0; }
@@ -403,13 +373,11 @@ static const char *helper_path(void){
   char *v = getenv("MIB3_SHIM_HELPER"); return (v && v[0]) ? v : MIB3_HELP_SOCK_DEFAULT;
 }
 /* LAZY REATTACH IS A DEFECT ON A STATIC MAP (P0, REVIEW_PATHB_2026-10-28).
- * helper_connect() is attempted only from helper_feed(), i.e. only when an AU
- * is ready, so when the sender restarts while the phone's map is static -- the
- * phone sends NOTHING for 600-840 ms at a time and can idle for minutes --
- * nothing calls connect() and the cluster stays dark until the map moves.
- * The fix lives on the clock tick that already exists: cluster_wait_frame's
- * poll wakes every 100 ms with or without AUs, and the 1/s connect gate below
- * makes the attempt cheap.  Same gate semantics as helper_feed's. */
+ * helper_connect() used to run only from helper_feed(), so when the sender
+ * restarted while the map was static -- the phone sends NOTHING for 600-840 ms at
+ * a time, and can idle for minutes -- nothing called connect() and the cluster
+ * stayed dark until the picture moved.  The attempt now rides the 100 ms clock
+ * tick that already exists (cluster_wait_frame's poll), gated to 1/s. */
 static int helper_connect(void);          /* forward: the pump hands the attempt to it */
 static void helper_reattach_pump(void)
 {
@@ -439,32 +407,17 @@ static int helper_connect(void){
     setsockopt(fd, SOL_SOCKET_, SO_SNDTIMEO_, &tv, sizeof(tv)); }
   /* *** SIZE THE HELPER SOCKET FOR REAL AUs (2026-10-26) ***
    *
-   * The 2026-10-25 session ended with the picture artifacted and NO counter
-   * anywhere explaining it: the decoder read qdrop=0 kdrop=0 awt=6, and the
-   * RGBA send read drop=0 -- because every one of those counters measures a
-   * DIFFERENT hop.  THIS hop (shim -> decoder, the AF_UNIX socket below) is the
-   * one nobody measures: helper_feed drops a record on EVERY EAGAIN (the
-   * MSG_DONTWAIT send returning "buffer full"), and hlp_drop was only ever
-   * readable through the probe export -- the log said nothing.
+   * A DEFAULT AF_UNIX send buffer on this image is 208 KB -- two of the measured
+   * 142 KB guidance AUs (amax=141999, 2026-10-24) -- so a decoder that
+   * legitimately pauses reading for ~100 ms makes every send return EAGAIN and
+   * the AU is DROPPED, silently, on the one hop with no other counter.  On a
+   * stream with ~1 keyframe per 88 s a dropped AU is unrecoverable: exactly
+   * "blocky flat areas, wrong tints, text stays sharp".
    *
-   * Why EAGAIN happens here at all: the decoder's loop can legitimately pause
-   * reading for ~100 ms (the bounded short-write retry in send_rgba, an output
-   * buffer hold, the first-connection renegotiate).  A DEFAULT AF_UNIX send
-   * buffer is 208 KB on this image -- TWO of the measured 142 KB guidance
-   * AUs (amax=141999, 2026-10-24) -- so a ~200 ms decoder pause makes every
-   * send return EAGAIN and the AU is DROPPED, silently, on the one hop with no
-   * counter.  A dropped AU is unrecoverable damage on a stream with ~1 keyframe
-   * per 88 s: exactly "blocky flat areas, wrong tints, text stays sharp"
-   * (the fresh intra content decodes, the predicted content conceals).
-   *
-   * So: (a) ask for a send buffer that holds several seconds of big AUs
-   * (default 4 MB, ~28 max-size AUs, ~2 s at 15 fps), and READ IT BACK -- the
-   * kernel clamps SO_SNDBUF to 2*net.core.wmem_max, so on a unit where
-   * bring_up.sh has not run (wmem_max 208 KB) the request silently clamps and
-   * the log must SAY so instead of letting the failure hide in a counter
-   * nobody reads; (b) count every drop in the log too (helper_feed).
-   * This changes NO drop policy, NO timeout, NO thread: sends stay
-   * non-blocking, the receiver thread can never stall on this socket. */
+   * So: ask for 4 MB (~28 max-size AUs), READ IT BACK, and say so when the kernel
+   * clamped it -- SO_SNDBUF is clamped to 2*net.core.wmem_max, which bring_up.sh
+   * raises, so an unraised unit silently caps at 208 KB.  Sends stay
+   * non-blocking: no drop policy, timeout or thread changes here. */
   { long want = (long)env_num("MIB3_SHIM_HLP_SNDBUF", (u64)(4u<<20));
     if (want > 0){
       int sb = (int)(want > (64u<<20) ? (64u<<20) : want);
@@ -483,33 +436,26 @@ static int helper_connect(void){
   return 0;
 }
 /* MSG_NOSIGNAL: a write to a socket whose peer is gone raises SIGPIPE as well as
- * returning EPIPE, and SIGPIPE's default action is to KILL THE PROCESS.  This shim
- * runs INSIDE carplay, whose failure action on this unit is reboot-immediate -- so
- * a helper (decoder) dying while we are mid-write must not be able to take the
- * process, and the car, down with it.  This became a routine path on 2026-10-18:
- * the lifecycle controller stops our decoder at the end of every session
- * (lanes/closeouts: LANE_CLUSTER_TRANSITION_2026-10-18.md S9).  send(MSG_NOSIGNAL)
- * keeps the fix local to these two writes; it does not touch the process's
- * signal disposition, so nothing else in carplay changes. */
+ * returning EPIPE, and SIGPIPE's default action is to KILL THE PROCESS.  This
+ * shim runs INSIDE carplay, whose failure action on this unit is
+ * reboot-immediate, and a helper dying mid-write is routine -- the controller
+ * stops our decoder at the end of every session.  Local to these two writes: the
+ * process's signal disposition is untouched, so nothing else in carplay changes. */
 #define MIB3_MSG_NOSIGNAL 0x4000
-/* Non-blocking send.  Without this, a helper that stops reading (a wedged
- * decoder, measured 2026-10-19 with nfree=0) makes send() BLOCK inside
- * carplay's cluster receiver thread -- and the whole CarPlay session stutters
- * on the main screen.  A dropped AU is recoverable; a stalled receiver thread
- * is not. */
+/* Non-blocking send: a helper that stops reading (a wedged decoder, measured
+ * 2026-10-19 with nfree=0) would otherwise make send() BLOCK inside carplay's
+ * cluster receiver thread and stutter the whole session on the main screen.
+ * A dropped AU is recoverable; a stalled receiver thread is not. */
 #define MIB3_MSG_DONTWAIT 0x40
 
 /* (time() and env_num() are declared at the top of the sink block.) */
 
-/* *** EVERY DROP ON THIS HOP IS NOW IN THE LOG (2026-10-26) ***
- * hlp_drop used to be readable only through the probe export; the log said
- * nothing while AUs were being dropped -- and a dropped AU is unrecoverable
- * damage on a ~1-keyframe-per-88 s stream (the 2026-10-25 artifact session
- * ended with no counter anywhere explaining the picture).  One line, rate
- * limited to 1/s (the same idiom as the connect gate), with the running
- * totals so the shim's log and the decoder's qdrop/kdrop/awt can be diffed
- * per window: the GAP between them is the number of phone frames that were
- * lost between the two processes. */
+/* EVERY DROP ON THIS HOP IS IN THE LOG (2026-10-26): one line, rate-limited to
+ * 1/s, with the running totals, so the shim's log and the decoder's
+ * qdrop/kdrop/awt can be diffed per window -- the GAP between them is the number
+ * of phone frames lost between the two processes.  hlp_drop used to be readable
+ * only through the probe export, which is how a whole session could artifact
+ * with no counter anywhere explaining it. */
 static void hlp_drop_log(const char *why){
   static long last_log = 0;
   long now = time(0);
@@ -523,39 +469,30 @@ static void hlp_drop_log(const char *why){
 
 /* LOSSY-BY-DESIGN IS WRONG ON THIS HOP (2026-10-27, measured).
  *
- * helper_feed() used to send with MSG_DONTWAIT and, on EAGAIN, simply DROP the
- * record ("hdr send EAGAIN (decoder not reading / sndbuf full)").  That is the
- * right policy for a live decoder that must never stall carplay -- and it is
- * catastrophic for the Path B re-muxer, because the phone's H.264 stream has ONE
- * keyframe per 78 s (measured: 2 in 2077 AUs).  A single dropped AU breaks the
- * predictive chain until the phone happens to send another IDR, i.e. for the rest
- * of the session.
+ * helper_feed() used to send with MSG_DONTWAIT and, on EAGAIN, DROP the record.
+ * That is right for a live decoder that must never stall carplay, and wrong
+ * here: the phone's H.264 has ONE keyframe per 78 s (measured, 2 in 2077 AUs),
+ * so a single dropped AU breaks the predictive chain for the rest of the
+ * session.  Field run: `helper dropped total=3691` of `36659` sent -- 9 % of the
+ * picture thrown away on the one hop with no recovery -- while every synthetic
+ * test (file -> sender, no socket) held the picture at 10, 30 and 60 fps, with
+ * one keyframe, with gaps, with the phone's exact High/full-range SPS.
  *
- * Measured in the 2026-10-27 field run: `helper dropped total=3691` against
- * `helper sent total=36659` -- 9 % of the picture was being thrown away on the
- * ONE hop in the chain that has no recovery.  Every synthetic test (file -> sender,
- * no socket) held the picture for the full duration at 10, 30 and 60 fps, with one
- * keyframe, with gaps, with the phone's exact High/full-range SPS -- because none
- * of them goes through this function.  The wire was never the problem.
- *
- * So: WAIT (bounded) for the consumer instead of discarding.  The wait is capped
- * by MIB3_SHIM_HLP_WAIT ms (default 250) so a dead consumer still cannot hold the
- * receiver thread forever -- and if the wait is exhausted the AU is dropped and
- * logged as before.  With that cap the record stays all-or-nothing: a partial
- * body still closes the socket, exactly as before. */
+ * So: WAIT, bounded, for the consumer instead of discarding.  The wait is capped
+ * by MIB3_SHIM_HLP_WAIT ms so a dead consumer still cannot hold the receiver
+ * thread forever; an exhausted wait drops and logs, as before.  The record stays
+ * all-or-nothing: a partial body still closes the socket. */
 static long send_all(int fd, const void *p, unsigned long n, int wait_ms)
 {
   const unsigned char *b = (const unsigned char *)p;
   unsigned long off = 0;
   u64 deadline = mono_ms() + (u64)(wait_ms > 0 ? wait_ms : 0);
   int spins = 0;
-  /* ITERATION BOUND (2026-10-29, the belt behind the mono_ms fix): the wall
-   * clock is the primary bound, but if a process ever runs with NO clock at
-   * all (mono_ms()==0 forever -- the exact trap that hung the audit bench's
-   * hostile-peer run before mono_ms learned to resolve itself), the deadline
-   * could never expire.  Cap the EAGAIN wait at 100 poll iterations x 20 ms
-   * = 2 s hard, independent of the clock.  The receiver thread must never be
-   * able to spin forever on this hop, whatever the environment. */
+  /* ITERATION BOUND: the wall clock is the primary bound, but a process with NO
+   * clock at all (mono_ms()==0 forever -- the trap that hung the audit bench's
+   * hostile-peer run) would never expire the deadline.  Cap the EAGAIN wait at
+   * 100 iterations x 20 ms = 2 s hard, independent of the clock, so the receiver
+   * thread can never spin forever on this hop. */
   while (off < n){
     long r = send(fd, b + off, n - off, MIB3_MSG_NOSIGNAL|MIB3_MSG_DONTWAIT);
     if (r > 0){ off += (unsigned long)r; continue; }
@@ -694,28 +631,19 @@ typedef long (*fn_cx_ver)(void*, const void*, const void*, int*);   /* ctx,tag_c
 typedef int  (*fn_ctr_init)(void*, const void*, const void*);     /* AES_CTR_Init(ctx,key,iv) */
 typedef int  (*fn_ctr_upd)(void*, const void*, long, void*);      /* AES_CTR_Update(ctx,src,len,dst) */
 /* ---------------------------------------------------------------------------
- * REMOVED 2026-10-29 (redteam refactor, Path B only): the DECODE BRIDGE
- * (the shim's own second Cinemo pipeline), the ROUTE-B EGL/Wayland SURFACE
- * module, the in-process SINK modes (dry/local), and the
- * ScreenStreamProcessData / CarPlayAppFrameworkSetSurface interposers.
+ * REMOVED 2026-10-29 (Path B only): the DECODE BRIDGE (a second Cinemo pipeline
+ * inside carplay), the ROUTE-B EGL/Wayland SURFACE module, the in-process SINK
+ * modes (dry/local), and the ScreenStreamProcessData /
+ * CarPlayAppFrameworkSetSurface interposers.
  *
- * WHY THIS IS SAFE (each is a Path A-era mechanism, dead in the shipping
- * Path B configuration):
- *   - Path B delivers the phone's H.264 UNDECODED: shim -> AU socket ->
- *     mib3clusterstream -> RTP/TS -> ECU.  No surface, no GL, no Cinemo, no
- *     OMX ever runs inside carplay on this path (MIB3_SHIM_SINK=helper|off
- *     are the only modes left, and `helper` touches a UNIX socket only).
- *   - The in-process display paths were the 2026-10-16 black-screen/reset
- *     hazard and have been ACK-gated off in every shipped generation since;
- *     nothing field-proven ever used them again.
- *   - ScreenStreamProcessData / SetSurface: the inject route (ptrace+dlopen+
- *     GOT-patch) installs exactly THREE seams (see inject/inject_shim.py
- *     SEAMS), and neither of these is among them -- in the shipping route
- *     they were never entered.  The SSPD stream registry was likewise never
- *     populated in production (the cluster thread is self-contained), so the
- *     interposer only ever forwarded.  Deleting them is behaviour-identical
- *     to stock in every deployment route.
- * The sources live on in git history and in artifacts/PATH_A_WORKING_20261026.
+ * Each was a Path A-era mechanism, dead on the shipping path: Path B delivers
+ * the phone's H.264 UNDECODED (shim -> AU socket -> mib3clusterstream ->
+ * RTP/TS -> ECU), so no surface, GL, Cinemo or OMX ever runs inside carplay and
+ * MIB3_SHIM_SINK=helper|off are the only modes left; the in-process display
+ * paths were the 2026-10-16 black-screen/reset hazard; and neither
+ * ScreenStreamProcessData nor SetSurface is one of the THREE seams the inject
+ * route patches, so on this route they were never entered.  Behaviour-identical
+ * to stock.  Sources: git history + artifacts/PATH_A_WORKING_20261026.
  * ------------------------------------------------------------------------- */
 
 /* NB: the 7 numeric args are 32-bit (undefined4 in the plugin) -- match the ABI. */
@@ -789,18 +717,14 @@ static fn_CopyServerInfo   real_CopyServerInfo;
 static fn_SendCommand      p_SendCommand;    /* the stock command shipper (showUI/forceKeyFrame/setNightMode) */
 
 /* ==========================================================================
- * RUNTIME GATE (the physical cure) -- see LANE_PERSISTENCE_INSTALL_2026-10-14.md
+ * RUNTIME GATE -- the physical cure.
  *
- * The shim is now loaded on EVERY boot (it lives on /data, which the kernel
- * mounts before systemd), so the *load* is not the enable signal any more.
- * The enable signal is a marker on the USB stick, checked HERE at runtime:
+ * The shim is loaded on every boot, so the LOAD is not the enable signal.  The
+ * signal is a marker on the USB stick, checked HERE at runtime rather than at
+ * boot because `sdcm` mounts the stick at multi-user.target, unordered relative
+ * to carplay.service, so a boot-time check loses the race:
  *
  *     <stick>/mib3shim.enable      (/tmp/USB/PORTn/PART1/mib3shim.enable)
- *
- * Why runtime and not boot: `sdcm` mounts the stick at multi-user.target,
- * UNORDERED relative to carplay.service, so a boot-time check loses the race
- * (FINDING_STICK_GATE_RACE_2026-10-10.md).  Session setup happens seconds-to-
- * minutes after boot, by which time the stick (if present) is mounted.
  *
  *   marker present  -> the cluster is activated (advertise + handle type-111).
  *   marker absent   -> behave exactly stock (forward everything).
@@ -820,72 +744,46 @@ static fn_access   p_access;
 static int resolved = 0;
 static volatile int saw_main_display = 0;
 
-/* FIX (2026-10-15): the altScreen ENABLEMENT must be consistent with the altScreen
- * ADVERTISEMENT.  iOS enforces this: if the control-SETUP response claims
- * enabledFeatures ∋ "altScreen" it requires >=2 entries in the /info displays
- * array, and if the flag is absent it requires <=1 (see the reference receiver
- * luka-dev/mib2q-carplay-rgi: "_carEndpoint_setupStreams" count test).  Telling
- * iOS "I have an alt screen" while advertising ONE display makes iOS refuse the
- * session -- the observed "session does not come up".
- *
- * So the cluster is a single, process-wide decision: the display is advertised by
- * the AddScreenDisplay seam (gated MIB3_SHIM_ADD) and that sets this flag; the
- * SETUP seam injects "altScreen" ONLY when this flag is set.  No flag -> no
- * cluster -> no altScreen claim -> the response is byte-identical to stock. */
+/* the altScreen ENABLEMENT must be consistent with the altScreen ADVERTISEMENT.
+ * iOS enforces it: enabledFeatures containing "altScreen" requires >=2 entries in
+ * the /info displays array, and its absence requires <=1 (rgi's
+ * _carEndpoint_setupStreams count test).  Claiming an alt screen while advertising
+ * ONE display makes iOS refuse the session -- the observed "session does not come
+ * up".  So the cluster is one process-wide decision: the display seam sets this
+ * flag, and the SETUP seam claims altScreen only when the flag is set.  No flag ->
+ * no cluster -> no claim -> the response is byte-identical to stock. */
 static volatile int g_cluster_advertised = 0;
 static volatile int g_info_completed = 0;   /* set when the /info seam completed a cluster advert */
 
 /* ---- the 2026-10-16 redteam findings this build carries -------------------
- * 1) THE WALL IS OUR OWN KERNEL FIREWALL, not the phone. The unit's `network`
- *    daemon applies iptables/ip6tables-restore from an embedded template with
- *    base policy INPUT=DROP and a per-interface allowlist (recovered by strings
- *    from lge/app_ro/network/network, section literally commented
+ * 1) THE WALL IS OUR OWN KERNEL FIREWALL.  The unit's `network` daemon applies an
+ *    iptables/ip6tables template with base policy INPUT=DROP and a per-interface
+ *    allowlist (strings of lge/app_ro/network/network, section commented
  *    "## carplay for ncm0 (usb interface)"):
  *        -A GENERIC_PORT_IN_FILTER -i ncm0 -p tcp --dport 5000:5001 -j ACCEPT
  *        -A GENERIC_PORT_IN_FILTER -i ncm0 -p tcp --dport 6030    -j ACCEPT
  *        -A GENERIC_PORT_IN_FILTER -i ncm0 -p tcp --dport 7000    -j ACCEPT
  *    (plus UDP 5001/5020/5353/6000/6003/6011; the same set for wlap/wlap2/wlap5;
- *    both IPv4 and IPv6 tables; 80/443/49200:49499 are all-interface globals).
- *    NO rule allows 6031 or any ephemeral port on the phone-facing interface,
- *    so the phone's SYN to our advertised dataPort was silently DROPPED --
- *    which is exactly the observed live behaviour: the phone offers 111, we
- *    answer {type:111,dataPort}, and the phone never connects (its SYN never
- *    reaches our listener; no RST is ever sent either, so the phone just
- *    times out and the session stays up).  The phone's complete observed
- *    socket set to the car {7000, 5001, 6030} is EXACTLY the ncm0 TCP
- *    allowlist -- and the one historical case where the phone DID connect to
- *    an advertised 111 port was the 6030-collision era (6030 IS allowlisted).
- *    CONSEQUENCE: "port number" was never actually tested -- every port the
- *    knobs offered (6031, ephemeral) is equally firewall-dropped, which made
- *    the port ablation look like "no effect".  Fix = bind 5000 (inside the
- *    5000:5001 allowlist; observed free while a phone is plugged: the stock
- *    event listener is 5001 and nothing else listens on 5000) with 6031 and
- *    ephemeral as fallbacks, and live_kit/cluster_port_fw.sh to insert the
- *    RAM-only iptables/ip6tables rule when the fallbacks are used.
- * 2) enabledFeatures is scoped to the CONTROL SETUP (the request carries the
- *    "features" proposal key; media/stream SETUPs carry "streams" only), and
- *    we claim ONLY altScreen+viewAreas -- the rgi reference's proven set.
- *    iAPChannel is opt-in (MIB3_SHIM_EF_IAPCHANNEL=1): each string in the
- *    array flips a phone-side endpoint flag, so claim nothing the stock unit
- *    does not implement.
- * 3) Part B fixes vs the stock wire format (corpus ProcessFrames 0x11fbf0):
- *    chacha20 body length is bodySize-16 (last 16 bytes are the Poly1305 tag)
- *    and MUST be followed by chacha20_poly1305_verify(ctx, dst+n, src+bs-16,
- *    &ok) with n+m == bs-16; AES-CTR is a PERSISTENT keystream (AES_CTR_Init
- *    once at SetSecurityInfo; Update per frame -- re-init per frame garbles
- *    every frame after the first); the chacha nonce is the 8-byte LE counter
+ *    both IPv4 and IPv6; 80/443/49200:49499 are all-interface globals).  NOTHING
+ *    allows 6031 or any ephemeral port on the phone-facing interface, so the
+ *    phone's SYN to our advertised dataPort was silently DROPPED -- no RST, so it
+ *    just times out and the session stays up.  The phone's observed socket set
+ *    {7000, 5001, 6030} is EXACTLY that allowlist.
+ * 2) enabledFeatures is scoped to the CONTROL SETUP and claims ONLY
+ *    altScreen+viewAreas (the rgi reference's proven set).
+ * 3) Part B wire format vs the corpus (ProcessFrames 0x11fbf0): chacha20 body
+ *    length is bodySize-16 (the last 16 bytes are the Poly1305 tag, NOT
+ *    ciphertext) and MUST be followed by chacha20_poly1305_verify(ctx, dst+n,
+ *    src+bs-16, &ok) with n+m == bs-16; AES-CTR is a PERSISTENT keystream (Init
+ *    once at SetSecurityInfo, Update per frame -- re-init per frame garbles every
+ *    frame after the first); the chacha nonce is the 8-byte LE counter
  *    (init_64x64 reads 8 bytes, not 12); AVCC must be rewritten to Annex-B
- *    (4-byte length -> 00 00 00 01) and the config parsed for SPS/PPS.
- * 4) The old receiver read bodies into a static 64 KiB buffer while
- *    bounds-checking only 8 MiB -- any IDR > 64 KiB overran static memory
- *    (a crash-the-unit bug waiting for the first successful connect).
- *    Bodies now go to a heap buffer that grows to the frame size.
- * 5) Once the phone connects it sends opcode-1 (avcC) + opcode-5 telemetry
- *    but NO video until the CAR drives the scene: forceKeyFrame{params:{uuid}}
- *    at stream start, then showUI{params:{uuid,url}} (+ setNightMode) -- the
- *    rgi/LIVI command set, shipped via the stock AirPlayReceiverSessionSendCommand
- *    (dispatch_sync onto the session's own control queue; caller CFReleases the
- *    cmd dict after it returns -- stock ForceKeyFrame pattern, corpus 0x1e31c).
+ *    (4-byte length -> 00 00 00 01) and parsed for SPS/PPS.
+ * 4) Bodies go to a HEAP buffer that grows to the frame size: the old receiver
+ *    read into a static 64 KiB buffer while bounds-checking 8 MiB, so any IDR over
+ *    64 KiB overran static memory.
+ * 5) Once connected the phone sends opcode-1 (avcC) + opcode-5 telemetry but NO
+ *    video until the CAR drives the scene (see the COMMANDS block below).
  * ------------------------------------------------------------------------ */
 
 /* the cluster uuid we advertised (same string goes into /info and into the
@@ -893,57 +791,43 @@ static volatile int g_info_completed = 0;   /* set when the /info seam completed
 static char g_cluster_uuid_str[64];
 static volatile long g_night_mode = 0;     /* the advertised nightMode (for setNightMode) */
 /* NIGHT MODE IS FOLLOW, NEVER ENFORCE (2026-10-28, owner direction).
- * The phone decides day/night, and the same mode must apply to BOTH display
- * entries -- main and cluster -- as it changes.  No code below may invent a
- * mode of its own.  Source ladder:
- *   1. the car's own published nightMode (what /info arrives with) -- the
- *      value is FILLED, never overwritten;
- *   2. MIB3_SHIM_NIGHT is a DEBUG force only (it is the only way any
- *      setNightMode is ever shipped).
- * There is no phone-side mode signal: the opcode-1 flags byte flips thousands
- * of times per session and was refuted as a mode bit (2026-10-29 storm). */
+ * The phone decides day/night and the same mode must apply to BOTH entries --
+ * main and cluster -- as it changes; nothing below may invent a mode of its own.
+ * The value is FILLED from the car's own published nightMode (what /info arrives
+ * with), never overwritten, and MIB3_SHIM_NIGHT is a DEBUG force -- the only way
+ * any setNightMode is ever shipped.  There is NO phone-side mode signal: the
+ * opcode-1 flags byte flips thousands of times per session and was refuted as a
+ * mode bit (2026-10-29 storm). */
 static volatile long g_night_applied = -2;  /* the mode last sent to the phone */
 /* session that owns the live cluster stream (command target for showUI etc.) */
 static void *volatile g_cmd_session = 0;
-/* COMMAND GENERATION (2026-10-19, view-area lane).  Bumped every time the
- * command target changes (cluster_setup for a new type-111 SETUP, and the
- * harness entry point).  A completion callback compares the generation it was
- * issued under with this value and DROPS (does not apply/log as current) a reply
- * that belongs to a superseded session.  Same idea as cl_thread_gen and
- * g_lsock_gen -- deliberately a THIRD, independent token, because it guards a
- * third thing (the RTSP command channel), and the three can disagree. */
+/* COMMAND GENERATION (2026-10-19).  Bumped whenever the command target changes
+ * (cluster_setup for a new type-111 SETUP, and the harness entry point).  A
+ * completion callback compares the generation it was issued under with this
+ * value and DROPS a reply that belongs to a superseded session.  Deliberately a
+ * THIRD, independent token -- same idea as cl_thread_gen and g_lsock_gen, because
+ * it guards a third thing, the RTSP command channel, and the three can disagree. */
 static volatile unsigned g_cmd_gen = 0;
 /* The view-area index we believe the PHONE has applied, and the index we last
  * REQUESTED.  g_va_current moves only on a status-0 completion (never on send),
  * so a refused switch cannot strand the display in a state we think we are in. */
 static volatile int g_va_current = 0;
 
-/* THE CLUSTER SCENE URL: what the phone renders on the cluster.  The bare
- * scene ("map") is the field-proven default (the 2026-10-27 session rendered
- * Apple Maps on the cluster with it, during guidance).
+/* THE CLUSTER SCENE URL: what the phone renders on the cluster.  The bare scene is
+ * the field-proven default; MIB3_SHIM_URL overrides the whole string, and the one
+ * value goes into /info initialURL AND every showUI.
  *
- * THE REFERENCE'S PARAMETERISED FORMS (omonob/MHI2-Carplay-Maps,
- * navigation_card_scene.h -- added 2026-10-29 as the documented EXPERIMENT for
- * the "white until guidance starts" + "map off-centre" symptoms; NOT flipped
- * by default, it is field-untested on this car):
+ * Parameterised forms from omonob/MHI2-Carplay-Maps (navigation_card_scene.h):
  *   pure map, no card:
  *     maps:/car/instrumentcluster/map?showETA=no&maneuverLayout=no&showSpeedLimit=no
  *   card layouts (maneuver card visible):
  *     maps:/car/instrumentcluster?showETA=no&maneuverLayout=leftAligned|rightAligned|topAligned&showSpeedLimit=no
- * maneuverLayout=no tells the phone to compose the PURE MAP (no maneuver
- * panel); on the reference that is what makes a map render while navigation is
- * NOT running, and the layout choice re-centres the map (see the calibration
- * note at va_preset_rect).  Try it with:
- *   MIB3_SHIM_URL='maps:/car/instrumentcluster/map?showETA=no&maneuverLayout=no&showSpeedLimit=no'
- * (one knob: the same string goes into /info initialURL and every showUI). */
-/* SCENE URL (2026-10-30).  Decompiled ground truth (rgi, docs/cluster-and-rgi/
- * THIRD_PARTY_NAV_APPS.md): the query is parsed by DBInstrumentClusterURLHandler
- * into CRSUIInstrumentClusterSceneSettings; `.../map` = itemType 1 (map only),
- * showETA/showSpeedLimit/ showCompass = yes|no, and maneuverLayout accepts only
- * top/left/rightAligned -- anything else (including "no") = justification 0.
- * The MIB2Q hook ships map-only + no layout + no ETA + no speed limit; that is
- * what keeps the cluster a plain, vehicle-centred map instead of a card layout.
- * MIB3_SHIM_URL still overrides the whole thing. */
+ * Decompiled ground truth (rgi, docs/cluster-and-rgi/THIRD_PARTY_NAV_APPS.md):
+ * DBInstrumentClusterURLHandler parses the query into
+ * CRSUIInstrumentClusterSceneSettings -- `.../map` = itemType 1 (map only),
+ * showETA/showSpeedLimit/showCompass = yes|no, and maneuverLayout accepts only
+ * top|left|rightAligned, so anything else (including "no") is justification 0.
+ * The layout parameter decides where the map sits: see va_preset_rect. */
 #define CLUSTER_URL_DEFAULT "maps:/car/instrumentcluster/map"   /* proven form; the MHI2 parameterised URL (showETA=/maneuverLayout=/showSpeedLimit=) is an UNTESTED experiment reachable via MIB3_SHIM_URL */
 static char g_cluster_url[160];            /* showUI url (== the advertised initialURL) */
 
@@ -1148,47 +1032,41 @@ static s64 dgeti64k(CFDictionaryRef d, const char *key, s64 dflt){
 
 /* ==========================================================================
  * CLUSTER GEOMETRY -- ONE resolver for the cluster's pixel size, its advertised
- * PHYSICAL size (mm), and the relation between them (2026-10-20, the 2x lane).
+ * PHYSICAL size (mm), and the relation between them.
  *
- * WHY THIS EXISTS.  Before it, the display seam and the view-area preset each
- * read MIB3_SHIM_W/H on their own, and `va_preset_rect()` carried a hand-tuned
- * special case for exactly 1280x480 whose "other panel" branch **never set
- * originYPixels at all** -- the field inherited the previous area's value
- * (measured on the desk inside the unit's own CFLite: sy=200 at 2560x960,
- * sy=150 at 1920x720, because area 0 wrote those into the same stack slot).
- * The result at 2x was a safe area ending 95 px BELOW the frame:
+ * The display seam and the view-area preset used to read MIB3_SHIM_W/H separately,
+ * and the hand-tuned branch for exactly 1280x480 never set originYPixels for any
+ * other panel -- it inherited the previous area's value from the same stack slot --
+ * so the safe area ended BELOW the frame:
  *
  *     2560x960:  area1 safe = 883,200,793,855   -> 200+855 = 1055 > 960
  *     1920x720:  area1 safe = 662,150,595,615   -> 150+615 =  765 > 720
  *     1280x480:  area1 safe = 439, 50,397,375   ->  50+375 =  425 <= 480  (ok)
  *
- * An advert like that is invalid -- CarKit validates view areas (rgi's own RE
- * names `CRDisplayScaleInfo.minAcceptableViewAreaSize*` /
- * `isViewAreaPixelSizeAcceptable`, and `_CRSizeFromAirPlayDictionary` checks
- * "area within limit") -- and because ONE unparseable `displays` entry costs the
- * WHOLE array, the phone tears the session down: exactly the field symptom
- * (centre screen black, connect/disconnect storm, the 111 port never dialled).
- * The log did not show it because `va_log_rect()` clamped negatives to 0 and 200
- * looks like a plausible top margin.
+ * An INVALID advert: CarKit validates view areas (rgi's RE names
+ * CRDisplayScaleInfo.minAcceptableViewAreaSize* / isViewAreaPixelSizeAcceptable,
+ * and _CRSizeFromAirPlayDictionary checks "area within limit"), and one
+ * unparseable `displays` entry costs the WHOLE array -- session torn down, centre
+ * screen black, connect/disconnect storm.  The log hid it because va_log_rect()
+ * clamped negatives to 0.
  *
  * KNOBS (every default reproduces the shipped behaviour byte for byte):
  *   MIB3_SHIM_W / MIB3_SHIM_H   cluster pixel size (default 1280x480)
- *   MIB3_SHIM_SCALE=<pct>       multiply the pixel size (100 = off, default).
- *                               Rounded UP to a multiple of 8 both ways so the
- *                               encoder and the decoder never see a ragged size.
- *                               100 / 150 / 200 -> 1280x480 / 1920x720 / 2560x960.
- *   MIB3_SHIM_CWPHY / CHPHY     advertised physical size in mm (292x110).  When
- *                               CHPHY is not set it is DERIVED from CWPHY and the
- *                               pixel aspect (round(CWPHY*h/w) = 110 at 1x, i.e.
- *                               unchanged), so the advertised mm can never
- *                               contradict the advertised pixels.
- *   MIB3_SHIM_SCALE_PHY=1       scale the physical size WITH the pixels so the
- *                               advertised DENSITY (px per mm) does not change:
- *                               2x then reads as a 584x219 mm panel at the same
- *                               111 dpi.  This is the RATIO/density hypothesis's
- *                               test knob; default 0 keeps the real panel size
- *                               and lets the density rise (2x = 222 dpi), which
- *                               is what a genuinely supersampled stream is.
+ *   MIB3_SHIM_SCALE=<pct>       multiply the pixel size (100 = off, default),
+ *                               rounded UP to a multiple of 8 so neither encoder
+ *                               nor decoder sees a ragged size:
+ *                               100/150/200 -> 1280x480 / 1920x720 / 2560x960
+ *   MIB3_SHIM_CWPHY / CHPHY     advertised physical mm (292x110).  With CHPHY
+ *                               unset it is DERIVED from CWPHY and the pixel
+ *                               aspect (round(CWPHY*h/w) = 110 at 1x), so the
+ *                               advertised mm can never contradict the pixels.
+ *   MIB3_SHIM_SCALE_PHY=1       scale the physical size WITH the pixels, so the
+ *                               advertised DENSITY (px per mm) is unchanged: 2x
+ *                               reads as a 584x219 mm panel at the same 111 dpi.
+ *                               This is the density hypothesis's test knob;
+ *                               default 0 keeps the real panel size and lets the
+ *                               density rise (2x = 222 dpi), which is what a
+ *                               genuinely supersampled stream is.
  * ========================================================================*/
 typedef struct { int w, h; int phy_w, phy_h; } geom_t;
 static int geom_round8(int v){ if (v < 8) return 8; return (v + 7) & ~7; }
@@ -1229,41 +1107,33 @@ static int geom_density_milli(const geom_t *g){
 }
 
 /* ==========================================================================
- * VIEW AREAS (2026-10-19, view-area lane).
+ * VIEW AREAS -- telling the phone how much of the panel the cluster really gives
+ * the map.
  *
- * WHY.  The instrument cluster has a VIEW button that cycles its layout: one
- * layout is a full-panel map, another is a two-gauge layout with the map in the
- * middle.  When the driver picks the gauge layout, the CLUSTER ECU paints the
- * gauges over the video we deliver -- and the PHONE never learns that its window
- * shrank, because we advertise exactly ONE view area (the full 1280x480 panel)
- * and never send updateViewArea.  So Apple Maps keeps drawing as if it owned the
- * whole panel, and a large part of it disappears behind the gauges.
+ * The cluster's VIEW button cycles its layout: full-panel map, or a two-gauge
+ * layout with the map in the middle.  In the gauge layout the ECU paints gauges
+ * over our video and the PHONE never learns its window shrank -- we advertise one
+ * full-panel area and never send updateViewArea -- so Apple Maps draws for the
+ * whole panel and much of it hides behind the gauges.
  *
- * WHAT THE PHONE NEEDS.  The /info display entry carries `viewAreas` (an array of
- * {originXPixels,originYPixels,widthPixels,heightPixels,safeArea?}),
- * `initialViewArea` (an index) and `adjacentViewAreas`.  The phone bounds-checks
- * an updateViewArea index against THAT array, so a second area must be
- * PREDECLARED before we can switch to it.  Two-part change:
- *   (a) declare N areas here, and
- *   (b) switch between them with updateViewArea (cluster_send_viewarea).
+ * The phone needs `viewAreas` (an array of {originXPixels,originYPixels,
+ * widthPixels,heightPixels,safeArea?}), `initialViewArea` (an index) and
+ * `adjacentViewAreas`; an updateViewArea index is bounds-checked against that
+ * array, so a second area must be PREDECLARED before we can switch to it.
  *
- * SHAPE CHOSEN (and why).  Per refs/rgi -- verified on real hardware,
- * docs/cluster-and-rgi/KDK_GEOMETRY_AND_ANIMATION.md + THIRD_PARTY_NAV_APPS.md --
- * EVERY declared area keeps the FULL encoded/visible frame and the areas differ
- * only in the NESTED `safeArea`.  rgi measured that an area whose *visible* frame
- * was reduced got the stream rejected at activation (root cause unknown); keeping
- * the visible frame full avoided that.  Our default follows that proven shape,
- * with MIB3_SHIM_VA_VISIBLE=1 as the deliberate experiment for the trip.
+ * SHAPE (refs/rgi, verified on real hardware -- docs/cluster-and-rgi/
+ * KDK_GEOMETRY_AND_ANIMATION.md + THIRD_PARTY_NAV_APPS.md): EVERY declared area
+ * keeps the FULL visible frame and the areas differ only in the NESTED `safeArea`;
+ * an area whose visible frame was reduced got the stream rejected at activation.
  *
  * KNOBS:
  *   MIB3_SHIM_VIEWAREAS=1        declare multiple view areas (default: off ->
  *                                the single full-panel area, unchanged)
  *   MIB3_SHIM_VA_COUNT=n         how many (default 3: this car has three layouts)
- *   MIB3_SHIM_VA_PRESET=1        derive class-safe boxes from CarPlay's own
- *                                classifier (default ON; see the CLASSIFIER block).
- *                                VA_PRESET=0 restores the old full-panel/guess.
- *   MIB3_SHIM_VA<i>="x,y,w,h[,sx,sy,sw,sh]"  explicit rects for area i (wins over
- *                                the preset)
+ *   MIB3_SHIM_VA_PRESET=1        derive class-safe boxes from CarPlay's classifier
+ *                                (default ON; VA_PRESET=0 restores the old
+ *                                full-panel/guess behaviour)
+ *   MIB3_SHIM_VA<i>="x,y,w,h[,sx,sy,sw,sh]"  explicit rect for area i (wins)
  *   MIB3_SHIM_VA_VISIBLE=1       also shrink the *visible* frame of areas >0 to
  *                                their safe rect (the rgi-refuted shape)
  *   MIB3_SHIM_VA_NOOUTSIDE=1     omit drawUIOutsideSafeArea from safeArea
@@ -1307,10 +1177,9 @@ static int va_count(void)
   return (int)n;
 }
 /* ==========================================================================
- * THE CLASSIFIER CarPlay applies to our safe box (desk reconstruction,
- * 2026-10-19, from rgi's decompile of
- * -[CPSInstrumentClusterCardViewController initWithSafeAreaFrame:…physicalPixelWidth:]
- * plus the DashBoard scene path).
+ * THE CLASSIFIER CarPlay applies to our safe box (desk reconstruction from rgi's
+ * decompile of -[CPSInstrumentClusterCardViewController
+ * initWithSafeAreaFrame:…physicalPixelWidth:] plus the DashBoard scene path).
  *
  * A safe box is NOT a crop and NOT a scale -- it is a CLASSIFICATION INPUT.  The
  * phone picks one of three card designs from its width and height:
@@ -1322,10 +1191,10 @@ static int va_count(void)
  *             included.  There is no graceful degradation.
  *   and, independently: ETA is dropped unless safeH > 202 px.
  *
- * For this panel (1280 px at the advertised 292 mm) scale = 0.670, so
- * wide >= 443 px and centred needs safeH > 257 px.  BOTH cliffs move with the
- * advertised mm (a true 278 mm panel puts wide at >= 465 px), so a preset box
- * keeps a margin rather than sitting on a threshold.
+ * For this panel (1280 px at 292 mm) scale = 0.670: wide >= 443 px, centred needs
+ * safeH > 257 px.  BOTH cliffs move with the advertised mm (a true 278 mm panel
+ * puts wide at >= 465 px), so a preset box keeps a margin instead of sitting on a
+ * threshold.
  * ========================================================================*/
 static int va_scale_milli(int cw, int phy_mm){
   if (phy_mm < 50 || phy_mm > 2000) phy_mm = 292;   /* absurd -> the default */
@@ -1357,12 +1226,10 @@ static int va_class_near_cliff(int sw, int sh, int cw, int phy_mm){
 /* Clamp a rect into its own frame.  Returns a bitmask of what had to move
  * (1 = the visible frame, 4 = the nested safe area) so the caller can WARN.
  *
- * WHY A CLAMP AND NOT A REFUSAL.  A safe area that leaves the display is an
- * invalid advert, and an invalid advert costs the whole CarPlay session.  The
- * frame is the hard limit and the class/position are the operator's intent, so
- * the safe box gets pulled back inside and the event is LOGGED.  Before this,
- * every panel size other than 1280x480 shipped such a box silently (see the
- * CLUSTER GEOMETRY block: sy+sh = 1055 on a 960-px-tall frame). */
+ * A safe area outside the display is an invalid advert, and an invalid advert
+ * costs the whole CarPlay session.  The frame is the hard limit and the
+ * class/position are the operator's intent, so the safe box is pulled back inside
+ * and the event is LOGGED -- never shipped silently. */
 static int va_fit(va_rect *r, int cw, int chp)
 {
   int bad = 0;
@@ -1394,34 +1261,25 @@ static int va_in_frame(const va_rect *r)
 }
 
 /* Class-safe boxes for the THREE cluster layouts, DERIVED from the classifier
- * rather than invented: each box is placed well inside the class it must land
- * in, with margin against the mm error that moves the cliffs.
+ * rather than invented: each box sits well inside the class it must land in, with
+ * margin against the mm error that moves the cliffs.  POSITION is still a
+ * placeholder -- the CLASS is deliberate, the COORDINATES must be measured against
+ * the car's own clear window (MIB3_RE/LANE_CLUSTER_LAYOUTS_2026-10-19.md).
+ * Override any box with MIB3_SHIM_VA<i>="x,y,w,h,sx,sy,sw,sh".
  *
- * These are PLACEHOLDERS in POSITION only -- the CLASS is deliberate, the
- * COORDINATES still have to be measured against the car's own clear window
- * (MIB3_RE/LANE_CLUSTER_LAYOUTS_2026-10-19.md, calibration grid).  Override any
- * of them with MIB3_SHIM_VA<i>="x,y,w,h,sx,sy,sw,sh"; MIB3_SHIM_VA_PRESET=0
- * restores the old full-panel/guess behaviour.
- *
- * CALIBRATION REFERENCE (added 2026-10-29 from the owner's reference
- * implementation, omonob/MHI2-Carplay-Maps, src/card-core
- * navigation_card_scene.h -- a DIFFERENT platform family (MHI2/QNX, AID 10.5
- * 1010x376), so the numbers are not ours to copy, but the MODEL is the
- * best-evidenced one available): their golden SAFE rects are
+ * REFERENCE MODEL (omonob/MHI2-Carplay-Maps, card-core navigation_card_scene.h; a
+ * DIFFERENT platform family -- MHI2/QNX, AID 10.5, 1010x376 -- so the numbers are
+ * not ours, the MODEL is).  Their golden SAFE rects:
  *   idle / pure map, not navigating : (202,16,606,344)
  *   pure map, CarPlay OWNS navigation: (42,16,606,344)   <-- the map RE-CENTRES
  *   left card                       : (18,75,606,284)     when nav ownership
  *   right card                      : (386,75,606,284)    flips; the OUTER view
  *   compact centred card            : (325,75,360,284)    area stays full-panel
- * -- i.e. (a) the OUTER view area stays the full panel (our shape, confirmed),
- * (b) the nested safe rect differs per layout, and (c) the phone composes the
- * MAP at a DIFFERENT offset depending on whether CarPlay owns navigation.
- * That last fact is the leading explanation for our "map off-centre from the
- * actual vehicle location" (2026-10-29 field symptom) and pairs with their
- * URL-parameter scheme (maps:/car/instrumentcluster/map?showETA=no&
- * maneuverLayout=no&showSpeedLimit=no for the pure map), which drives the same
- * layout choice from OUR side of the wire.  Calibrate ours with MIB3_SHIM_VA<i>
- * + MIB3_SHIM_URL against the Arteon's own clear window. */
+ * i.e. the outer view area stays the full panel (our shape, confirmed), the nested
+ * safe rect differs per layout, and the phone composes the MAP at a DIFFERENT
+ * offset depending on whether CarPlay owns navigation -- the leading explanation
+ * for "map off-centre from the actual vehicle location" (2026-10-29), driven from
+ * our side of the wire by MIB3_SHIM_URL. */
 static void va_preset_rect(int i, int cw, int chp, va_rect *r)
 {
   geom_t g;
@@ -1442,25 +1300,21 @@ static void va_preset_rect(int i, int cw, int chp, va_rect *r)
   } else if (i == 1){
     /* THE TUNED CARD, owner-locked 2026-10-20 at 439,50,397,375 on 1280x480.
      *
-     * SCALE-INVARIANT (2026-10-20, the 2x lane).  The numbers are expressed as
-     * FRACTIONS of the panel, so the same card lands in the same place, with the
-     * same class, at ANY pixel size.  At 1280x480 they evaluate to the locked
-     * values exactly (1280*397/1280 = 397, 480*375/480 = 375, ...), so the 1x
-     * advert is byte-identical to the shipped one.
+     * Expressed as FRACTIONS of the panel so the same card lands in the same
+     * place, with the same class, at ANY pixel size; at 1280x480 they evaluate to
+     * the locked values exactly (1280*397/1280 = 397, 480*375/480 = 375), so the
+     * 1x advert is byte-identical to the shipped one.
      *
-     * Why the fractions keep the CLASS: the classifier's thresholds are a fixed
-     * FRACTION of the panel width as long as the advertised mm does not change
-     * (wideThrPx = 660 * 0.153mm/(phyMm/pxW) = 34.6 % of the width at 292 mm),
-     * and this card is 31 % of the width -> "centred" at every scale.
-     *
+     * The CLASS survives because the classifier's thresholds are a fixed FRACTION
+     * of the width while the advertised mm is unchanged (wideThrPx = 34.6 % at
+     * 292 mm) and this card is 31 % of the width -> "centred" at every scale.
      * Measured, desk (container, unit CFLite): 1x -> 439,50,397,375;
      * 1.5x -> 658,75,595,562; 2x -> 878,100,794,750; 2x+SCALE_PHY -> same px.
      * The old branch produced 883,200,793,855 at 2x (95 px below the frame).
      *
-     * The four tuning laws still hold, because they are all expressed relative
-     * to the frame: bottom margin = chp-(sy+sh) = 55*chp/480; the top edge
-     * follows sh; width is a size class at 300 px *at 1x* -- at 2x the platter
-     * clamp scales with the panel, so the type keeps its relative size. */
+     * The laws stay relative to the frame: bottom margin = chp-(sy+sh) =
+     * 55*chp/480, the top edge follows sh, and the 300 px width class at 1x scales
+     * with the panel at 2x so the type keeps its size. */
     r->sw = cw * 397 / 1280;
     r->sh = chp * 375 / 480;
     r->sx = cw * 439 / 1280;
@@ -1540,12 +1394,10 @@ static CFMutableDictionaryRef va_build_one(const va_rect *r)
   return area;
 }
 /* one "visible=x,y,w,h safe=x,y,w,h" line, the SAFE-AREA-IN-FRAME verdict, then
- * the CLASSIFIER verdict for this box (see the CLASSIFIER block: 0 = blank
- * cluster).
- *
- * The rect line prints SIGNED numbers: it used to clamp negatives to 0, which
- * is how a safe area ending 95 px below the frame still read as a plausible
- * "safe=883,200,793,855" for two car sessions. */
+ * the CLASSIFIER verdict for this box (0 = blank cluster), so the car tells us
+ * what it will draw instead of us guessing from the picture.  The rect prints
+ * SIGNED numbers: clamping negatives to 0 is how a safe area ending 95 px below
+ * the frame still read as a plausible "safe=883,200,793,855" for two sessions. */
 static void va_put_int(char *b, int *k, int x)
 {
   char d[12]; int m = 0;
@@ -1622,13 +1474,10 @@ static CFMutableArrayRef va_build(int cw, int chp)
     }
   }
   logkv("cluster/va","count declared",(u64)(unsigned)p_CFArrayGetCount(va),0);
-  /* ONE summary line per advert.  These two numbers are what the desk bench
-   * asserts at every scale:
-   *   boxes clamped  -- must be 0: an advert whose safe area leaves the frame is
-   *                     invalid and can cost the whole session (2026-10-20);
-   *   classes        -- must be the SAME sequence at every scale while the
-   *                     advertised mm is unchanged, because the classifier's
-   *                     cliffs are a fraction of the frame. */
+  /* ONE summary line per advert: the two numbers the desk bench asserts at every
+   * scale -- boxes clamped (must be 0: an out-of-frame safe area is an invalid
+   * advert) and classes (must be the SAME sequence at every scale while the
+   * advertised mm is unchanged). */
   { char b[80]; int k = 0, j;
     logkv("cluster/va","out-of-frame boxes clamped",(u64)(u32)clamped,0);
     for (j = 0; j < nclass; j++){
@@ -1719,77 +1568,59 @@ static void add_cluster_fields(CFMutableArrayRef *inArray, int cw, int chp){
 }
 
 /* ==========================================================================
- * /info COMPLETION -- the MODERN CarKit display schema (2026-10-15).
+ * /info COMPLETION -- the MODERN CarKit display schema.
  *
- * THE GAP.  The unit's libAirPlay 320.17.4 builds `/info` in
- * AirPlayCopyServerInfo(): it copies `displays` (and `extendedFeatures`,
- * `audioFormats`, ...) from the platform dict into a CFMutableDictionary and
- * returns it -- and the caller (libAirPlay 0xcc98, the /info HTTP handler)
- * serialises that SAME dict with CFBinaryPlistV0Create.  LG's
- * CarPlayConfiguration::setDisplays fills `displays` via
- * AirPlayInfoArrayAddScreenDisplay, whose entries use the OLD 210 schema:
- * identifier key `uuid`, and NO `initialVideoStreams`.  iOS-26-era CarKit
- * (CRDisplayInfo / CARSessionConfiguration, verified against the working
- * receivers) requires the NEW schema at the display-dict level and a SEPARATE
- * top-level key `displayPanels`; a `displays` entry it cannot parse makes it
- * reject the whole array and teardown-loop the session.
+ * THE GAP.  AirPlayCopyServerInfo() copies `displays` (and `extendedFeatures`,
+ * `audioFormats`, ...) out of the platform dict into a CFMutableDictionary, and
+ * the /info HTTP handler (libAirPlay 0xcc98) serialises that SAME dict with
+ * CFBinaryPlistV0Create.  LG fills `displays` via AirPlayInfoArrayAddScreenDisplay
+ * with the OLD 210 schema (identifier key `uuid`, no `initialVideoStreams`);
+ * iOS-26-era CarKit (CRDisplayInfo / CARSessionConfiguration) requires the NEW
+ * schema at the display-dict level plus a separate top-level `displayPanels`, and
+ * a `displays` entry it cannot parse makes it reject the WHOLE array and
+ * teardown-loop the session.
  *
- * Required fields (field-by-field, from luka-dev/mib2q-carplay-rgi
- * hook/altscreen/altscreen_hook.c, itself verified against the iOS 26.1 CarKit
- * decompile -- see LANE_ADVERT_COMPLETE_2026-10-15.md for the full table):
- *   per display :  uid (CarKit initWithPhysicalScreenDictionary reads "uid";
- *                  missing -> CRDisplayInfo nil -> the whole displays array is
- *                  rejected), uuid (AirPlaySender picks 110 vs 111 by a
- *                  uuid-vs-display-0 compare), name, type, maxFPS,
- *                  width/heightPixels, width/heightPhysical, viewAreas,
- *                  initialViewArea, adjacentViewAreas,
- *                  initialVideoStreams (MUST be a present, NON-empty array or
- *                  CRDisplayInfo returns nil), plus cornerMasks / nightMode /
- *                  limitedUI / limitedUIElements;
- *   cluster only:  properties = ["Instrument Cluster"]  (-> CarKit
- *                  supportsInstrumentClusterContent),
- *   top level   :  displayPanels = the same [main,cluster] array (the
- *                  CARSessionConfiguration consumer; without it the cluster is
- *                  unrecognized and iOS never proposes altScreen), and
- *                  extendedFeatures = ["altScreen","viewAreas"] (the /info
- *                  advertisement; a SEPARATE message from the SETUP response's
- *                  `enabledFeatures`).
+ * Required fields (from luka-dev/mib2q-carplay-rgi altscreen_hook.c, verified
+ * against the iOS 26.1 CarKit decompile -- full table in
+ * LANE_ADVERT_COMPLETE_2026-10-15.md):
+ *   per display :  uid (missing -> CRDisplayInfo nil -> array rejected), uuid
+ *                  (AirPlaySender picks 110 vs 111 by a uuid-vs-display-0
+ *                  compare), name, type, maxFPS, width/heightPixels,
+ *                  width/heightPhysical, viewAreas, initialViewArea,
+ *                  adjacentViewAreas, initialVideoStreams (a present, NON-empty
+ *                  array or CRDisplayInfo returns nil), cornerMasks, nightMode,
+ *                  limitedUI, limitedUIElements;
+ *   cluster only:  properties = ["Instrument Cluster"]  (-> supportsInstrument-
+ *                  ClusterContent);
+ *   top level   :  displayPanels = the same [main,cluster] array (without it the
+ *                  cluster is unrecognized and iOS never proposes altScreen), and
+ *                  extendedFeatures = ["altScreen","viewAreas"] -- the /info
+ *                  advertisement, a SEPARATE message from SETUP's
+ *                  `enabledFeatures`.
  *
  * THE WIRING IS PROVEN FROM THE BINARY (R8830L, disassembly):
  *   1. CarPlayConfiguration::setDisplays (libCarPlayAppFramework 0x236e4) calls
  *      AirPlayInfoArrayAddScreenDisplay(&this[0x88], ...) -- the array our first
- *      seam appends the cluster entry to.
- *   2. CarPlayServerCallbacks::copyRequiredProperty(key=="displays", fw)
- *      (0x1db88) returns [fw+0x310].  CarPlayConfiguration is the sub-object at
- *      fw+0x288 (proved by the sibling case: key "audioFormats" returns
- *      [fw+0x288] and calls CarPlayConfiguration::getDeviceID(fw+0x288)), so
- *      fw+0x310 == config[0x88] -- EXACTLY the array from (1).
+ *      seam appends to.
+ *   2. CarPlayServerCallbacks::copyRequiredProperty(key=="displays", fw) (0x1db88)
+ *      returns [fw+0x310]; CarPlayConfiguration is the sub-object at fw+0x288
+ *      (proved by the sibling "audioFormats" case), so fw+0x310 == config[0x88].
  *   3. AirPlayCopyServerInfo (libAirPlay 0xe3d8-0xe3ec) calls
  *      AirPlayReceiverServerPlatformCopyProperty(server,1,"displays",..) -> (2)
  *      -> CFDictionarySetValue(info,"displays",thatArray).
- *   4. The /info HTTP handler (libAirPlay 0xcc98) serialises that dict with
- *      CFBinaryPlistV0Create.  So this seam sees the SAME array the first seam
- *      annotated.
- * Also proved: CarPlayServerCallbacks::copyExtendedFeatures (0x1dc54) BUILDS
- * `extendedFeatures` from LG flags (`enhancedRequestCarUI` @[fw+0x300],
- * `vocoderInfo` @[fw+0x3f8]) -- so on this unit the key is often PRESENT without
- * altScreen, which is why we MERGE rather than skip-if-present or clobber.
+ *   4. The /info handler serialises it, so this seam sees the SAME array.
+ * Also: copyExtendedFeatures (0x1dc54) BUILDS `extendedFeatures` from LG flags
+ * (`enhancedRequestCarUI` @[fw+0x300], `vocoderInfo` @[fw+0x3f8]), so the key is
+ * often PRESENT without altScreen -- hence MERGE, never skip-if-present or clobber.
  *
- * HONEST SCOPE.  The field SET is SUPPORTED (a working reference receiver,
- * verified against the iOS 26.1 CarKit decompile), not PROVEN against this
- * unit's own libraries -- the unit's libAirPlay has no `uid`/`displayPanels`/
- * `initialVideoStreams` strings at all, so there is nothing in the binary to
- * confirm the consumer side.  What IS proven here: the seam exists and is
- * interposable (exported symbol + JUMP_SLOT relocation), the array it completes
- * is the one the /info response carries (above), and the object the shim
- * produces serialises with the unit's own CFBinaryPlistV0Create and satisfies
- * the two-display/altScreen invariant.  The car decides the rest.
+ * HONEST SCOPE: the field SET is SUPPORTED (a working reference receiver verified
+ * against the iOS 26.1 decompile), not PROVEN against this unit's libraries -- it
+ * has no `uid`/`displayPanels`/`initialVideoStreams` strings at all.
  *
  * Everything is gated on the CLUSTER ENTRY ACTUALLY BEING PRESENT (type==111 in
- * `displays`): if it is not there we publish NEITHER displayPanels NOR
- * extendedFeatures, so the 2-display/altScreen contract can never be advertised
- * without the second display -- the same both-ways discipline as
- * g_cluster_advertised (see LANE_SESSION_FIX_2026-10-15.md).
+ * `displays`): otherwise NEITHER displayPanels NOR extendedFeatures is published,
+ * so the 2-display/altScreen contract can never be advertised without the second
+ * display -- the same both-ways discipline as g_cluster_advertised.
  * ========================================================================*/
 
 #define MIB3_CLUSTER_TYPE  111
@@ -1914,11 +1745,10 @@ static void dump_cf(const char *tag, CFTypeRef v, int depth){
 }
 
 /* Does the display list already carry a type-111 (cluster) entry?  Makes the
- * advertisement idempotent PER DISPLAY LIST.  LG rebuilds `displays` on every
- * session, so the old "add once per process" latch meant only the FIRST phone
- * plug after injection ever advertised -- and every later plug still claimed
- * altScreen while showing one display (the 1-display/altScreen contradiction
- * that kills the session).  Correct whether the array persists or is rebuilt. */
+ * advertisement idempotent PER DISPLAY LIST, not per process: LG rebuilds
+ * `displays` on every session, so the old once-per-process latch meant only the
+ * FIRST plug after injection advertised -- every later plug still claimed
+ * altScreen while showing one display, the contradiction that kills the session. */
 static int array_has_cluster(CFMutableArrayRef *inArray){
   if (!inArray || !*inArray) return 0;
   if (!p_CFArrayGetCount || !p_CFArrayGetValueAtIndex || !p_CFGetTypeID ||
@@ -1997,14 +1827,10 @@ static int info_complete_entry(CFMutableDictionaryRef d, int is_cluster, s64 nig
       else p_CFDictionarySetInt64(d, g_k_corner, 0);
     }
     if (!p_CFDictionaryGetValue(d, g_k_lui))    p_CFDictionarySetInt64(d, g_k_lui, 0);
-    /* NIGHT: FILL, NEVER OVERWRITE (2026-10-29, owner direction -- follow the
-     * phone, force nothing).  This used to poke g_k_night with whatever we
-     * resolved, on BOTH display entries -- i.e. it could overwrite the unit's
-     * own value on the main display with a guess of ours.  Now an existing key
-     * is left exactly as the car provided it; the caller decides the fill
-     * value, and when the phone's mode is observed the CALLER mirrors into the
-     * cluster entry only (the display whose theme we actually own the mapping
-     * for). */
+    /* NIGHT: FILL, NEVER OVERWRITE.  An existing key is left exactly as the car
+     * provided it -- this used to poke the key on BOTH entries and could
+     * overwrite the unit's own value on the MAIN display.  The caller picks the
+     * fill value; the MIRROR block below tracks the live mode on the cluster. */
     if (!p_CFDictionaryGetValue(d, g_k_night))
       p_CFDictionarySetInt64(d, g_k_night, night);
   }
@@ -2108,43 +1934,28 @@ static int info_complete(CFMutableDictionaryRef info){
   }
   if (!cluster){ logline("info","no cluster entry in displays -- publish nothing"); return 0; }
 
-  /* PER-DISPLAY COMPLETION -- RESTORED 2026-10-29 (redteam).
-   *
-   * The 2026-10-29 night-mirror rework accidentally DELETED the two calls
-   * below when it replaced the old night block, which silently dropped the
-   * per-display modern-schema completion (uid, name/properties on the
-   * cluster, cornerMasks, limitedUI, nightMode FILL, initialVideoStreams,
-   * adjacentViewAreas) from every /info the 2026-10-29 field build
-   * (5b5dc684) advertised -- the very session that reported "white frame on
-   * connect" and "map off-centre".  Every WORKING session before 10-29
-   * (10-16 .. 10-27, LANE_ADVERT_COMPLETE .. IT_WORKS) ran WITH these calls;
-   * the display entries' completeness is what CarKit's display model
-   * consumes.  (Honest scope, unchanged: the uid/ivs requirement is
-   * SUPPORTED by the reference receivers, and this phone demonstrably
-   * tolerates its absence -- the 10-29 session still connected -- but the
-   * completed shape is the field-proven one and the reference's.)
-   *
-   * Composition with the night model (2026-10-29, D3): the calls run FIRST
-   * and only FILL missing keys; the MIRROR block below then overwrites the
-   * cluster's nightMode with the main entry's CURRENT value object on every
-   * build, so the mirror -- the deliberate 10-29 semantics -- always wins on
-   * that one key.  MIB3_SHIM_NIGHT no longer reaches /info at all (it only
-   * gates the debug setNightMode command). */
+  /* PER-DISPLAY COMPLETION -- RESTORED 2026-10-29 (redteam).  The night-mirror
+   * rework had accidentally deleted these two calls, so build 5b5dc684 shipped
+   * every /info without the per-display schema (uid, name/properties on the
+   * cluster, cornerMasks, limitedUI, nightMode fill, initialVideoStreams,
+   * adjacentViewAreas) -- the session that reported "white frame on connect" and
+   * "map off-centre", while every working session before 10-29 ran WITH them.
+   * They run FIRST and only FILL missing keys; the mirror block below then
+   * overwrites the cluster's nightMode with the main entry's current value object,
+   * so the mirror wins on that one key.  MIB3_SHIM_NIGHT never reaches /info (it
+   * gates only the debug setNightMode command). */
   { s64 night = main ? dict_i64((CFDictionaryRef)main, g_k_night) : 0;
     g_night_mode = night;   /* the value the debug-force path sends as setNightMode */
     if (main && env_on("MIB3_SHIM_MAINMOD",1)) info_complete_entry(main, 0, night);
     info_complete_entry(cluster, 1, night); }
 
-  { /* NIGHT = MIRROR THE CAR'S MAIN DISPLAY ONTO THE CLUSTER (2026-10-29).
-     * Fill-only was WRONG in a way this run's log exposed: the car's own
-     * /info carries nightMode on the MAIN display and it CHANGES mid-drive
-     * (observed num=0 early, bool=true later); because a key already existed,
-     * fill-only left the cluster frozen at DAY for the whole session while the
-     * car had switched to night.  So: copy the main entry's VALUE OBJECT onto
-     * the CLUSTER entry on every /info build -- preserving the car's own
-     * representation (num vs bool) -- and never touch the main entry itself.
-     * This is pass-through of the car's state, not a mode we invent; no
-     * setNightMode is ever shipped from this path. */
+  { /* NIGHT = MIRROR THE CAR'S MAIN DISPLAY ONTO THE CLUSTER.  Fill-only was wrong:
+     * the car's /info carries nightMode on the MAIN display and it CHANGES
+     * mid-drive (observed num=0 early, bool=true later), so an existing key left
+     * the cluster frozen at DAY for the whole drive.  Copy the main entry's VALUE
+     * OBJECT onto the cluster on every build -- preserving the car's own
+     * representation (num vs bool) -- and never touch main.  Pass-through of the
+     * car's state, not a mode we invent: no setNightMode is shipped from here. */
     CFTypeRef mnv = main ? p_CFDictionaryGetValue(main, g_k_night) : 0;
     g_night_mode = (s64)dict_i64(main ? (CFDictionaryRef)main : 0, g_k_night);
     if (mnv && p_CFDictionarySetValue) {
@@ -2156,18 +1967,15 @@ static int info_complete(CFMutableDictionaryRef info){
     }
   }
 
-  /* top-level keys: publish the SAME array under displayPanels, and the /info
-   * feature advertisement.  Only when the cluster exists (above).
-   *
-   * displayPanels: set unconditionally (= the displays array) -- nothing in the
-   * unit provides this key at all, and the reference overwrites it too.
-   * extendedFeatures: MERGE, not skip or clobber.  The unit's libAirPlay reads
-   * this key from the platform (it has native support), so a value may already
-   * be present; overwriting could drop a real feature and skipping-if-present
-   * could leave altScreen out.  Append our two strings iff missing. */
-  /* displayPanels: LIVI-shaped panels (uid="{uuid}-panel" + showsInstruments +
-   * initialVideoStreams).  MIB3_SHIM_PANELS=0 restores the old behaviour
-   * (displayPanels = the same displays array). */
+  /* top-level keys, published only when the cluster entry exists (above).
+   * displayPanels: set unconditionally, in the LIVI shape -- a panel per display
+   * with uid="{uuid}-panel", the display's size, properties (showsInstruments for
+   * the cluster) and initialVideoStreams=[{uuid}].  Nothing in the unit provides
+   * this key at all and the reference overwrites it too; MIB3_SHIM_PANELS=0
+   * restores displayPanels = the same displays array.
+   * extendedFeatures: MERGE -- never skip-if-present (altScreen could be left out)
+   * and never clobber (the unit's libAirPlay BUILDS this key from LG flags, so a
+   * real feature could be dropped).  Append our two strings iff missing. */
   if (env_on("MIB3_SHIM_PANELS",1)) panels_build(info);
   else p_CFDictionarySetValue(info, g_k_dp, arr);
   (void)arr;
@@ -2206,30 +2014,25 @@ static int info_complete(CFMutableDictionaryRef info){
 }
 
 /* ==========================================================================
- * THE ADVERT SELF-CHECK (2026-10-20, the 2x lane).
+ * THE ADVERT SELF-CHECK -- is the dict we are about to serialise internally
+ * consistent?
  *
- * WHY.  The 2x experiment on the car could not be interpreted, because nothing
- * ever checked that the advert we built was INTERNALLY CONSISTENT -- and it was
- * not (see the CLUSTER GEOMETRY block: at 2x a safe area ended 95 px below the
- * frame, invisibly, for two whole sessions).  A single malformed `displays`
- * entry costs the WHOLE CarPlay session, so "the phone refused 2x" and "our
- * advert was broken" are indistinguishable without this.
- *
- * WHAT IT ASSERTS (all of it from the dict we are about to serialise):
+ * One malformed `displays` entry costs the WHOLE CarPlay session, so "the phone
+ * refused 2x" and "our advert was broken" are indistinguishable without this (at
+ * 2x a safe area ended 95 px below the frame, invisibly, for two sessions).  It
+ * asserts, from that dict alone:
  *   - exactly one type-111 entry, and its pixel/physical size;
- *   - every declared view area's safeArea INSIDE its visible frame, and
- *     initialViewArea inside the declared count;
+ *   - every declared area's safeArea INSIDE its visible frame, initialViewArea in
+ *     range;
  *   - initialVideoStreams present and NON-empty (an empty array is a 0 s session);
- *   - displayPanels: one panel per display, with the SAME pixel and physical
- *     geometry as the display it describes, and `showsInstruments` on the cluster
- *     panel;
- *   - extendedFeatures carries altScreen + viewAreas, and altScreen is only
- *     claimed when >= 2 displays exist (the both-ways contract that kills a
- *     session otherwise).
+ *   - displayPanels: one panel per display with the SAME pixel and physical
+ *     geometry, and `showsInstruments` on the cluster panel;
+ *   - extendedFeatures carries altScreen + viewAreas, and altScreen only when
+ *     >= 2 displays exist (the both-ways contract).
  *
- * Runs on every /info by default (MIB3_SHIM_INFOCHECK=0 disables) and is also
- * exported for the desk bench, so the SAME code judges the advert on the desk
- * and on the car.  Log tag: `infocheck`.  `mismatch=0` is the only good value.
+ * Runs on every /info (MIB3_SHIM_INFOCHECK=0 disables) and is exported for the
+ * desk bench, so the SAME code judges the advert on the desk and on the car.
+ * Log tag `infocheck`; `mismatch=0` is the only good value.
  * ========================================================================*/
 static int ic_in_frame(CFTypeRef area, CFTypeRef *safeOut)
 {
@@ -2361,30 +2164,22 @@ static int info_check(CFMutableDictionaryRef info)
 /* ==========================================================================
  * Cluster (type 111) STREAM handling.
  *
- * The unit's stream SETUP dispatcher (inside AirPlayReceiverSessionSetup)
- * handles types 100/101/102/110 and DROPS everything else -- including 111 --
- * at its `sub w1,w0,#0x64; cmp w1,#0xa; b.hi` guard (only indices 0..10 are in
- * the jump table; 103..109 and >=111 share the drop branch).
- *
- * Worse, the session holds exactly ONE screen: the 110 case ("_ScreenSetup")
- * uses session+0x1af0 (screen), +0x1ae8 (screenInitialized), +0x1af8 (listen
- * sock), +0x1b00 (net sock) and a single _ScreenThread -- and it asserts if a
- * second 110 arrives.  So we cannot simply spoof 111->110.
+ * The unit's SETUP dispatcher (inside AirPlayReceiverSessionSetup) handles types
+ * 100/101/102/110 and DROPS everything else at its `sub w1,w0,#0x64; cmp w1,#0xa;
+ * b.hi` guard (only indices 0..10 are in the jump table).  Worse, the session
+ * holds exactly ONE screen: the 110 case uses session+0x1af0 (screen), +0x1ae8
+ * (screenInitialized), +0x1af8 (listen sock), +0x1b00 (net sock) and a single
+ * _ScreenThread -- and it asserts if a second 110 arrives -- so 111 cannot simply
+ * be spoofed as 110.
  *
  * The shim therefore owns a SECOND screen object and reproduces the unit's own
- * _ScreenSetup + _ScreenThread sequence for it, using the exported
- * AirPlayReceiverSessionScreen_* API.  Two helpers the unit uses are NOT
- * exported (chacha key derive; the two screen time-sync callbacks); those are
- * called by RVA off the libAirPlay base (train-specific, flagged in the log).
+ * _ScreenSetup + _ScreenThread sequence for it via the exported
+ * AirPlayReceiverSessionScreen_* API.  Two helpers it needs are NOT exported
+ * (chacha key derive; the two screen time-sync callbacks): those are called by RVA
+ * off the libAirPlay base (train-specific, logged as such).
  * ========================================================================*/
-/* SINK DISPATCHER (2026-10-16; reduced 2026-10-29 to the Path B modes): the one
- * place cluster frames may leave the process.  Modes (MIB3_SHIM_SINK):
- *   off (default) | helper (out-of-process, over the AU socket -- THE Path B
- *   mode: the consumer is mib3clusterstream, the RTP/TS sender)
- * The in-process display modes (dry/local + the surface/bridge machinery) were
- * the 2026-10-16 black-screen/reset hazard and were removed with the rest of the
- * Path A code in the 2026-10-29 redteam refactor.  A stale knob that names them
- * is REFUSED with a loud log line, never silently ignored. */
+/* SINK dispatch modes: see THE SINK DISPATCHER at the bottom of this file.
+ * MIB3_SHIM_SINK = off (default) | helper (the Path B sender on the AU socket). */
 #define SINK_OFF 0
 #define SINK_HELPER 2
 static int g_sink = -1;          /* -1 = unresolved */
@@ -2401,42 +2196,38 @@ int  mib3shim_helper_connected(void);
 /* ==========================================================================
  * COMMANDS TO THE PHONE (the refs' post-connect sequence).
  *
- * The verified iOS sequence (rgi ALTSCREEN_CLUSTER_VIDEO.md, iOS 26.6
- * AirPlaySender/CarKit decompile): once the phone connects the 111 stream it
- * sends opcode-1 (avcC) + opcode-5 (telemetry) but ZERO video until the CAR
- * drives the scene: forceKeyFrame{params:{uuid}} at stream start, then
- * showUI{params:{uuid,url}} (+ setNightMode{params:{uuid,nightMode}}) -- the
- * phone then renders the cluster scene (Apple Maps) and the video flows.
- * Command shapes verified against BOTH working receivers:
+ * Once connected the phone sends opcode-1 (avcC) + opcode-5 (telemetry) but ZERO
+ * video until the CAR drives the scene: forceKeyFrame{params:{uuid}} at stream
+ * start, then showUI{params:{uuid,url}} (+ setNightMode{params:{uuid,nightMode}})
+ * -- then it renders the cluster scene (Apple Maps) and the video flows.  Shapes
+ * verified against BOTH working receivers:
  *   rgi  altscreen_hook.c:2644-2665  showUI   {uuid, url}
  *   rgi  altscreen_hook.c:2565-2588  forceKeyFrame {uuid}
  *   rgi  altscreen_hook.c:2470-2485  setNightMode {uuid, nightMode}
  *   LIVI stack.rs:1826-1843         same three, same keys
- * Shipped via the stock AirPlayReceiverSessionSendCommand (the rgi's exact
- * route).  The uuid MUST be the CLUSTER DISPLAY uuid we advertised.
+ * Shipped via the stock AirPlayReceiverSessionSendCommand.  The uuid MUST be the
+ * CLUSTER DISPLAY uuid we advertised.
  * ======================================================================== */
 /* build {type:.., params:..}; params is consumed (retained by the cmd dict,
  * our +1 released here after SendCommand returns, per the stock pattern). */
-/* ---- COMMAND COMPLETION (2026-10-19, view-area lane) ----------------------
- * AirPlayReceiverSessionSendCommand(session, cmd, completion, ctx): the stock
- * response handler for POST /command calls
+/* ---- COMMAND COMPLETION ---------------------------------------------------
+ * AirPlayReceiverSessionSendCommand(session, cmd, completion, ctx) takes the stock
+ * handler for POST /command calls:
  *     completion(int status, CFDictionaryRef resp|NULL, void *ctx)
- * with status 0 = the phone ACCEPTED/applied and non-zero = refused.  Until now
- * we always passed (0,0) and could not tell "delivered" from "refused" -- the
- * same blindness that hid the missing "type" key (INTEGRATION_2026-10-18).
+ * status 0 = the phone ACCEPTED/applied, non-zero = refused.  Passing (0,0) could
+ * not tell "delivered" from "refused" -- the same blindness that hid the missing
+ * "type" key.
  *
- * WHERE IT RUNS: libairplay's HTTP-client thread, some time AFTER SendCommand
- * returns, and it may outlive the session that issued it.  It therefore does
- * NOTHING but compare the generation it was issued under with g_cmd_gen and
- * write one log line.  It touches no CF object (the resp dictionary is
- * deliberately ignored), takes no lock, and performs no display or socket I/O,
- * so it cannot deadlock the control queue or race a teardown.
+ * WHERE IT RUNS: libAirPlay's HTTP-client thread, AFTER SendCommand returns, and
+ * it may outlive the session that issued it.  So it does NOTHING but compare the
+ * generation it was issued under with g_cmd_gen and write one log line: no CF
+ * object touched (resp is deliberately ignored), no lock, no display or socket
+ * I/O -- it cannot deadlock the control queue or race a teardown.
  *
- * LIFETIME: `ctx` is one of a small ring of STATIC slots, valid for the life of
- * the process -- no malloc, nothing to free, no cross-thread ownership.  ship_cmd
- * runs on one thread at a time (the cluster receiver thread / the harness), so
- * the round-robin is monotonic; a slot reused before its reply arrives simply
- * logs under the newer command's name, which is bounded and harmless.
+ * LIFETIME: `ctx` is one of a small ring of STATIC slots valid for the process
+ * lifetime -- no malloc, nothing to free, no cross-thread ownership.  ship_cmd runs
+ * on one thread at a time, so the round-robin is monotonic; a slot reused before
+ * its reply arrives logs under the newer command's name, which is bounded.
  *
  * MIB3_SHIM_CMDACK=0 restores the exact old call, SendCommand(session, cmd, 0, 0).
  * -------------------------------------------------------------------------*/
@@ -2513,42 +2304,30 @@ static int ship_cmd_i(void *session, const char *type, CFMutableDictionaryRef pa
   if (!session || !p_SendCommand || !p_CFDictionaryCreateMutable ||
       !p_CFDictionarySetValue || !p_kCFLDictKeyCB || !p_kCFLDictValCB || !p_CFRelease)
     return -1;
-  /* ---- GENERATION GUARD (stability, 2026-10-18) ---------------------------
+  /* ---- GENERATION GUARD ---------------------------------------------------
    * AirPlayReceiverSessionSendCommand is a dispatch_sync_f onto the SESSION's own
-   * control queue, with NO timeout, that builds an RTSP POST /command and
+   * control queue with NO timeout, that builds an RTSP POST /command and
    * HTTPClientSendMessage()s it (corpus libAirPlay decompiled.c:12863-12899 ->
-   * FUN_00113038 at 9935; the shipped binary at VA 0x17f3c calls
-   * dispatch_sync_f@plt).  This runs on the CLUSTER RECEIVER THREAD.
-   *
-   * Two hazards follow, and the refs/rgi implementation removed this exact
-   * pattern (its SESSION_LIFECYCLE.md defects 3 and 5: "stock command under
-   * alt_lock ... deadlock and use-after-free edge" and "night-mode refresh on
-   * the receive thread ... could outlive a teardown"):
-   *   (a) while the call is in flight we are not read()ing the phone's cluster
-   *       socket, so that stream looks silent-but-ESTABLISHED; and
-   *   (b) `session` was captured at SETUP time.  A superseded receiver thread
-   *       (a new type-111 SETUP creates a new one; the old thread lives until
-   *       its socket ends) would command through an OLD session object.
-   *
-   * Cheap guards, no behaviour change on the healthy path:
-   *   1. only the CURRENT setup generation may command (g_cmd_session is written
-   *      by cluster_setup on every type-111 SETUP);
-   *   2. mirror stock's own liveness byte (session+0x446, set once by
-   *      AirPlayReceiverSessionStart and never cleared: decompiled.c:13087,
-   *      tested at 12877) so we do not enter dispatch_sync on a dead session.
-   * MIB3_SHIM_CMDGEN=0 restores the old unconditional behaviour. */
+   * FUN_00113038; the shipped binary at VA 0x17f3c calls dispatch_sync_f@plt).
+   * It runs on the CLUSTER RECEIVER THREAD, so: (a) while it is in flight we are
+   * not read()ing the phone's cluster socket, which then looks
+   * silent-but-ESTABLISHED; and (b) `session` was captured at SETUP time, so a
+   * superseded receiver thread could command an OLD session object.  The refs
+   * removed exactly this pattern (rgi SESSION_LIFECYCLE.md defects 3 and 5).
+   * Guards: only the CURRENT setup generation may command (g_cmd_session is
+   * written by cluster_setup on every type-111 SETUP), and stock's own liveness
+   * byte must be set (below).  MIB3_SHIM_CMDGEN=0 restores the old behaviour. */
   if (env_on("MIB3_SHIM_CMDGEN",1)){
     if (session != g_cmd_session){
       logline("cluster/cmd/skipped-superseded", type);
       return -2;
     }
-    /* The 0x446 liveness byte is a REVERSE-ENGINEERED offset from the decompiled
-     * corpus (AirPlayReceiverSessionStart / decompiled.c:13087).  The corpus is a
-     * different BUILD from this unit in general, so if this offset is wrong on
-     * this image the check silently disables EVERY command (showUI /
-     * forceKeyFrame / nightMode / changeMapZoomLevel) while everything still
-     * looks connected -- a silent, trip-costing failure.  It is therefore its own
-     * knob so the operator can neutralise it WITHOUT a rebuild:
+    /* The 0x446 liveness byte is a REVERSE-ENGINEERED offset (session+0x446, set
+     * once by AirPlayReceiverSessionStart and never cleared: decompiled.c:13087,
+     * tested at 12877).  The corpus is a different BUILD from this unit, so a wrong
+     * offset here would silently disable EVERY command (showUI / forceKeyFrame /
+     * nightMode / changeMapZoomLevel) while everything still looks connected -- a
+     * silent, trip-costing failure.  Hence its own knob:
      *   MIB3_SHIM_CMDALIVE=0  -> skip the byte check (the generation check above
      *                            still applies; that one is sound by construction).
      * Every trip should grep the log for these two skip lines. */
@@ -2562,14 +2341,13 @@ static int ship_cmd_i(void *session, const char *type, CFMutableDictionaryRef pa
   if (!cmd) return -1;
   int rc = -1;
   {
-    /* KEY BUG FOUND 2026-10-18 by the new command-capture bench (harness/
-     * libstubcmd.c): this used to pass `sstr(type)` as the dictionary KEY, so
-     * every command went out as {"<name>": "<name>", "params": {...}} -- with
-     * NO "type" key at all.  Both reference receivers build
-     * {"type": "<name>", "params": {...}} (playport AirPlaySession.kt:139,
-     * rgi altscreen_hook.c alt_ship) and iOS dispatches on that key.
-     * `showUI`/`forceKeyFrame`/`setNightMode`/`changeMapZoomLevel` were all
-     * therefore shipped in a shape the phone does not recognise. */
+    /* THE "type" KEY (found 2026-10-18 by the command-capture bench, harness/
+     * libstubcmd.c): this used to pass sstr(type) as the dictionary KEY, so every
+     * command went out as {"<name>": "<name>", "params": {...}} -- with NO "type"
+     * key -- while both references build {"type": "<name>", "params": {...}}
+     * (playport AirPlaySession.kt:139, rgi altscreen_hook.c alt_ship) and iOS
+     * dispatches on that key.  All four commands were therefore shipped in a shape
+     * the phone does not recognise. */
     CFStringRef kt = sstr("type"), kp = sstr("params"), vt = sstr(type);
     if (kt && kp && vt && params){
       p_CFDictionarySetValue(cmd, kt, vt);
@@ -2639,22 +2417,16 @@ static void cluster_send_forcekeyframe(void *session, const char *why)
 typedef struct { long sec; long nsec; } mib3_ts;
 static long (*p_clock_gettime)(int, void*);
 static int  g_clock_warned = 0;
-/* THE CLOCK MUST RESOLVE ITSELF (2026-10-29, found by the audit bench's H2
- * hostile-peer run hanging forever).
- *
- * mono_ms() used to depend on resolve() having run (it is resolve() that
- * fills p_clock_gettime / p_syscall).  In carplay that is guaranteed: the
- * SETUP seam fires resolve() long before any AU exists.  But the AU-socket
- * exports (mib3shim_helper_*) are also driven STANDALONE (the audit's
- * driver_helper, any future direct consumer) -- and there resolve() never
- * runs, both clock pointers stay NULL, mono_ms() returns 0 forever, and
- * send_all()'s deadline (0 + 60) can NEVER expire: against a peer that never
- * drains, the EAGAIN branch polled POLLOUT in an INFINITE 20 ms loop.  That
- * is exactly the "stalled receiver thread" class this shim must make
- * impossible, so the clock now resolves itself lazily (dlsym is thread-safe;
- * this runs once), and send_all() additionally bounds its poll iterations so
- * even a genuinely clock-less process cannot spin forever (belt for the
- * belt).  The NO CLOCK line stays: a silently-disabled timer is still the
+/* THE CLOCK MUST RESOLVE ITSELF.  mono_ms() used to depend on resolve() having run
+ * to fill p_clock_gettime / p_syscall.  In carplay that is guaranteed -- SETUP
+ * fires resolve() long before any AU exists -- but the AU-socket exports are also
+ * driven STANDALONE (the audit's driver_helper, any direct consumer), and there
+ * both pointers stayed NULL: mono_ms() returned 0 forever, send_all()'s deadline
+ * (0 + 60) could never expire, and against a peer that never drains the EAGAIN
+ * branch polled POLLOUT in an INFINITE 20 ms loop -- the stalled-receiver-thread
+ * class this shim must make impossible.  So the clock resolves lazily here (dlsym
+ * is thread-safe, this runs once) and send_all() additionally bounds its poll
+ * iterations.  The NO CLOCK line stays: a silently-disabled timer is still the
  * worst outcome and must be visible. */
 static u64 mono_ms(void)
 {
@@ -2673,11 +2445,11 @@ static u64 mono_ms(void)
 }
 
 /* ==========================================================================
- * PERIODIC RECOVERY POINTS -- THE MISSING INGREDIENT OF THE CLUSTER PICTURE
- * (2026-10-27, measured)
+ * PERIODIC RECOVERY POINTS -- the ingredient the cluster picture was missing
+ * (2026-10-27, measured).
  *
- * Every H.264 stream this cluster ECU sustains carries a recovery point at a
- * fixed short cadence, and the phone's does not:
+ * Every H.264 stream this ECU sustains carries a recovery point at a fixed short
+ * cadence, and the phone's does not:
  *
  *   stream                              IDRs                 cadence      held?
  *   the car's own nav (multi-screen-   17 of 81 AUs          every 5 AUs  yes
@@ -2688,23 +2460,15 @@ static u64 mono_ms(void)
  *     (w7.bin, 2026-10-27 field run)                          + our own      then the
  *                                                             start-request  placeholder)
  *
- * So the picture appeared and then fell back not because of framing, pacing,
- * SPS, profile or rate -- all of those were measured and eliminated -- but
- * because after the first ~0.5 s the ECU had no keyframe to decode from.  It is
- * exactly the interval the other MHI2 implementation tunes: their "40 FPS
- * display optimisation" for the 791 cluster is a two-byte change from a forced
- * IDR every 20 frames to every 5 (core.so offsets 0x4370/0x452c), and their
- * bridge requests a fresh IDR on latency recovery.
+ * So the picture appeared and fell back not on framing, pacing, SPS, profile or
+ * rate -- all measured and eliminated -- but because after ~0.5 s the ECU had no
+ * keyframe to decode from.  The verb exists: forceKeyFrame{params:{uuid}} (rc=0
+ * measured, answered in ~3 access units).  What was missing is the CADENCE -- it
+ * used to fire once, at stream-start / first-IDR / helper-connect.
  *
- * We already have the verb: forceKeyFrame{params:{uuid}} (rc=0 measured, and it
- * is answered in ~3 access units -- w7.bin shows the second IDR at AU index 3
- * from the requests we sent at stream start).  What was missing is the CADENCE:
- * today it fires only at stream-start / first-IDR / helper-connect, i.e. once.
- *
- * MIB3_SHIM_IDR_MS sets the target interval (default 500 ms == the car's own
- * 10 fps/5-frame cadence; 0 disables it).  A request is only sent while video
- * is actually flowing and only while no IDR has arrived inside the interval, so
- * a phone that honours it costs one command per interval and nothing else.
+ * MIB3_SHIM_IDR_MS sets the interval (default 500 ms == the car's own 10 fps /
+ * 5-frame cadence; 0 disables).  A request goes only while video is flowing and
+ * only while no IDR has arrived inside the interval.
  */
 static u64  g_kf_seen_ms;      /* when the last IDR ARRIVED (0 = none yet) */
 static u64  g_kf_req_ms;       /* when we last ASKED */
@@ -2742,16 +2506,14 @@ static void cluster_idr_pump(void *session)
   cluster_showui_retry(session);
   if (!g_kf_seen_ms) return;                       /* the start sequence owns the first one */
   /* THE PUMP IS LOAD-BEARING -- DO NOT REMOVE IT AGAIN (2026-10-30, field).
-   * Removing this timer for "encoder load" reasons produced exactly the
-   * pre-2026-10-27 defect on the glass: the cluster rendered the first frame
-   * and then NOTHING except one frame when a scene edge happened to fire a
-   * keyframe.  The ECU's map app advances on recovery points; every stream it
-   * has ever decoded carries one every ~5 access units (the car's own nav:
-   * 500 ms at 10 fps).  Measured in the broken build: periodic=0, scene-edge=2
-   * -> first frame + one update at guidance end.  Keep 500 ms.
-   * The real cost of this pump is the phone's 65 KB IDRs; that is a phone-side
-   * encoder property to investigate separately, not a reason to starve the
-   * receiver of the only signal it presents on. */
+   * Removing this timer produced the pre-2026-10-27 defect on the glass: the
+   * cluster rendered the first frame and then NOTHING but one frame when a scene
+   * edge happened to fire a keyframe (measured in the broken build: periodic=0,
+   * scene-edge=2 -> first frame + one update at guidance end).  The ECU's map app
+   * advances on recovery points; every stream it has ever decoded carries one
+   * every ~5 access units.  Keep 500 ms.  The real cost of this pump is the
+   * phone's 65 KB IDRs -- a phone-side encoder property to investigate separately,
+   * not a reason to starve the receiver of the only signal it presents on. */
   int iv = (int)env_num("MIB3_SHIM_IDR_MS", 500);
   if (iv <= 0) return;
   u64 now = mono_ms();
@@ -2803,14 +2565,13 @@ static void cluster_send_nightmode(void *session)
   if (p_CFRelease) p_CFRelease(p);
 }
 
-/* CONFIG-FLAG OBSERVATION — LOG ONLY, NEVER A SIGNAL (2026-10-29).
- * The opcode-1 screen-state byte was hypothesised to carry day/night and it
- * does NOT: it flips thousands of times per session (22<->86 in a measured
- * run).  Wiring it into the theme produced 198 synchronous setNightMode
- * commands on the video thread -- the worst lag this project has measured.
- * So it is now purely diagnostic: a rate-limited delta line (at most one per
- * 5 s, with a per-session counter logged at stream close).  Nothing in this
- * shim consumes the value. */
+/* CONFIG-FLAG OBSERVATION -- LOG ONLY, NEVER A SIGNAL.
+ * The opcode-1 screen-state byte was hypothesised to carry day/night and does NOT:
+ * it flips thousands of times per session (22<->86 in a measured run).  Wiring it
+ * into the theme produced 198 synchronous setNightMode commands on the video thread
+ * -- the worst lag this project has measured.  Diagnostic only, therefore: a
+ * rate-limited delta line (at most one per 5 s, plus a per-session counter at
+ * stream close).  Nothing in this shim consumes the value. */
 static void night_flag_update(unsigned char flags, const char *tag)
 {
   static signed char prev = -1;
@@ -2828,30 +2589,26 @@ static void night_flag_update(unsigned char flags, const char *tag)
 }
 
 /* ==========================================================================
- * UPDATE VIEW AREA (2026-10-19, view-area lane) -- THE KEY ITEM.
+ * UPDATE VIEW AREA -- the command that re-frames the cluster scene.
  *
- * The cluster's VIEW button changes the layout the ECU paints, but nothing tells
- * the phone, so Apple Maps keeps rendering into the whole panel and the gauges
- * cover it.  This ships the CarPlay command that re-frames the cluster scene:
+ * The VIEW button changes the layout the ECU paints, but nothing tells the phone,
+ * so Apple Maps keeps rendering into the whole panel.  This ships:
  *
  *   {type:"updateViewArea",
  *    params:{uuid, viewAreaIndex, animationDurationMillis, adjacentViewAreas}}
  *
- * `adjacentViewAreas` MUST ALWAYS BE PRESENT (rgi, verified against the stock
- * MHI3 AirPlayReceiverSessionViewAreaUpdate): [] when the FULL-screen area is
- * current, [0] when a smaller area is current.  iOS keeps
- * CARScreenInfo.adjacentViewArea SEPARATE from currentViewArea, so omitting the
- * key is observably different from sending an empty array.
+ * `adjacentViewAreas` MUST ALWAYS BE PRESENT (rgi, verified against the stock MHI3
+ * AirPlayReceiverSessionViewAreaUpdate): [] when the FULL-screen area is current,
+ * [0] when a smaller area is.  iOS keeps CARScreenInfo.adjacentViewArea SEPARATE
+ * from currentViewArea, so omitting the key differs from sending an empty array.
  *
- * The phone bounds-checks viewAreaIndex against the viewAreas we declared in
- * /info (carEndpoint_validateViewAreaParams: "viewAreaIndex < viewAreas.count"),
- * which is why declaring the areas (va_build) must land first.
+ * The phone bounds-checks viewAreaIndex against the viewAreas declared in /info
+ * (carEndpoint_validateViewAreaParams: "viewAreaIndex < viewAreas.count"), so
+ * va_build() must land first.
  *
- * GATES: MIB3_SHIM_VIEWAREAS=1 (we declared them) AND MIB3_SHIM_CMDS=1 (commands
- * are on) AND MIB3_SHIM_VA_CMD=1 (this one specifically).  A refused or ignored
- * switch is a LOGGED NO-OP: g_va_current is only updated when the phone's
- * completion says status 0 -- so a failure can never strand the display in a
- * state we believe we are in but the phone is not.
+ * GATES: MIB3_SHIM_VIEWAREAS=1 AND MIB3_SHIM_CMDS=1 AND MIB3_SHIM_VA_CMD=1.  A
+ * refused switch is a LOGGED NO-OP: g_va_current moves only on a status-0
+ * completion, so a failure cannot strand the display in a state we believe in.
  * ========================================================================*/
 static int cluster_send_viewarea(void *session, int index, int dur_ms, const char *why)
 {
@@ -2902,26 +2659,23 @@ static int cluster_send_viewarea(void *session, int index, int dur_ms, const cha
 }
 
 /* ==========================================================================
- * APPEARANCE (2026-10-19, view-area lane).
+ * APPEARANCE -- per-surface, finer grained than setNightMode.
  *
  *   {type:"mapAppearanceUpdate"|"uiAppearanceUpdate",
  *    params:{uuid, appearanceMode, appearanceSetting}}
  *
- * Per-SURFACE appearance: finer grained than setNightMode, which is one mode for
- * the whole session.  rgi ships exactly this pair (altscreen_hook.c:2678-2683)
- * with a [target][mode][setting] triple where target 0 = UI, 1 = map.
+ * rgi ships exactly this pair (altscreen_hook.c:2678-2683) with a
+ * [target][mode][setting] triple where target 0 = UI, 1 = map.
  *
  * KNOBS: MIB3_SHIM_APPEARANCE=1 arms it; MIB3_SHIM_APPMODE / MIB3_SHIM_APPSETTING
- * give the pair; MIB3_SHIM_APPTARGET=map|ui picks which command.  Nothing is
- * sent unless APPEARANCE is on, so the shipped default is unchanged.  Driven at
- * runtime by the control-inbox line `a <map|ui> <mode> <setting>`.
+ * give the pair; MIB3_SHIM_APPTARGET=map|ui picks the command.  Nothing is sent
+ * unless APPEARANCE is on, so the shipped default is unchanged.  At runtime the
+ * control-inbox line `a <map|ui> <mode> <setting>` drives it.
  *
- * "Drive from the car's theme where possible": NOT POSSIBLE YET -- the only
- * theme-ish signal we already have is g_night_mode (from setNightMode), and
- * there is no shipped RSI/viwi service that publishes the cluster's appearance
- * (see the lane doc, problem A).  dayNight IS exposed on
- * viwi.service.hmiintegration (port 49506, service `hmiintegration`), which is
- * the honest candidate for a future auto-drive; it is not wired here.
+ * NOT driven from the car's theme: the only theme-ish signal is g_night_mode, and
+ * no shipped RSI/viwi service publishes the cluster's appearance.  dayNight IS
+ * exposed on viwi.service.hmiintegration (port 49506) -- the honest candidate for
+ * a future auto-drive, deliberately not wired here.
  * ========================================================================*/
 static void cluster_send_appearance(void *session, int is_map, int mode, int setting)
 {
@@ -2952,32 +2706,29 @@ static void cluster_send_appearance_armed(void *session)
 }
 
 /* ==========================================================================
- * ZOOM: the STEERING-WHEEL up/down mirror (2026-10-18).
+ * ZOOM: the STEERING-WHEEL up/down mirror (LANE_CLUSTER_ZOOM_2026-10-18.md).
  *
- * WHY THIS EXISTS (see LANE_CLUSTER_ZOOM_2026-10-18.md):
- * The wheel roller does NOT reach CarPlay.  On this unit it goes
+ * The wheel roller does NOT reach CarPlay.  It goes
  *   cluster (CAN MFL) -> BAP NavigationSd MapScale SetGet -> navsd_app
  *   -> POST {relativeSteps} to /maprenderer/discreteInputs/<renderer>
  *   -> the CAR'S OWN nav zooms -> navsd reports BAP MapScale Status -> the
  *   cluster paints its own scale OSD.
  * Our video replaces the nav's map, so the wheel moved a map nobody sees.
  *
- * The fix is the CarPlay cluster API for exactly this: send
+ * The CarPlay cluster API for exactly this:
  *   changeMapZoomLevel {uuid: <cluster display uuid>, zoomDirection: 0|1}
  * (0 = zoom IN, non-zero = zoom OUT -- rgi command revert + DashBoard's
- * CRSUIClusterZoomAction).  The phone routes it to the cluster scene, Apple
- * Maps zooms.
+ * CRSUIClusterZoomAction).
  *
- * WHERE THE STEPS COME FROM: the external tool `mib3wheel` (shim/tools/
- * mib3wheel.c) watches the unit's own maprenderer RSI and writes "+1"/"-1"
- * lines into an AF_UNIX socket we own.  This module is the receiving end.
+ * The steps come from the external tool `mib3wheel` (shim/tools/mib3wheel.c),
+ * which watches the unit's own maprenderer RSI and writes "+1"/"-1" lines into an
+ * AF_UNIX socket we own; this module is the receiving end.
  *
- * WHY A MAILBOX INSTEAD OF SENDING FROM THE LISTENER THREAD: the listener
- * would have to hold the session pointer, i.e. it could send into a torn-down
- * session (a use-after-free inside carplay => reboot).  Instead the listener
- * only QUEUES the step and the CLUSTER THREAD -- which already owns a valid
- * session for the length of that stream -- drains the queue and ships.  No new
- * lifetime contract, no lock.
+ * WHY A MAILBOX AND NOT A SEND FROM THE LISTENER THREAD: the listener would hold
+ * the session pointer, so it could send into a torn-down session (use-after-free
+ * inside carplay => reboot).  The listener only QUEUES; the CLUSTER THREAD, which
+ * already owns a valid session for the length of the stream, drains and ships.
+ * No new lifetime contract, no lock.
  * ========================================================================*/
 #define ZOOM_Q 16
 static volatile int g_zoom_q[ZOOM_Q];
@@ -3019,15 +2770,16 @@ static void cluster_send_zoom(void *session, int dir_in)
  * Never sends anything itself (see the mailbox note above).  It runs for the
  * life of the process; a reboot is the undo. */
 /* ---- the control inbox's line grammar -------------------------------------
- * ONE socket carries two logical channels, so a single small tool can drive
- * both without a second listener/thread:
+ * ONE socket carries three logical channels, so a single small tool can drive all
+ * of them without a second listener/thread:
  *   +1 | 1 | in      zoom in        (queued, shipped by the cluster thread)
  *   -1 | out         zoom out
  *   v<N> | view <N>  switch to view-area index N
  *   next | prev      step the view-area index (wrapping over MIB3_SHIM_VA_COUNT)
- * An unknown line is LOGGED and ignored -- never acted on.  Lines are parsed
- * from a small accumulator so a streamed client ("+1-1" with no separators)
- * behaves exactly as it did before this change. */
+ *   a <map|ui> <mode> <setting>   appearance update
+ * An unknown line is LOGGED and ignored -- never acted on.  Lines are parsed from
+ * a small accumulator so a streamed client ("+1-1" with no separators) behaves
+ * exactly as it did before this change. */
 #define VA_Q 8
 static volatile int g_va_q[VA_Q];
 static volatile int g_va_qw, g_va_qr, g_va_qdrop;
@@ -3433,22 +3185,16 @@ static void *cluster_thread(void *arg){
   extern int accept(int, void*, unsigned int*);
   logkv("cluster/thread","listening fd",(u64)(u32)c->lsock,0);
   logline("cluster/thread","waiting for the phone to connect");
-  /* ---- LISTENER OWNERSHIP (stability, 2026-10-18) -------------------------
-   * The old code did ONE blocking accept() with no timeout.  If the phone never
-   * opened the type-111 stream for this session (it aborted the stream, or its
-   * SYN was dropped), this thread stayed in accept() forever and the listener
-   * kept port 5000 bound for the life of the process.  The NEXT type-111 SETUP
-   * then failed to bind 5000 (SO_REUSEADDR does not permit a second live
-   * listener) and own_listen() fell through to 6031 -- a port the unit's own
-   * firewall drops for the phone's interface (lge/app_ro/network: only
-   * "-i ncm0 --dport 5000:5001/6030/7000" are allowed).  The phone would then
-   * dial a black hole that WE advertised: the documented libairplay outcome is
-   * "the phone gave up on an advertised but unserviced cluster" (-6722/-6753,
-   * 23 s sessions).  refs/rgi hit the same class and fixed it the same way
-   * (SESSION_LIFECYCLE.md defect 4: "infinite 111 accept ... later 111 SETUP
-   * fails -6728" -> one-second accept tick rechecking the stop flag).
-   * So: accept with a short tick, and abandon the listener as soon as a newer
-   * SETUP has superseded it (g_lsock no longer points at our fd). */
+  /* ---- LISTENER OWNERSHIP -------------------------------------------------
+   * The old code did ONE blocking accept() with no timeout: if the phone never
+   * opened the type-111 stream for this session (it aborted, or its SYN was
+   * dropped) the thread sat in accept() forever and kept port 5000 bound for the
+   * life of the process.  The NEXT SETUP then could not bind 5000 (SO_REUSEADDR
+   * does not permit a second live listener), own_listen() fell through to 6031 --
+   * which the firewall drops -- and the phone dialled a black hole WE had
+   * advertised (-6722/-6753, 23 s sessions).  rgi hit the same class and fixed it
+   * the same way (SESSION_LIFECYCLE.md defect 4).  So: accept on a short tick, and
+   * abandon the listener as soon as a newer SETUP has superseded it. */
   while (c->lsock >= 0 && connfd < 0){
     struct pollfd { int fd; short events; short revents; } pfd;
     extern int poll(void*, unsigned long, int);
@@ -3633,30 +3379,25 @@ static void *cluster_thread(void *arg){
                     cluster_send_appearance_armed(c->session);   /* no-op unless MIB3_SHIM_APPEARANCE=1 */
                   }
                 }
-                /* The receiver hands us SLICES ONLY -- the parameter sets arrive
-                 * out of band (the opcode-1 avcC record handled above) and are
-                 * NOT present in the media AUs.  A decoder fed bare slices with
-                 * no SPS/PPS decodes nothing; it conceals to flat black (that is
-                 * exactly the "decodes but the surface is black" symptom).  So
-                 * stamp the SPS/PPS onto EVERY AU: ~32 bytes, and it makes each
-                 * AU self-contained, which also makes the helper robust across
-                 * reconnects. */
+                /* The receiver hands us SLICES ONLY -- the parameter sets arrive out
+                 * of band (the opcode-1 avcC record above) and are NOT in the media
+                 * AUs.  A decoder fed bare slices decodes nothing and conceals to
+                 * flat black ("decodes but the surface is black"), so stamp
+                 * SPS/PPS onto EVERY AU: ~32 bytes, each AU self-contained, which
+                 * also makes the helper robust across reconnects. */
                 if (g_cl_cfg_len > 0) sink_feed(g_cl_cfg_annexb, g_cl_cfg_len, 0);
                 { int was_conn = mib3shim_helper_connected();
                   if (sink_feed(rbuf, (unsigned long)pl, 0) == 0) g_au_fed++;
                   /* A freshly (re)connected helper has no reference frames, so
                    * ask the phone for a keyframe and a real IDR will follow. */
                   if (!was_conn && mib3shim_helper_connected()){
-                    /* UNCONDITIONAL -- this is the one request that must never be
+                    /* UNCONDITIONAL -- the one request that must never be
                      * rate-limited.  It fires at most once per helper connection
-                     * (guarded by !was_conn), and it is what makes a freshly
-                     * attached decoder start on an IDR instead of mid-GOP.
-                     * The storm limiter added on 2026-10-18 suppressed it whenever
-                     * a stream-start request was <5 s old -- i.e. on every
-                     * reconnect.  Measured 2026-10-19: forceKeyFrame rc=0 at
-                     * stream-start, then "rate-limited (s since last)=1" for
-                     * helper-connect, decoder got 77 P-slices, qdrop=279, frozen.
-                     * The 2026-10-18 working build sent it unconditionally. */
+                     * (guarded by !was_conn) and is what makes a freshly attached
+                     * decoder start on an IDR instead of mid-GOP.  The 2026-10-18
+                     * storm limiter suppressed it on every reconnect (measured
+                     * 2026-10-19: rc=0 at stream-start, then "rate-limited (s since
+                     * last)=1", decoder got 77 P-slices, qdrop=279, frozen). */
                     cluster_send_forcekeyframe(c->session, "helper-connect"); } }
               } else logline("cluster/thread","malformed AU (avcc_prepare) -- dropped");
             }
@@ -3669,44 +3410,33 @@ static void *cluster_thread(void *arg){
               logkv("cluster/thread","body",(u64)bs,0);
               logkv("cluster/thread","plain",(u64)pl,0);
               logline("cluster/thread/plain-head", hs);   /* want 00000001 (Annex-B NAL) */
-              /* the helper-hop totals on the same marker (2026-10-26): the
-               * DECODER prints its own counters (parse/ausz/kdrop/qdrop/awt)
-               * -- diffing `sent total` here against `ausz` there, per window,
-               * is the ONLY way to see AUs lost between the two processes.
-               * `dropped total` must stay 0 in a healthy session; any nonzero
-               * value here with qdrop=0 there is the artifact mechanism
-               * hiding in plain sight. */
-              /* TIMESTAMPED HEARTBEAT (2026-10-29 logging audit): these numbers
-               * used to appear with no time reference, and "helper sent total"
-               * counts RECORDS (2 per video AU: cfg + frame), which was misread
-               * as AUs and produced a bogus 2x rate error for a whole session.
-               * From here on every rate is derivable from one line. */
+              /* the helper-hop totals on the same marker: the DECODER prints its
+               * own counters (parse/ausz/kdrop/qdrop/awt), so diffing `sent total`
+               * here against `ausz` there, per window, is the ONLY way to see AUs
+               * lost between the two processes.  `dropped total` must stay 0 in a
+               * healthy session.
+               * TIMESTAMPED because an untimed copy of these numbers was misread
+               * for a whole session: `sent total` counts RECORDS (~2 per video
+               * AU: cfg + frame), which produced a bogus 2x rate error. */
               logkv("cluster/thread","hb ms",mono_ms(),0);
               logkv("cluster/thread","helper sent total (RECORDS; ~2/AU)",(u64)hlp_sent,0);
               logkv("cluster/thread","helper AUs total",g_au_fed,0);
               logkv("cluster/thread","helper dropped total",(u64)hlp_drop,0);
             }
           } else {
-            others++;   /* opcodes 2/4/5: keepalive/misc -- previously ignored.
-                         * Navigation start drops the whole session, and control
-                         * traffic is the prime suspect, so LOG ALL OF IT.
-                         *
-                         * NAMED 2026-10-19 (view-area lane) from the SHIPPED
-                         * binary -- corpus libAirPlay.so decompiled.c
-                         * AirPlayReceiverSessionScreen_ProcessFrames (0x11fbf0):
+            others++;   /* opcodes 2/4/5: keepalive/misc.  NAMED 2026-10-19 from the
+                         * SHIPPED binary (corpus libAirPlay decompiled.c
+                         * AirPlayReceiverSessionScreen_ProcessFrames 0x11fbf0):
                          *   opcode 0 -> video AU (decrypt, ScreenStreamProcessData)
                          *   opcode 1 -> avcC + SetWidthHeight + SetAVCC
-                         *   opcode 2 -> goto "done" (local_dc = 0) SILENTLY
-                         *   opcode 4 -> same  ((byte)(op-4) < 2)
-                         *   opcode 5 -> same
+                         *   opcode 2/4/5 -> goto "done" (local_dc = 0) SILENTLY
                          *   anything else -> "### Unknown screen opcode: %u" + -6727
-                         * So 2/4/5 are INERT BY CONSTRUCTION: the unit's own
-                         * receiver discards them with no error and no state
-                         * change.  They are not a hidden control channel.
-                         * NOTE: requestUI is NOT a screen opcode at all -- it is
-                         * an RTSP /command type on the phone->host direction
-                         * (LIVI stack.rs:1604, PlayPort AirPlaySession.kt:541);
-                         * see the lane doc for why no seam reaches it today. */
+                         * So 2/4/5 are INERT BY CONSTRUCTION: no error, no state
+                         * change, not a hidden control channel.  (requestUI is not a
+                         * screen opcode at all -- it is an RTSP /command type,
+                         * LIVI stack.rs:1604, PlayPort AirPlaySession.kt:541.)
+                         * Logged anyway: navigation start drops the whole session
+                         * and control traffic is the prime suspect. */
             { const char *H = "0123456789abcdef"; int k; char hs[96]; char bh[192];
               unsigned lim = 48, bl = (bs < 64u) ? (unsigned)bs : 64u;
               for (k = 0; k < (int)lim; k++){ unsigned char cc = hdr[k]; hs[k*2] = H[cc>>4]; hs[k*2+1] = H[cc&15]; }
@@ -3733,13 +3463,13 @@ static void *cluster_thread(void *arg){
       logkv("cluster/thread","other-opcodes",(u64)others,0);
       if (p_free && rbuf) p_free(rbuf);
       logline("cluster/thread","stream closed");
-      /* TELL THE DECODER THE STREAM IS OVER.  Nothing downstream can see the
-       * phone hang up otherwise: the AU socket stays open, so v4l2_seq's read()
-       * never returns 0, it keeps running, and the presenter keeps re-committing
-       * its LAST frame -- which is exactly why the cluster shows a map of a road
-       * that no longer exists, forever (LANE_CLUSTER_TRANSITION_2026-10-18).
-       * Closing the helper socket IS the EOF the decoder already handles
-       * (`online: shim gone` -> re-accept), so no decoder change is needed.
+      /* TELL THE DECODER THE STREAM IS OVER.  Nothing downstream sees the phone
+       * hang up otherwise: the AU socket stays open, the decoder's read() never
+       * returns 0, it keeps running and re-commits its LAST frame -- which is
+       * exactly why the cluster shows a map of a road that no longer exists,
+       * forever (LANE_CLUSTER_TRANSITION_2026-10-18).  Closing the helper socket
+       * IS the EOF the decoder already handles (`online: shim gone` -> re-accept),
+       * so no decoder change is needed.
        * GUARD: only the NEWEST cluster thread may close it -- an older session's
        * thread exiting must not tear down a newer session's AU channel (the unit
        * measured 8 connects / 7 disconnects in one run). */
@@ -3757,18 +3487,16 @@ static void *cluster_thread(void *arg){
   return 0;
 }
 
-/* ---- our own listener (exactly what LIVI and PlayPort do, plus the port
- * chain the unit's own FIREWALL forces -- see the redteam block above).
- * Both working receivers bind a WILDCARD TCP listener and advertise whatever
- * port it got.  On THIS unit the phone-facing interfaces (ncm0 for wired USB,
- * wlap* for wireless) have an iptables/ip6tables default-DENY allowlist whose
- * only carplay TCP ports are 5000:5001 / 6030 / 7000 (lge/app_ro/network's
- * embedded template, section "## carplay for ncm0 (usb interface)").  The
- * stock event listener owns 5001 and the stock screen owns 6030, so the only
- * firewall-legal free port is 5000.  6031 (the MHI3-native alt port) and any
- * ephemeral port are DROPPED by the firewall -- the phone's SYN never arrives
- * -- so they are fallbacks that require live_kit/cluster_port_fw.sh to insert
- * the RAM-only allow rule first. */
+/* ---- our own listener (exactly what LIVI and PlayPort do), plus the port chain
+ * the unit's own FIREWALL forces.  Both working receivers bind a WILDCARD TCP
+ * listener and advertise whatever port it got; on THIS unit the phone-facing
+ * interfaces (ncm0 wired, wlap* wireless) have an iptables/ip6tables default-DENY
+ * allowlist whose only carplay TCP ports are 5000:5001 / 6030 / 7000
+ * (lge/app_ro/network, section "## carplay for ncm0 (usb interface)").  The stock
+ * event listener owns 5001 and the stock screen owns 6030, so 5000 is the only
+ * firewall-legal free port.  6031 (the MHI3-native alt port) and any ephemeral
+ * port are DROPPED -- the phone's SYN never arrives -- so they are fallbacks that
+ * need live_kit/cluster_port_fw.sh first. */
 static int own_listen(int *out_port, int *out_gen){
   extern int socket(int, int, int);
   extern int setsockopt(int, int, int, const void*, unsigned int);
@@ -3792,12 +3520,10 @@ static int own_listen(int *out_port, int *out_gen){
   chain[nc++] = 5000;
   chain[nc++] = 6031;
   chain[nc++] = 0;   /* ephemeral */
-  /* SUPERSEDE THE PREVIOUS LISTENER FIRST (stability, 2026-10-18).
-   * A listener left over from an earlier type-111 SETUP holds 5000, and
-   * SO_REUSEADDR does NOT permit a second live listener on the same port, so
-   * without this the bind would fail and we would fall through to 6031 -- a
-   * port the phone cannot reach (see the listener-ownership note in
-   * cluster_thread).  Closing it here also unsticks the old thread's poll. */
+  /* SUPERSEDE THE PREVIOUS LISTENER FIRST: a listener left over from an earlier
+   * type-111 SETUP holds 5000, SO_REUSEADDR does not permit a second live
+   * listener, and the bind would fall through to the firewall-dropped 6031.
+   * Closing it here also unsticks the old thread's poll. */
   if (g_lsock >= 0){
     int old = g_lsock; g_lsock = -1; g_lsock_gen++; close(old);
     logkv("cluster/listen","superseded old listener fd",(u64)(u32)old,0);
@@ -3842,11 +3568,10 @@ static int own_listen(int *out_port, int *out_gen){
  * {type:111, dataPort} to response["streams"].  Returns 0 on success. */
 static int cluster_setup(void *session, void *streamDict, void *response){
   if (!session || !streamDict || !response){ logline("cluster","bad args"); return -1; }
-  /* SELF-CONTAINED RECEIVER -- no stock ScreenStream.
-   * A stock alt screen binds the MAIN display and starts a second in-dio OMX
-   * decoder on this unit: black main screen + decoder crash (the reference
-   * receiver luka-dev/mib2q-carplay-rgi hit the identical wall and abandoned the
-   * stock screen entirely).  So we own the listener and service the stream
+  /* SELF-CONTAINED RECEIVER -- no stock ScreenStream.  A stock alt screen binds the
+   * MAIN display and starts a second in-dio OMX decoder on this unit: black main
+   * screen + decoder crash (the rgi reference hit the identical wall and abandoned
+   * the stock screen entirely).  So we own the listener and service the stream
    * ourselves; nothing here touches the unit's screen/stream machinery. */
   long connID = (long)dgeti64k((CFDictionaryRef)streamDict, "streamConnectionID", 0);
   logkv("cluster","streamConnectionID",(u64)connID,0);
@@ -3919,16 +3644,12 @@ static int cluster_setup(void *session, void *streamDict, void *response){
     }
   }
 
-  /* ROUTE-B sink.* THE SINK IS **DEFERRED** TO THE RECEIVER THREAD (see
-   * cluster_thread -> sink_start) and is NOT created here.
-   *
-   * Doing display-pipeline work inside THIS seam (the CarPlay SETUP path) is
-   * exactly what blacked the centre screen and reset the unit on 2026-10-16:
-   * a blocking/rupturing Cinemo or EGL call here stalls CarPlay session setup,
-   * and carplay.service is FailureAction=reboot-immediate.  The setup seam must
-   * return the response immediately and touch nothing.  So we only RESOLVE the
-   * mode here (and log it); the actual sink stands up on our own thread after
-   * the phone connects.  See the SINK DISPATCHER comment for the modes. */
+  /* ROUTE-B sink: THE SINK IS DEFERRED TO THE RECEIVER THREAD (cluster_thread ->
+   * sink_start) and is NOT created here.  Display-pipeline work inside this seam
+   * -- the CarPlay SETUP path -- is exactly what blacked the centre screen and
+   * reset the unit on 2026-10-16: a blocking Cinemo or EGL call here stalls
+   * session setup and carplay.service is FailureAction=reboot-immediate.  So this
+   * only RESOLVES the mode and logs it. */
   sink_resolve();
   { char m[96]; buf b = { m, sizeof(m)-2, 0 };
     bs(&b,"mode="); bu64(&b,(u64)(u32)g_sink,10,0);
@@ -4028,18 +3749,12 @@ static void run_banner(void){
   /* The frame-rate CEILING we advertise for the cluster, and whether the phone's
    * own telemetry will be recorded.  Both are on the banner because both were
    * invisible knobs in a session that needed them: FPS decides what the phone
-   * will encode at (the leading suspect for the remaining cluster defect) and
-   * CTL5 is the only channel that reports the rate it actually achieved.
+   * encodes at, CTL5 is the only channel reporting the rate it actually achieved.
    *
-   * DEFAULT 15 (2026-10-29, measured): the phone uses maxFPS as its RATE, not a
-   * ceiling -- at 60 its own telemetry showed encoderCurrentFPS pinned at 60,
-   * encoderDropFPS 16-88/s, queuedFramesAvg 18-22 (~0.3-1 s of standing queue)
-   * and sinkOverflowDropFPS 21-54; at 15 the SAME phone, same session, read
-   * queue 8-13 and zero overflow (data/PATHB_20261029/FINDINGS_20261029.md S1).
-   * 15 also sits at the ECU's own design point: the car's nav stream is 10 fps,
-   * and multi-screen-server's encoder (the reference implementation this ECU
-   * was built around) feeds 10 fps.  MIB3_SHIM_FPS=60 restores the old
-   * behaviour for A/B on the next trip. */
+   * DEFAULT 60 (2026-10-30, re-measured).  The phone uses maxFPS as its RATE, not
+   * a ceiling: at FPS=30 it delivered 14.61 fps, at FPS=60 it delivered 26.60 fps
+   * with wire peak 53 dgrams per 25 ms (the car's own 61), RTP loss 0, lossAvg ~0,
+   * no artifacts, rttAvg 3 ms.  MIB3_SHIM_FPS=30 restores the previous value. */
   bs(&b,"  FPS="); bu64(&b,(u64)(u32)env_num("MIB3_SHIM_FPS",60),10,0);
   ctl5_resolve();
   bs(&b,"  CTL5="); bu64(&b,(u64)(u32)(ctl5_want > 0 ? 1 : 0),10,0);
@@ -4105,13 +3820,8 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
   logkv("AddScreenDisplay","ADD_env",(u64)(u32)env_on("MIB3_SHIM_ADD",1),1);
   logkv("AddScreenDisplay","gate",(u64)(u32)gate_active(),1);
 
-  /* 2) advertise the cluster for THIS display list, after the main display.
-   *    RUNTIME GATE: only when the stick marker is present (gate_active()).
-   *    IDEMPOTENT PER LIST (not one-shot per process): add the cluster iff the
-   *    list does not already carry a type-111 entry.  LG rebuilds `displays`
-   *    every session, so the old one-shot latch meant only the FIRST phone plug
-   *    after injection advertised -- later plugs still claimed altScreen with
-   *    one display (contradiction -> session killed). */
+  /* 2) advertise the cluster for THIS display list, after the main display,
+   *    gated on the stick marker.  Per-LIST idempotent -- see array_has_cluster. */
   if (rc == 0 && env_on("MIB3_SHIM_ADD",1) && gate_active()) {
     if (array_has_cluster(inArray)) {
       g_cluster_advertised = 1;   /* present this session -> keep the claim consistent */
@@ -4139,37 +3849,27 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
     chph = gm.phy_h;
     cfps = (int)env_num("MIB3_SHIM_FPS", 60);  /* DEFAULT 60 (2026-10-30, re-measured).
                                                  *
-                                                 * This was 15, chosen on 2026-10-29 because
-                                                 * the phone's telemetry showed "queue 8-13"
-                                                 * at 15 against "18-22" at 60.  THAT
-                                                 * COMPARISON WAS A UNITS ERROR: the field is
-                                                 * queuedFramesAvg, i.e. FRAMES, so 8-13
-                                                 * frames at 15 fps is 530-870 ms of delay
-                                                 * while 17 frames at 60 fps is 283 ms.  The
-                                                 * higher rate had the SHORTER queue all
-                                                 * along.
+                                                 * It was 15 for a day because the phone's
+                                                 * telemetry read "queue 8-13" at 15 against
+                                                 * "18-22" at 60 -- a UNITS ERROR: the field is
+                                                 * queuedFramesAvg, i.e. FRAMES, so 8-13 frames
+                                                 * at 15 fps is 530-870 ms of delay while 17
+                                                 * frames at 60 fps is 283 ms.  The higher rate
+                                                 * had the SHORTER queue all along.
                                                  *
-                                                 * Measured on 2026-10-30 with the paced
-                                                 * sender: delivered 14.61 fps at FPS=30 vs
-                                                 * 26.60 fps at FPS=60, wire peak 53 dgrams
-                                                 * per 25 ms (car's own 61), RTP loss 0, no
-                                                 * artifacts, lossAvg ~0, rttAvg 3 ms.
+                                                 * Measured 2026-10-30 with the paced sender:
+                                                 * 14.61 fps at FPS=30 vs 26.60 fps at FPS=60,
+                                                 * wire peak 53 dgrams per 25 ms (car's own 61),
+                                                 * RTP loss 0, no artifacts, rttAvg 3 ms.
                                                  *
-                                                 * 15 was also justified as sitting at the ECU's
-                                                 * design point (the car's own nav stream is
-                                                 * 10 fps; MS-S's encoder feeds 10 fps; the
-                                                 * MHI2 reference's native encoder feed
-                                                 * measured 10.000 fps).  The old "60" note
-                                                 * (rgi's bandwidth ladder maps avgTx to
-                                                 * 10/20/30/60 then clamps to maxFPS, and the
-                                                 * WIRED branch uses maxFPS directly) still
-                                                 * describes the MECHANISM -- what it got
-                                                 * wrong was the value: a high ceiling is
-                                                 * only harmless when the unit re-encodes at
-                                                 * its own pace (MHI2's path); Path B hands
-                                                 * the phone's stream to the ECU unchanged,
-                                                 * so the phone's queue pathology lands on
-                                                 * the glass.  MIB3_SHIM_FPS=60 restores it. */
+                                                 * The MECHANISM was never wrong (rgi's bandwidth
+                                                 * ladder maps avgTx to 10/20/30/60, then clamps
+                                                 * to maxFPS; the WIRED branch uses maxFPS
+                                                 * directly): a high ceiling is harmless only
+                                                 * when something re-encodes at its own pace.
+                                                 * Path B hands the phone's stream to the ECU
+                                                 * unchanged, so the phone's queue lands on the
+                                                 * glass. */
     logline("AddScreenDisplay","ADDING cluster display");
     log_uuid("AddScreenDisplay/cluster-uuid", cu);
     logkv("AddScreenDisplay","cluster widthPixels",(u64)(u32)cw,0);
@@ -4255,32 +3955,26 @@ int AirPlayReceiverSessionSetup(void *session, void *request, void **responseOut
     }
   }
 
-  /* Inject enabledFeatures = [...existing, viewAreas, altScreen] -- but ONLY
-   * into the CONTROL SETUP response.
+  /* Inject enabledFeatures = [...existing, viewAreas, altScreen] -- into the
+   * CONTROL SETUP response ONLY.
    *
-   * THE SCOPE FIX (2026-10-16 redteam, rgi-faithful): the phone proposes in
-   * the control-SETUP REQUEST under "features" (media/stream SETUPs carry
-   * "streams" only -- PlayPort handleSetup splits them exactly this way),
-   * and reads the negotiated set from the control-SETUP RESPONSE under
-   * "enabledFeatures" (iOS _apsession_ensureControlStreamSetup, verified in
-   * the rgi's iOS 26.6 AirPlaySender decompile).  The previous build injected
-   * enabledFeatures into EVERY SETUP response -- including the 111 stream
-   * SETUP itself, which NO reference does (PlayPort's stream-SETUP response
-   * carries ONLY the "streams" key).
+   * SCOPE: the phone proposes in the control-SETUP REQUEST under "features"
+   * (media/stream SETUPs carry "streams" only -- PlayPort handleSetup splits them
+   * exactly this way) and reads the negotiated set from the control-SETUP RESPONSE
+   * under "enabledFeatures" (iOS _apsession_ensureControlStreamSetup, verified in
+   * the rgi's iOS 26.6 AirPlaySender decompile).  The old build injected it into
+   * EVERY response, including the 111 stream SETUP, which no reference does.
    *
-   * CONTENT FIX (rgi warning, altscreen_hook.c:1975-1979): "each string in
-   * that array flips a sibling endpoint flag (viewAreas+0x3D, altScreen+0x3E,
-   * uiContext+0x3F, enhancedSiri+0x39), so NEVER echo the phone's proposal".
-   * Seed from the receiver's EXISTING response enabledFeatures (usually
-   * absent on this unit) and add ONLY the two contracts we implement:
-   * viewAreas and altScreen.  "iAPChannel" (the old default, taken from
-   * PlayPort's full-receiver set) is now OPT-IN (MIB3_SHIM_EF_IAPCHANNEL=1):
-   * the stock MIB3 has never negotiated it, and the rgi -- the only
-   * stock-HU-proven reference -- does not claim it.
+   * CONTENT (rgi warning, altscreen_hook.c:1975-1979: "each string in that array
+   * flips a sibling endpoint flag (viewAreas+0x3D, altScreen+0x3E, uiContext+0x3F,
+   * enhancedSiri+0x39), so NEVER echo the phone's proposal").  Seed from the
+   * receiver's EXISTING response value (usually absent on this unit) and add ONLY
+   * the two contracts we implement.  iAPChannel is opt-in
+   * (MIB3_SHIM_EF_IAPCHANNEL=1): the stock MIB3 has never negotiated it and the rgi
+   * -- the only stock-HU-proven reference -- does not claim it.
    *
-   * Coupling unchanged (2026-10-15): only when the cluster was actually
-   * advertised (g_cluster_advertised) -- altScreen flag <=> >=2 displays.
-   * MIB3_SHIM_ENABLEDFEAT=0 ablates the whole injection at runtime. */
+   * COUPLING: only when the cluster was actually advertised (g_cluster_advertised),
+   * i.e. altScreen flag <=> >=2 displays.  MIB3_SHIM_ENABLEDFEAT=0 ablates it. */
   if (env_on("MIB3_SHIM_ENABLEDFEAT",1) && gate_active() && g_cluster_advertised &&
       responseOut && *responseOut && p_CFDictionarySetValue &&
       p_CFStringCreateWithCString && p_kCFTypeArrayCallBacks &&
@@ -4365,20 +4059,19 @@ int AirPlayReceiverSessionSetup(void *session, void *request, void **responseOut
 /* ==========================================================================
  * The /info seam.
  *
- * Interposes AirPlayCopyServerInfo -- the function that BUILDS the /info dict
- * the phone reads (displays, extendedFeatures, audioFormats, ...).  The unit's
- * own /info HTTP handler (libAirPlay 0xcc98) calls it via the PLT stub at
- * 0x9640 and serialises the returned dict with CFBinaryPlistV0Create.
+ * Interposes AirPlayCopyServerInfo, which BUILDS the /info dict the phone reads
+ * (displays, extendedFeatures, audioFormats, ...).  The unit's own /info HTTP
+ * handler (libAirPlay 0xcc98) calls it through the PLT stub at 0x9640 and
+ * serialises the returned dict with CFBinaryPlistV0Create.
  *
- * Why here and not the display-array seam: `displayPanels` is a DIFFERENT
- * TOP-LEVEL key of the /info dictionary.  AirPlayInfoArrayAddScreenDisplay only
- * reaches the `displays` array, so it can never add a sibling top-level key.
- * This seam hands us the whole mutable /info dict, so it is the only place the
- * modern schema can be completed.
+ * Why not the display-array seam: `displayPanels` is a DIFFERENT TOP-LEVEL key of
+ * the /info dictionary and AirPlayInfoArrayAddScreenDisplay only ever reaches the
+ * `displays` array.  This seam hands us the whole mutable dict, so it is the only
+ * place the modern schema can be completed.
  *
- * MIB3_SHIM_INFO=0 ablates it at runtime (target_env.py).  When the gate is off
- * or the cluster was never advertised, the returned dict is byte-identical to
- * stock (info_complete publishes nothing without a type-111 entry).
+ * MIB3_SHIM_INFO=0 ablates it (target_env.py).  With the gate off, or the cluster
+ * never advertised, the dict is byte-identical to stock -- info_complete publishes
+ * nothing without a type-111 entry.
  * ========================================================================*/
 void *AirPlayCopyServerInfo(void *a0, void *a1, void *a2)
 {
@@ -4422,42 +4115,33 @@ int  mib3shim_info_check(void *info){ resolve(); return info_check((CFMutableDic
 int  mib3shim_info_completed(void){ return g_info_completed; }
 
 /* ---- cluster frame counter (harness) --------------------------------------
- * mib3shim_cluster_frames: the AUs the receiver actually handed to the sink.
- * (The old ScreenStreamProcessData interception counter and its stream
- * registry were removed with the Path A code -- see the removal note at the
- * typedef block near the top.  driver_receiver.c dlsym's this export; the
- * value is the sink-feed AU count, i.e. exactly what the receiver
- * forwarded, which is the number the audit bench means by "frames".) */
+ * The AUs the receiver actually handed to the sink.  driver_receiver.c dlsym's
+ * this export, and it is exactly the number the audit bench means by "frames"
+ * (the old ScreenStreamProcessData counter went with the Path A removal). */
 unsigned long mib3shim_cluster_frames(void){ return g_au_fed; }
 
 
 
 /* ==========================================================================
- * THE SINK DISPATCHER (2026-10-16; reduced 2026-10-29) -- the ONE place
- * cluster frames may leave the process, and the reason the 2026-10-16
- * black-screen/reset cannot repeat.
+ * THE SINK DISPATCHER -- the ONE place cluster frames may leave the process, and
+ * why the 2026-10-16 black-screen/reset cannot repeat.
  *
- * BACKGROUND.  On 2026-10-16 an in-process display sink was enabled live and
- * the centre screen went black as CarPlay started and the unit reset
- * (LANE_CLUSTER_LIVE_2026-10-16.md S5b): the sink was created INSIDE the
- * CarPlay SETUP seam (stalling session setup -- carplay.service is
- * FailureAction=reboot-immediate) and BOTH display paths ran IN-PROCESS,
- * sharing the process's Adreno/OMX/ILM/EGL state with CarPlay's rendering.
+ * That day an in-process display sink was enabled live: the centre screen went
+ * black as CarPlay started and the unit reset (LANE_CLUSTER_LIVE_2026-10-16.md
+ * S5b).  The sink had been created INSIDE the CarPlay SETUP seam (stalling session
+ * setup -- carplay.service is FailureAction=reboot-immediate) and BOTH display
+ * paths ran IN-PROCESS, sharing Adreno/OMX/ILM/EGL state with CarPlay's rendering.
  *
- * WHAT IS LEFT (2026-10-29 redteam refactor, Path B only):
- *   * off (default)     -- nothing leaves the process.
- *   * helper            -- frames forwarded OUT OF PROCESS over the AU socket
- *                          (mib3helper.h framing).  In Path B the consumer on
- *                          the other end is mib3clusterstream, the RTP/TS
- *                          sender.  carplay performs NO display call at all,
- *                          so a sender fault cannot touch the centre screen or
- *                          the CarPlay process.
- *   * The sink stands up on the RECEIVER THREAD (cluster_thread), never in
- *     the SETUP seam -- unchanged.
- *   * dry/local (and the surface/bridge machinery they drove) were REMOVED
- *     with the rest of the Path A code; a stale knob naming them is REFUSED
- *     with a loud log line.  That keeps the 2026-10-16 accident impossible to
- *     re-arm AND makes the removal visible on the log instead of silent.
+ * What is left (Path B only):
+ *   * off (default)  -- nothing leaves the process.
+ *   * helper         -- frames forwarded OUT OF PROCESS over the AU socket
+ *                       (mib3helper.h framing); the consumer is mib3clusterstream,
+ *                       the RTP/TS sender.  carplay performs NO display call, so a
+ *                       sender fault cannot touch the centre screen or carplay.
+ * The sink stands up on the RECEIVER THREAD (cluster_thread), never in the SETUP
+ * seam.  dry/local and the machinery they drove were REMOVED with the rest of Path
+ * A; a stale knob naming them is REFUSED loudly, so the accident cannot re-arm and
+ * the removal is visible.
  * ========================================================================*/
 static void sink_resolve(void){
   char *v;
@@ -4515,35 +4199,31 @@ unsigned long mib3shim_helper_dropped(void){ return hlp_drop; }
 const char *mib3shim_bc_path(void){ if (bc_fd == -2){ bc_pick_path(); } return bc_path; }
 
 /* ==========================================================================
- * THE CRASH-GUARD SEAM (2026-10-15/16)
+ * THE CRASH-GUARD SEAM.
  *
- * The unit's stock fault: on teardown (systemctl stop/restart carplay), the
+ * The unit's stock fault: on teardown (systemctl stop/restart carplay) the
  * CCarSSWRsiClient destructor frees the wrapped RSI client and sends its
  * unsubscribes; the `{type:"unsubscribe"}` ack comes back through librsic's
- * dispatch (WsClientImpl::broadcastOnMessage -> WsSubscribeClient::onMessage
- * -> WsSubscribeClient::broadcastMessage) and is delivered to the FREED
- * callback -- FUN_00392778 dereferences NULL+0x10 (si_addr 0x10), SIGSEGV,
- * and LG's app-crash reset reboots the whole unit.
+ * dispatch (WsClientImpl::broadcastOnMessage -> WsSubscribeClient::onMessage ->
+ * WsSubscribeClient::broadcastMessage) and is delivered to the FREED callback --
+ * FUN_00392778 dereferences NULL+0x10 (si_addr 0x10), SIGSEGV, and LG's
+ * app-crash reset reboots the whole unit.
  *
- * VERIFIED facts (see REPORT_REDTEAM_CRASH_2026-10-15.md):
- *  - all these librsic symbols are EXPORTED and every relevant internal call
- *    goes through the PLT (inside-librsic calls at e.g. 0x3533c, 0x62e98) --
- *    so LD_PRELOAD interposition intercepts them.
- *  - carplay's own teardown calls these via cross-DSO PLT too.
+ * VERIFIED (REPORT_REDTEAM_CRASH_2026-10-15.md): all these librsic symbols are
+ * EXPORTED and every relevant internal call goes through the PLT (inside-librsic
+ * calls at e.g. 0x3533c, 0x62e98), and carplay's own teardown calls them
+ * cross-DSO -- so interposition reaches all of it.
  *
  * THE GUARD: a process-global flag set by ANY unsubscribe call; while set,
  * broadcastOnMessage / broadcastMessage drop message dispatches (return
- * silently). No messages reach the freed callback. A process restart resets
- * the flag trivially (new address space).
+ * silently), so no message reaches the freed callback.  A process restart resets
+ * the flag trivially.  Armed only when the stick marker is present, same as every
+ * other seam; MIB3_SHIM_GUARD=0 overrides.
  *
- * Gate: armed only when the stick marker is present (gate_active()), same as
- * the other seams; MIB3_SHIM_GUARD=0 overrides. Delegation to the real code
- * via R( <mangled name>) on first use.
- *
- * KNOWN LIMITS (deliberate, benign): the flag is all-or-nothing for the rest
- * of the process lifetime; a single mid-session unsubscribe would mute all
- * subsequent dispatches. On this build unsubscribes happen only at teardown,
- * so the window is exactly the dangerous one.
+ * KNOWN LIMIT (deliberate, benign): the flag is all-or-nothing for the rest of the
+ * process lifetime, so one mid-session unsubscribe would mute all later
+ * dispatches.  On this build unsubscribes happen only at teardown, so the window
+ * is exactly the dangerous one.
  * ======================================================================== */
 static int g_guard_teardown = 0;         /* 0 = normal dispatch, 1 = dropping */
 static unsigned long g_guard_set_count = 0, g_guard_drop_count = 0;
@@ -4563,16 +4243,14 @@ typedef void (*fn_guard_unsub_all)(void*);                  /* (this) */
 typedef void (*fn_guard_unsub_str)(void*, void*);           /* WsClientImpl::unsubscribe(string) */
 
 static void *guard_real(const char *mangled){
-  /* RTLD_NEXT ONLY -- deliberately NOT the two-tier R().
-   *
-   * The guard seams only ever sit BEFORE librsic in the search order (LD_PRELOAD
-   * is first).  RTLD_NEXT is the correct "next object after us" lookup there.
-   * RTLD_DEFAULT is POISON for these symbols: when the real symbol is absent
-   * (e.g. the desk bench, which has no librsic) dlsym(RTLD_DEFAULT, mangled)
-   * finds THIS shim's own interposer, so the seam delegates to itself and
-   * recurses/hangs.  (Found 2026-10-15: it made driver_guard hang on the desk for
-   * all three shim builds.)  RTLD_NEXT returns NULL instead, which is exactly
-   * "no real function to forward to". */
+  /* RTLD_NEXT ONLY -- deliberately NOT the two-tier R().  These seams only ever
+   * sit BEFORE librsic in the search order (the shim is injected first), so
+   * RTLD_NEXT is the correct "next object after us" lookup.  RTLD_DEFAULT is
+   * POISON here: when the real symbol is absent (the desk bench has no librsic)
+   * it finds THIS shim's own interposer, and the seam delegates to itself and
+   * recurses/hangs -- measured 2026-10-15, it hung driver_guard for all three
+   * builds.  RTLD_NEXT returns NULL instead, which is exactly "no real function
+   * to forward to". */
   return dlsym(RTLD_NEXT, mangled);
 }
 

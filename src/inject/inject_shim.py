@@ -2,22 +2,20 @@
 # ============================================================================
 # inject_shim.py -- install the shim's seams into an ALREADY RUNNING carplay.
 #
-# v3: SELF-VERIFYING, and py2/py3 compatible (the unit is python2; the desk can
-#     run this file through python3 -m py_compile as a syntax check).
-#     After patching it READS THE SLOTS BACK and asserts each one points at the
-#     intended shim symbol; it fails (non-zero) if a seam has no slot, if a slot
-#     does not verify, or if the on-disk shim's md5 does not match the expected
-#     value.  A "0/0 patched" run can no longer look like success.
-#
-# v2: resolves EVERY address deterministically from the ELF files on disk plus
-#     the process's load bases in /proc/maps. No dlsym inside the target (the v1
-#     dlsym call returned garbage, which silently patched a call slot with a
-#     bogus address -- so the shim was never entered and the session died).
+# Every address is resolved DETERMINISTICALLY: the real symbol from the ELF files
+# on disk, plus the process's load bases in /proc/maps.  There is no dlsym inside
+# the target -- that returned garbage once and silently patched a call slot with a
+# bogus address, so the shim was never entered and the session died.
 #
 # WHY PATCH AT ALL: symbol interposition depends on load order, and a dlopen()ed
-# library lands LAST, so every call still resolves to the real function. So find
-# the GOT slots that already hold the real addresses and repoint them at the
-# shim's own symbols.
+# library lands LAST, so every call still resolves to the real function.  So the
+# GOT slots that already hold the real addresses are repointed at the shim's own
+# symbols, then READ BACK and asserted.  The run fails (non-zero) if a seam has no
+# slot, if a slot does not verify, or if the on-disk shim's md5 is not the expected
+# one -- a "0/0 patched" run can no longer look like success.
+#
+# py2/py3 compatible: the unit is python2, the desk runs it through
+# python3 -m py_compile as a syntax check.
 #
 #   /usr/bin/python inject_shim.py <pid> /dev/shm/mib3shim.so [expected_md5]
 #
@@ -123,10 +121,10 @@ def _elf_sections(f):
 def elf_jumpslots(path, want):
     """r_offsets of R_AARCH64_JUMP_SLOT relocations whose symbol is `want`.
 
-    This is the DETERMINISTIC way to find a seam's GOT slot.  A value scan
-    cannot tell two seams in the SAME library apart once one of them has been
-    repointed into a shim (both slots then 'point into a shim'), which is how
-    SessionSetup's slot was stolen by CopyServerInfo (LANE bug 2026-10-16)."""
+    The deterministic way to find a seam's GOT slot: a value scan cannot tell two
+    seams in the SAME library apart once one of them has been repointed into a
+    shim (both slots then 'point into a shim'), which is how SessionSetup's slot
+    was stolen by CopyServerInfo."""
     f = open(path, "rb").read()
     sh, shstrndx = _elf_sections(f)
     def sname(i):
@@ -297,9 +295,8 @@ def main():
             if not hold_base or not hold_path:
                 failures.append("%s: %s not mapped" % (sym, hold))
                 continue
-            # DETERMINISTIC: the slot is the JUMP_SLOT relocation for this
-            # symbol in the CALLING library.  (A value scan cannot separate two
-            # seams that share a library -- that is the bug this replaces.)
+            # the slot is the JUMP_SLOT relocation for this symbol in the CALLING
+            # library -- see elf_jumpslots for why a value scan cannot do it.
             offs = elf_jumpslots(hold_path, sym)
             hits = [(hold_base + o, hold_path) for o in offs]
             print("[i] %s: %d relocation slot(s) in %s" % (sym, len(hits), hold))

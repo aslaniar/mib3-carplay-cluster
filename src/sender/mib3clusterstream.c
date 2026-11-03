@@ -1390,7 +1390,6 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
  * decoder latches as an error.  The real starvation was the AU boundary above,
  * not the silence.  The fill stays behind --ka-ms so a later session can still
  * attribute with it. */
- */
 /* THE QUEUE IS THE JITTER BUFFER (2026-10-30).  8 entries was a latency bound
  * for a pass-through pacer; it is not a buffer.  A jitter buffer has to hold
  * the phone's worst measured hole (486 ms, ~9 AUs at 17 fps) plus its bursts,

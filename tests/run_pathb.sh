@@ -1,21 +1,9 @@
 #!/bin/bash
 # ============================================================================
-# run_pathb.sh -- PATH B BENCH (2026-10-26 later): the muxer as a LIVE component.
+# run_pathb.sh -- PATH B BENCH: the muxer as a LIVE component.
 #
-# The 2026-10-26 car run left three defects, all in shim/tools/mib3clusterstream.c:
-#
-#   1. unix input accepted ONE connection then exited  -> every shim reconnect
-#      killed delivery for the rest of the boot;
-#   2. each shim record became its own PES, so the parameter sets travelled in a
-#      PES separate from the IDR.  Every stream the ECU ever decoded had them in
-#      the SAME access unit (that is how file mode splits Annex-B).  This is the
-#      surviving suspect for "Starting map display...";
-#   3. it could not choose its UDP source port, and the receiver drops video from
-#      any port except multi-screen-server's -> the live run needed a Python
-#      forwarder wedged in the middle.
-#
-# This bench pins the fixes, and each assertion is written so it FAILS on the old
-# behaviour (T4 runs the old framing on purpose and must not satisfy T3).
+# What it pins.  Each assertion is written so it FAILS on the old behaviour -- T4
+# runs the old framing on purpose and must not satisfy T3:
 #
 #   T1  native build, -Wall -Wextra clean
 #   T2  unit build (aarch64, unit glibc), runs under the unit's own ld-2.23.so

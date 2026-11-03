@@ -19,13 +19,12 @@
 #   sh wheel_zoom.sh stop        # stop the watcher
 #
 # WHY `probe` COMES FIRST
-#   The shim's zoom command is pinned down by the reference implementation
-#   (rgi) and the bench.  What is NOT proved from the desk is WHICH interface
-#   the wheel's step appears on: navsd posts {relativeSteps} to the renderer's
-#   discreteInput (that is what the shipped code says), but only the car can
-#   confirm it.  `probe` prints the raw renderers/discreteInputs so the answer
-#   is evidence, not opinion.  If `check` shows no `cluster/zoom` lines after
-#   rolling the wheel, run `watch` (which logs every event) and read the file.
+#   The zoom COMMAND is pinned down by the reference implementation (rgi) and the
+#   bench; what is NOT proved from the desk is WHICH interface carries the wheel's
+#   step.  navsd posts {relativeSteps} to the renderer's discreteInput (the shipped
+#   code says so) but only the car can confirm it, so `probe` prints the raw
+#   renderers/discreteInputs and the answer is evidence, not opinion.  If `check`
+#   shows no `cluster/zoom` lines, run `watch` (logs every event) and read the file.
 #
 # SAFETY: read-only RSI (GET + WebSocket subscribe).  No service is restarted,
 # no display call is made, nothing is written outside /dev/shm and the stick.

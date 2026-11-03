@@ -7,16 +7,16 @@
 #       rsi-display-management / displaymgr); it only POSTs/DELETEs RSI elements
 #       and starts/stops OUR OWN processes.  A reboot is the full undo. ***
 #
-# WHAT IT DOES (mechanism -- do not re-derive; LANE_PATH_A_SURFACES_MAP_2026-10-16 S7e):
+# MECHANISM (do not re-derive; LANE_PATH_A_SURFACES_MAP_2026-10-16 S7e):
 #   multi-screen-server (MS-S) streams whatever ivi surface id is written on a
-#   `displaymanagement.renderingSurfaces` element's `internalIdentifier`.  That id is
-#   server-assigned at CREATE from a table COMPILED INTO rsi-display-management:
+#   `displaymanagement.renderingSurfaces` element's `internalIdentifier`, and that
+#   id is assigned at CREATE from a table COMPILED INTO rsi-display-management:
 #       navi -> 19   test -> 3000   navi-kombi-renderingsurface -> 33
-#   19 and 33 are held by the nav engine for its lifetime; 3000 is FREE.  So we own
+#   19 and 33 are held by the nav engine for its lifetime; 3000 is FREE, so we own
 #   ivi 3000 (with our presenter) and register an element named "test".
 #   THREATS HANDLED: rsi-display-management holds elements in RAM (a restart wipes
-#   ours -- we re-check, never assume); a FAILED stream start is NEVER retried, so the
-#   only retry is `{"resync":true}`; the ECU re-acquires on a stream restart = resync.
+#   ours -- we re-check, never assume); a FAILED stream start is NEVER retried, so
+#   the only retry is `{"resync":true}`; the ECU re-acquires on a stream restart.
 #
 # ORDER IS LOAD-BEARING: the presenter must own ivi 3000 with a committed buffer
 # BEFORE the "test" element is created, or MS-S's grab fails and will not retry.
@@ -26,17 +26,17 @@
 #   sh deliver_ctl.sh apply             # park nav -> register ours -> resync   (idempotent)
 #   sh deliver_ctl.sh verify            # assert the post-conditions, PASS/FAIL
 #   sh deliver_ctl.sh restore           # put the car's nav back               (idempotent)
+#   sh deliver_ctl.sh handover ...      # the event-gated path (see the HANDOVER block)
 #   sh deliver_ctl.sh watch [secs]      # live table while you start a route
-#   sh deliver_ctl.sh oracle start      # start the MS-S live-log capture (the ORACLE; idempotent, append)
-#   sh deliver_ctl.sh oracle stop       # stop the capture
-#   sh deliver_ctl.sh oracle tail       # show the last share/stream decisions
+#   sh deliver_ctl.sh oracle start      # start the MS-S live-log capture (the ORACLE)
+#   sh deliver_ctl.sh oracle stop|tail  # stop it / show the last decisions
 # (start_mss_log.sh is a thin wrapper for the same thing, for the day-of card.)
 #
 # SAFETY: on every mutating step a one-line breadcrumb (write + sync) lands on the
 #   STICK at <stick>/PART1/deliver.bc -- a fault here can reset the unit and wipe
-#   /dev/shm, so the stick is the only surviving record.  (We do NOT touch the shim's
-#   own mib3shim.bc -- a root-created file carries the wrong SMACK label and would
-#   silently break the shim's logging: THE LABEL TRAP.)
+#   /dev/shm, so the stick is the only surviving record.  (We do NOT touch the
+#   shim's own mib3shim.bc -- a root-created file carries the wrong SMACK label:
+#   THE LABEL TRAP.)
 # ============================================================================
 set -u
 # All of these are overridable so the controller can be exercised against a MOCK RSI
@@ -73,26 +73,22 @@ bc() { printf '[%s] %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$*" >> "$BCF" 2>/dev/nul
 say() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
 # ---------------------------------------------------------------------------
-# TIME, and the SUB-SECOND WAIT (2026-10-20, LANE_SWITCH_EVENTS).
+# TIME, and the SUB-SECOND WAIT.
 #
-# Every gate below used to poll once a second, so a decision MS-S had already
-# taken was noticed up to 1000 ms late.  MS-S samples at ~1 Hz, but its *log*
-# is a stream: the line is there the instant the decision is.  So the waits now
-# poll at OPOLL (100 ms) and return the moment the line appears, and each one
-# reports how long it actually took -- the numbers land in the log instead of
-# being guessed from a stopwatch.  (`MIB3_DLV_OPOLL=1` restores the old cadence.)
+# The gates used to poll once a second, so a decision MS-S had already taken was
+# noticed up to 1000 ms late.  MS-S samples at ~1 Hz but its LOG is a stream, so
+# the waits poll at OPOLL (100 ms) and return the moment the line appears, each
+# one reporting how long it actually took.  (MIB3_DLV_OPOLL=1 restores the old
+# cadence.)
 #
-# *** BASE 10, ALWAYS (2026-10-21, PLAN_SWITCH_LATENCY V3). ***
-# /proc/uptime prints e.g. `2289.08`.  The fraction was truncated to two digits
-# and added to the seconds with $(( )) -- and `08` / `09` are NOT valid octal, so
-# the whole arithmetic aborts ("value too great for base") and now_ms returned
-# the EMPTY STRING.  That is ~20 % of seconds, and it is not cosmetic: every
-# elapsed-time subtraction then reads `$(( now - "" ))` -> 0 or a crash, and the
-# field log carries 10 empty timings.  `10#` is a bashism that busybox ash does
-# not implement, so the portable cure is to STRIP the leading zeros -- the value
-# is then a plain decimal literal in every shell (ash, dash, bash).  Three strips
-# are enough because the fraction is truncated to three digits first.
-# MIB3_DLV_UPTIME exists so the desk bench can assert the 08/09 cases.
+# *** BASE 10, ALWAYS. ***  /proc/uptime prints e.g. `2289.08`; truncating the
+# fraction and adding it with $(( )) makes `08`/`09` invalid OCTAL, so the whole
+# arithmetic aborts ("value too great for base") and now_ms returned the EMPTY
+# STRING for ~20 % of seconds.  `10#` is a bashism busybox ash lacks, so the
+# portable cure is to STRIP the leading zeros -- the value is then a plain decimal
+# literal in ash, dash and bash.  Three strips suffice because the fraction is
+# truncated to three digits first.  MIB3_DLV_UPTIME exists so the desk bench can
+# assert the 08/09 cases.
 now_ms() {
   _uf="${MIB3_DLV_UPTIME:-/proc/uptime}"
   if [ -r "$_uf" ]; then
@@ -115,10 +111,9 @@ now_ms() {
 NAP_F=""
 nap_probe() {
   [ -n "$NAP_F" ] && return 0
-  # 4 x 0.25 s = 1.0 s nominal.  Judge it in MILLISECONDS (now_ms is exact on the
-  # unit via /proc/uptime, and on the desk via date +%s%N): comparing whole seconds
+  # 4 x 0.25 s = 1.0 s nominal, judged in MILLISECONDS: comparing whole seconds
   # made the verdict a coin flip (a 0.5 s probe only crosses a second boundary half
-  # the time), and a wrong verdict costs exactly the one second this exists to save.
+  # the time), and a wrong verdict costs exactly the second this exists to save.
   _a="$(now_ms)"; _i=0
   while [ "$_i" -lt 4 ]; do sleep 0.25 2>/dev/null; _i=$((_i+1)); done
   _b="$(now_ms)"
@@ -134,9 +129,8 @@ nap() {
     ''|0|0.0*) sleep 1 ;;
     0.*)       # busybox `sleep` is INTEGER-ONLY on this unit, so `nap 0.1` used to
                # burn a full second -- every gate poll, every retry, the fps join.
-               # busybox HAS a usleep applet and it is accurate (measured 110 ms
-               # for 100 ms).  This is the difference between a 1 s poll and a
-               # 100 ms poll on every MS-S gate.
+               # busybox HAS a usleep applet and it is accurate (measured 110 ms for
+               # 100 ms).  That is the difference between a 1 s and a 100 ms poll.
                _us="$(awk -v s="$_sec" 'BEGIN{printf "%d", s*1000000}' 2>/dev/null)"
                if [ -n "$_us" ]; then busybox usleep "$_us" 2>/dev/null || sleep 1
                else sleep 1; fi ;;
@@ -168,26 +162,21 @@ tstep() {
 }
 
 # ---------------------------------------------------------------------------
-# PHASE 0 SUB-TIMERS (2026-10-21) -- PASSIVE: they only add log fields.
+# PHASE 0 SUB-TIMERS -- PASSIVE: they only add log fields.
 #
-# WHY: `tstep mutations` reported ~3 s in the field for a DELETE and a POST that
-# each cost 20-30 ms (HANDOFF_2026-10-21 S4).  That span was never just two
-# curls.  It also carried a `wc -c` over a file that reaches hundreds of MB
-# (oracle_mark), TWO breadcrumbs that each do a `sync` (a sync behind the
-# decoder's dirty pages can stall), three list GETs at its head and, in `back`, a
-# 2 MB `tail | grep`.  Guessing which of those is the 3 s is exactly what
-# Phase 4 must not do, so each one is timed on its own and the printed parts SUM
-# to the step:
+# `tstep mutations` reported ~3 s in the field for a DELETE and a POST that each
+# cost 20-30 ms (HANDOFF_2026-10-21 S4).  That span also carried a `wc -c` over a
+# file reaching hundreds of MB, TWO breadcrumbs that each do a `sync`, three list
+# GETs and, in `back`, a 2 MB `tail | grep`; so each is timed on its own and the
+# printed parts SUM to the step:
 #     del get post sync mark grep lists   (+ other = precisely the remainder)
-# Nothing here reads a value, changes an order, a budget or a wire call: every
-# timer is a pair of now_ms() calls around a call that was already there.
-# `other` is COMPUTED (step - parts), never estimated, so the sum stays exact
-# even when a future edit adds an untimed statement -- a breakdown that does not
-# add up is worse than none, and a previous version of this line exceeded its own
-# total without anyone noticing.
-# COST: two now_ms() per timed call.  now_ms is a fork on the unit (~1-3 ms at
-# load 50), so this adds a few tens of ms to a 12 s switch.  That is stated here
-# because it is the one way Phase 0 is not free.
+# Nothing here reads a value, changes an order, a budget or a wire call: every timer
+# is a pair of now_ms() calls around a call that was already there.  `other` is
+# COMPUTED, never estimated, so the sum stays exact when a future edit adds an
+# untimed statement -- a previous version exceeded its own total unnoticed.
+# COST: two now_ms() per timed call; now_ms is a fork on the unit (~1-3 ms at load
+# 50), so this adds a few tens of ms to a 12 s switch.  Stated because it is the one
+# way Phase 0 is not free.
 # ---------------------------------------------------------------------------
 SUBL=0; SUBM=0; SUBS=0; SUBD=0; SUBG=0; SUBP=0; SUBR=0; SUB_T0=0
 sub_reset() { SUBL=0; SUBM=0; SUBS=0; SUBD=0; SUBG=0; SUBP=0; SUBR=0; SUB_T0=0; }
@@ -226,13 +215,12 @@ rsi_report() { [ -n "${REQ:-}" ] && say "  rsi: ${REQ%,}"; return 0; }
 acquire() {
   if mkdir "$LOCK" 2>/dev/null; then echo "$$" > "$LOCK/pid"; trap 'release' EXIT INT TERM; return 0; fi
   _p="$(cat "$LOCK/pid" 2>/dev/null)"
-  # A pid is NOT proof of a live deliver_ctl: pids are recycled, so a dead
-  # holder's number can belong to an unrelated process and the lock then looks
-  # held FOREVER (measured 2026-10-20: pid 12008, absent from `ps`, blocked every
-  # switch and froze the cluster on the previous surface).  Check the cmdline too.
-  # A ZOMBIE answers kill -0 with an EMPTY cmdline (2026-10-26): that is a dead
-  # holder as well, not a refusal reason.  NO /proc (the desk bench): kill -0
-  # is all there is -- a live pid is treated as held (the old behaviour).
+  # A pid is NOT proof of a live deliver_ctl: pids are recycled, so a dead holder's
+  # number can belong to an unrelated process and the lock then looks held FOREVER
+  # (measured 2026-10-20: pid 12008, absent from `ps`, blocked every switch and froze
+  # the cluster on the previous surface).  Check the cmdline too.  A ZOMBIE answers
+  # kill -0 with an EMPTY cmdline (2026-10-26) and is a dead holder as well.  With NO
+  # /proc (the desk bench) kill -0 is all there is: a live pid counts as held.
   if [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null; then
     if [ -r "/proc/$_p/cmdline" ]; then
       _cmd="$(tr "\0" " " < /proc/$_p/cmdline 2>/dev/null)"
@@ -257,10 +245,9 @@ acquire() {
 release() { [ -n "${LOCK:-}" ] && [ -f "$LOCK/pid" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK" 2>/dev/null; }
 
 # --- oracle lookups are bounded ------------------------------------------------
-# The oracle log grows ~8 MB/min and is never rotated, so a FULL grep costs
-# seconds: `deliver_ctl.sh status` measured 17.3 s, and ~3.9 s of the switch's
-# wall time was one such grep inside do_verify (reported total 4040 ms vs the
-# controller's 7969 ms).  Every one of these lookups only wants RECENT history.
+# The oracle log grows ~8 MB/min and is never rotated, so a FULL grep costs seconds
+# (`status` measured 17.3 s; ~3.9 s of the switch was one such grep inside
+# do_verify).  Every lookup here only wants RECENT history:
 # MIB3_DLV_ORACLE_TAIL bytes (default 2 MB) is minutes of it.
 otail() { tail -c "${MIB3_DLV_ORACLE_TAIL:-2000000}" "$MSSLOG" 2>/dev/null; }
 ogrep() { otail | grep -aq "$1" 2>/dev/null; }
@@ -269,14 +256,12 @@ ogrep() { otail | grep -aq "$1" 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
 pids_of() { if have pidof; then pidof "$1" 2>/dev/null; elif have pgrep; then pgrep -x "$1" 2>/dev/null; fi; }
 # h <method> <url> [body] -- ONE RSI request.
-# It used to discard the two things the switch's 3 s actually needed: how long
-# the request took, and whether it SUCCEEDED.  Every request carries
-# `--max-time 8`, so an expiry (curl rc 28) was indistinguishable from a success
-# -- and hypothesis H3 ("the 11 s run was one curl expiry") is unanswerable
-# without the status.  So the cost and the rc are recorded and reported as
-# `reqs=` on the HANDOVER TIMING line.  NOTHING ELSE CHANGES: same timeout, same
-# single attempt, no retries, the body still goes to stdout (every caller
-# discards or reads it) and the function still returns curl's own status.
+# It records how long the request took and what curl returned.  Every request
+# carries `--max-time 8`, so an expiry (curl rc 28) was indistinguishable from a
+# success and H3 ("the 11 s run was one curl expiry") was unanswerable without the
+# status; the cost and rc are reported as `reqs=` on the HANDOVER TIMING line.
+# Nothing else changes: same timeout, one attempt, no retries, body to stdout, and
+# the function still returns curl's own status.
 H_RC=0; H_MS=0; REQ=""
 h() { _hm="$1"; _hu="$2"; _hb="${3:-}"
   _h0="$(now_ms)"
@@ -297,26 +282,21 @@ sps()  { curl -sS --max-time 8 "http://$RSI:$DMP/displaymanagement/streamParamet
 valid_uri() { case "$1" in /displaymanagement/renderingSurfaces/*|/displaymanagement/streamParameters/*|/displaymanagement/displays/*) return 0;; *) return 1;; esac; }
 
 # The oracle is MS-S's own live log (port 54321) -- the ONLY way to read the share
-# decision without eyes on the dash. It is started by apply/restore AND can be run
-# earlier via `oracle start` / start_mss_log.sh. It is IDEMPOTENT and APPEND-only:
-# pre-starting it is safe, and `apply` no longer truncates it (a pre-started capture
-# used to be wiped by apply -- fixed 2026-10-16).
+# decision without eyes on the dash. Started by apply/restore, or earlier via
+# `oracle start` / start_mss_log.sh.  IDEMPOTENT and APPEND-only: pre-starting is
+# safe and `apply` no longer truncates it.
 #
-# *** HYGIENE (2026-10-21, PLAN_SWITCH_LATENCY V11 / Phase 1c) ***
-# The capture is ONE `curl -sN --max-time 3600` writing to tmpfs at ~8 MB/min, and
-# it is the eyes of every gate.  It used to be trusted on two things that are not
-# proof: "the file is non-empty" and "the pid is alive".  Both fail silently:
-#   * curl dies (MS-S restart, socket reset, the 3600 s cap, the unit's own OOM)
-#     -> the file stays non-empty, every later gate waits out its whole budget and
-#     reports a switch failure that never happened;
+# HYGIENE: the capture is ONE `curl -sN --max-time 3600` writing to tmpfs at
+# ~8 MB/min, and it is the eyes of every gate.  Two things that are NOT proof used
+# to be trusted: "the file is non-empty" and "the pid is alive".
+#   * curl dies (MS-S restart, socket reset, the 3600 s cap, OOM) -> the file stays
+#     non-empty and every later gate waits out its budget, reporting a switch
+#     failure that never happened;
 #   * the pid is RECYCLED -> `oracle_off` kills an innocent process while the real
-#     capture keeps growing the file (the delivery lock learned this exact lesson:
-#     a pid in a file is not proof of the process you think it is).
-# So: the pid must match OUR curl's cmdline; liveness is GROWTH (measured against
-# the size/time recorded by the previous invocation, so the check costs nothing on
-# the hot path); and the file rotates at a size cap so an all-day drive cannot fill
-# tmpfs.  Rotation is a single atomic rename and it happens only in oracle_on,
-# BEFORE any gate mark is taken -- see the note in oracle_rotate.
+#     capture keeps growing the file.
+# So: the pid must match OUR curl's cmdline; liveness is GROWTH (measured against the
+# size/time the previous invocation recorded, so the check is free on the hot path);
+# and the file rotates at a size cap so an all-day drive cannot fill tmpfs.
 ORACLE_KEEP="${MIB3_DLV_ORACLE_KEEP:-4194304}"     # bytes kept when rotating (minutes of log)
 ORACLE_MAX="${MIB3_DLV_ORACLE_MAX:-67108864}"      # rotate above this (64 MB ~ 8 min at 8 MB/min)
 ORACLE_STALE_MS="${MIB3_DLV_ORACLE_STALE_MS:-8000}" # no growth for this long = dead capture
@@ -336,14 +316,13 @@ oracle_pid() {
   esac
   return 1
 }
-# rotate at the cap.  ATOMIC: the kept tail is written to a sibling and renamed
-# over the log, so a reader (oracle_since / otail) sees either the old file or the
-# new one, never a half-written one.  It runs ONLY from oracle_on, i.e. before the
-# invocation has taken a byte mark -- and only one deliver_ctl runs at a time (the
-# lock), so no gate can be mid-flight.  A mark taken BEFORE a rotation is larger
-# than the new size, and oracle_since already treats that as "rotated/re-created:
-# start over" (it reads from 0), which is exactly right: the retained tail is new
-# history, not a stale hit.
+# rotate at the cap.  ATOMIC: the kept tail is written to a sibling and renamed over
+# the log, so a reader (oracle_since / otail) sees the old file or the new one, never
+# a half-written one.  It runs ONLY from oracle_on, i.e. before the invocation has
+# taken a byte mark, and only one deliver_ctl runs at a time (the lock), so no gate
+# can be mid-flight.  A mark taken BEFORE a rotation is larger than the new size, and
+# oracle_since treats that as "rotated: start over" (reads from 0) -- correct, since
+# the retained tail is new history, not a stale hit.
 oracle_rotate() {
   _sz="$(oracle_mark)"
   [ "${_sz:-0}" -ge "$ORACLE_MAX" ] || return 0
@@ -541,14 +520,14 @@ do_verify() {
 }
 
 # ============================================================================
-# HANDOVER -- the event-driven replacement for `apply` (2026-10-18).
+# HANDOVER -- the event-driven replacement for `apply`.
 #
-# WHY IT EXISTS: `apply` (park -> sleep 2 -> register -> resync) assumes MS-S has
-# observed the park by the time we register ours.  It never verifies that, so a
-# park MS-S did not process (the nav engine re-created its element; a missed 1 Hz
-# check) leaves the nav's TransportStream holding (ip,port) and our start dies
-# SILENTLY with `Failed to create transportStream` (startShareInternal @0x1175d0).
-# See LANE_MS_S_HANDOVER_2026-10-18.md S1.
+# `apply` (park -> sleep 2 -> register -> resync) ASSUMES MS-S has observed the
+# park by the time we register ours, and never verifies it.  A park MS-S did not
+# process (the nav engine re-created its element; a missed 1 Hz check) leaves the
+# nav's TransportStream holding (ip,port) and our start dies SILENTLY with
+# `Failed to create transportStream` (startShareInternal @0x1175d0).  See
+# LANE_MS_S_HANDOVER_2026-10-18.md S1.
 #
 # HANDOVER gates on MS-S's OWN decisions (the oracle), one at a time:
 #   check   our presenter owns ivi $OURID with a committed buffer
@@ -560,9 +539,9 @@ do_verify() {
 # ============================================================================
 
 oracle_lines() { if [ -f "$MSSLOG" ]; then wc -l < "$MSSLOG" 2>/dev/null | tr -d ' '; else echo 0; fi; }
-# A MARK is a BYTE OFFSET, not a line number.  The oracle grows at ~8 MB/min on the
-# unit, so "sed -n 'N,$p'" (the old gate) read the whole file on every pass -- fine at
-# 1 Hz, unusable at 10 Hz.  tail -c from the mark reads only what is new.
+# A MARK is a BYTE OFFSET, not a line number: the oracle grows ~8 MB/min, so the old
+# `sed -n 'N,$p'` gate read the whole file every pass -- fine at 1 Hz, unusable at
+# 10 Hz.  tail -c from the mark reads only what is new.
 oracle_mark() { if [ -f "$MSSLOG" ]; then wc -c < "$MSSLOG" 2>/dev/null | tr -d ' '; else echo 0; fi; }
 oracle_since() {  # oracle_since <byte-offset>
   _off="${1:-0}"
@@ -725,38 +704,35 @@ handover_arm() {
 }
 
 # ----------------------------------------------------------------------------
-# handover switch [fps] -- THE UP DIRECTION, event driven (2026-10-20).
+# handover switch [fps] -- THE UP DIRECTION, event driven.
 #
-# WHY IT EXISTS: the field measured 65 s and 71 s from the phone's cluster stream
-# starting to our map appearing.  The old flow was park -> attach -> arm as three
-# separate LOCKED invocations, each with its own gate, so MS-S needed three of its
-# ~1 Hz samples; worse, `park` waited up to 20 s for `STOP STREAMING` before it
-# would even try to attach, and a failure left the nav element deleted (no stream
-# at all).  Three facts make one pass enough:
+# The field measured 65 s and 71 s from the phone's cluster stream starting to our
+# map appearing: the old flow was park -> attach -> arm as three separate LOCKED
+# invocations, each with its own gate, so MS-S needed three of its ~1 Hz samples --
+# and `park` alone waited up to 20 s for `STOP STREAMING` before it would even try
+# to attach.  Three facts make ONE pass enough:
 #
-#   * MS-S applies a DIFF of the element list, REMOVALS FIRST.  A nav delete and
-#     our create that land in the same sample window are therefore applied in one
-#     pass: stopShare(nav) frees (ip,port) and startShare(3000) takes it.  So the
-#     two mutations are issued back-to-back and the two waits collapse into one.
-#   * MS-S's own words identify each failure the moment it happens, so a gate can
-#     end early instead of sitting out a timeout: `Failed to create
-#     transportStream` (the (ip,port) dedup = the re-created-nav trap) and
-#     `startShareInternal status = N` (holder wedged) both mean "resync", and
-#     `Specified surface (ID:3000) does not exist` means "the presenter is not
-#     committing" (hopeless, stop now).
-#   * a resync is the only thing that clears either wedge -- so it is the rescue,
-#     run at most ONCE, and its result is gated the same way.
+#   * MS-S applies a DIFF of the element list, REMOVALS FIRST, so a nav delete and
+#     our create in the same sample window are applied in one pass: stopShare(nav)
+#     frees (ip,port) and startShare(3000) takes it.  The two mutations go out back
+#     to back and the two waits collapse into one.
+#   * MS-S names each failure the moment it happens, so a gate ends early instead of
+#     sitting out a timeout: `Failed to create transportStream` (the (ip,port) dedup
+#     = the re-created-nav trap) and `startShareInternal status = N` (holder wedged)
+#     both mean "resync", while `Specified surface (ID:3000) does not exist` means
+#     the presenter is not committing -- hopeless, stop now.
+#   * a resync is the only thing that clears either wedge, so it is the rescue, run
+#     at most ONCE and gated the same way.
 #
-# ON TOTAL FAILURE IT ROLLS BACK: the nav element is re-created and a resync is
-# issued, so the car's map is streaming again and the controller's "the nav is
-# still up; nothing of ours is on screen" is TRUE rather than assumed.
+# ON TOTAL FAILURE IT ROLLS BACK: the nav element is re-created and a resync issued,
+# so the car's map is streaming again and "the nav is still up; nothing of ours is on
+# screen" is TRUE rather than assumed.
 #
-# ORDER THAT REMAINS LOAD-BEARING (learned on the car 2026-10-20): the framerate
-# is written AFTER the element churn (which resets the field) and BEFORE the
-# resync/arm (which is when MS-S builds the stream), never on a live stream --
-# that makes MS-S treat the share as a new stream identity and the ECU ends up
-# with two encoders interleaved.  The write runs in the BACKGROUND during the
-# gate wait here, and is joined before the resync, so the order is unchanged and
+# ORDER THAT REMAINS LOAD-BEARING: the framerate is written AFTER the element churn
+# (which resets the field) and BEFORE the resync/arm (when MS-S builds the stream),
+# never on a live stream -- MS-S would treat the share as a new stream identity and
+# the ECU ends up with two encoders interleaved.  The write runs in the BACKGROUND
+# during the gate wait and is joined before the resync, so the order is unchanged and
 # most of its cost is hidden.
 # ----------------------------------------------------------------------------
 switch_gate() {   # switch_gate <byte-mark> <budget-ms> -> 0 ok | 1 wedge | 2 absent | 3 timeout
@@ -941,19 +917,20 @@ hand_back_to_nav_rollback() {
 }
 
 
-# own map (ivi 33).  Used by transition_ctl.sh's SHUTDOWN/FALLBACK path.
+# ----------------------------------------------------------------------------
+# handover back [secs] -- THE DOWN DIRECTION: put the cluster back on the car's own
+# map (ivi 33).  Used by transition_ctl.sh's SHUTDOWN/FALLBACK path.
 #
-# WHY IT IS NOT JUST `restore`: it is gated on MS-S's own decisions, and it knows
-# about the one trap that makes a plain "delete ours, create the nav" leave the
-# cluster showing our stale frame:
+# Not just `restore`: it is gated on MS-S's own decisions, and it knows the trap that
+# makes a plain "delete ours, create the nav" leave the cluster on our stale frame:
 #
 #   THE RE-CREATED-NAV TRAP.  If the nav engine re-created its element during our
 #   session (the documented behaviour), MS-S's diff identity (surfaceId, ip, port)
-#   says the nav is "already present" -- so when we delete OUR element, MS-S runs
-#   stopShare(ours) but NEVER calls startShare for the nav (no identity changed).
-#   Result: no TransportStream at all, the cluster retains our last frame, and
-#   every gate looks "fine".  The only thing that forces a start is a resync
-#   (stop+recreate), so step 5 below retries through one.  [STATIC]+[EXEC]
+#   says the nav is "already present" -- so deleting OUR element runs
+#   stopShare(ours) but NEVER startShare for the nav (no identity changed).
+#   Result: no TransportStream at all, the cluster retains our last frame, and every
+#   gate looks "fine".  Only a resync (stop+recreate) forces a start, so step 3
+#   retries through one.  [STATIC]+[EXEC]
 # ----------------------------------------------------------------------------
 handover_back() {
   _to="${1:-20}"                       # the SLOW budget (rescue path)
@@ -968,18 +945,15 @@ handover_back() {
   sub0; _mk="$(oracle_mark)"; sub_add mark
 
   # ---- TRAP PREDICTION (cheap, and it saves the whole fast gate) -------------
-  # THE RE-CREATED-NAV TRAP: if the nav engine re-created its own element during
-  # our session, MS-S already sampled identity (33, ip, port) -- it tried to
-  # startShare it, the (ip,port) dedup refused (`Failed to create transportStream`)
-  # and it will NOT try again, because the identity never leaves its stream list.
-  # So the plain "delete ours, the nav comes back" cannot work, and only a resync
-  # fixes it.  Two independent tells, either is enough:
+  # If the nav engine re-created its element during our session, MS-S already sampled
+  # identity (33, ip, port): it tried startShare, the (ip,port) dedup refused
+  # (`Failed to create transportStream`) and it will NOT retry while that identity
+  # stays in its stream list.  Two independent tells, either sufficient:
   #   (a) the nav element EXISTS while our session is live (the engine put it back);
-  #   (b) the oracle has said `Failed to create transportStream` since our share.
-  # Neither tell is required: the fast gate below still catches the trap, it just
-  # costs its budget first -- so the prediction is an accelerator, not the proof.
-  # This 2 MB `tail | grep` sits inside the `mutations` span, which is why it is
-  # timed separately: on a loaded unit it is a plausible share of the 3 s.
+  #   (b) the oracle said `Failed to create transportStream` since our share.
+  # Neither is required: the fast gate below still catches the trap, it just pays its
+  # budget first -- this is an accelerator, not the proof.  The 2 MB `tail | grep`
+  # sits inside the `mutations` span, which is why it is timed separately.
   _trap=0
   [ -n "$NAVU" ] && _trap=1
   if [ "$_trap" = "0" ] && [ -f "$MSSLOG" ]; then

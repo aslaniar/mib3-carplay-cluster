@@ -4,22 +4,19 @@
 #
 #   /usr/bin/python target_env.py <pid> "MIB3_SHIM_ADD=0"
 #
-# WHY: the injected shim reads its knobs with getenv(). We cannot change the
-# target's environment from outside -- but we can call setenv() inside it, and
-# the shim's next getenv() will see the new value. That lets us flip behaviour
-# (advertise on/off, gate forced, surface/bridge off/on) between phone plugs
-# with NO rebuild.
+# WHY: the injected shim reads its knobs with getenv(), and we cannot change the
+# target's environment from outside -- but we can call setenv() inside it, and the
+# shim's next getenv() sees the new value.  That flips behaviour (advertise on/off,
+# gate forced, sink mode) between phone plugs with NO rebuild.
 #
-# 2026-10-16 FIX: putenv() -> setenv().
-#   glibc putenv() stores the POINTER to the caller's string (no copy), and the
-#   scratch we handed it lives on the target's STACK -- which gets reused before
-#   the next plug, so the value silently evaporated (every fresh RUN banner read
-#   SURFACE=0, and no bridge/surface log appeared, across RUN 4 + RUN 5 even
-#   though both putenv calls returned "0 = ok"). setenv() COPIES the value onto
-#   the heap, so it survives to the next getenv(). A read-back is printed so the
-#   knob can be confirmed BEFORE a plug.
+# setenv(), NEVER putenv(): glibc putenv() stores the POINTER to the caller's
+# string (no copy), and the scratch we hand it lives on the target's STACK, which
+# is reused before the next plug -- so the value silently evaporated while both
+# calls returned "0 = ok" (every fresh RUN banner read the default).  setenv()
+# COPIES the value onto the heap, so it survives to the next getenv().  A read-back
+# is printed so the knob can be confirmed BEFORE a plug.
 #
-# RAM only; a reboot erases it.
+# RAM only; a reboot erases it.  py2 only (the unit's interpreter).
 # ============================================================================
 import os, struct, sys
 
