@@ -101,7 +101,7 @@ one knob, one source of truth) · `MIB3_SHIM_CFEAT` /
 `MIB3_SHIM_CINDEV` = cluster `features`/`primaryInputDevice` (default `0`/`0`; cluster is display-only) ·
 **`MIB3_SHIM_PORT=<n>`** = preferred cluster data port; the chain is knob → **5000** (inside the
 unit's own firewall allowlist `ncm0 tcp 5000:5001`, observed free; see `REDTEAM_SHIM_2026-10-16.md`) →
-**6031** (MHI3-native alt; firewall-dropped without `live_kit/cluster_port_fw.sh`) → ephemeral ·
+**6031** (MHI3-native alt; firewall-dropped without `the unit's own firewall helper (not part of this repository)`) → ephemeral ·
 **`MIB3_SHIM_CMDS=0/1`** (default 1) send `forceKeyFrame`/`showUI`/`setNightMode` to the phone once the
 111 stream connects (the refs' post-connect sequence — without them the phone connects but sends no
 video) · **`MIB3_SHIM_EF_IAPCHANNEL=1`** / **`MIB3_SHIM_EF_UICONTEXT=1`** = also claim that feature in
@@ -151,10 +151,10 @@ framework. Two providers:
   shim .so, owns its own surface + Cinemo decode, and is fed frames over `/dev/shm/mib3cluster.sock`
   (`mib3helper.h` protocol). The shim inside carplay only `connect()`+`write()`s — **no display call**,
   so a helper fault cannot black the screen or reboot carplay. Start it with
-  `live_kit/start_cluster_helper.sh`. See `../LANE_DELIVERY_SAFETY_2026-10-16.md`.
+  `attic/path_a/start_cluster_helper.sh`. See `../LANE_DELIVERY_SAFETY_2026-10-16.md`.
 - **`local` (hazardous)** — the shim's own Wayland/EGL surface (`surface`) or its own Cinemo pipeline
   (`bridge`) created IN carplay. Desk-verified wiring only
-  (`LANE_ROUTE_B_STUB_BENCH_2026-10-09.md`, `harness/run_routeb.sh`); **ACK-gated; not for the car**.
+  (`LANE_ROUTE_B_STUB_BENCH_2026-10-09.md`, `attic/harness_legacy/run_routeb.sh`); **ACK-gated; not for the car**.
 
 The dynamic RSI swap (`cluster_swap.sh`) then repoints the Kombi renderer at the surface; the surface's
 owning **process is irrelevant** to `multi-screen-server` (it resolves by `internalIdentifier`).
@@ -174,7 +174,7 @@ the frame payload **and** the per-stream `ScreenStreamRef`. It captures its own 
 > **Honest limit:** at this seam the payload is the cluster stream's **decrypted but still compressed
 > H.264** access unit (decoded pixels exist only inside Cinemo). A **decode bridge (H.264→RGBA)** is
 > required before the RGBA surface path on a live unit. See
-> **`../LANE_FRAME_INTERCEPT_2026-10-09.md`**; desk-verified by `harness/run_routeb.sh` TEST D
+> **`../LANE_FRAME_INTERCEPT_2026-10-09.md`**; desk-verified by `attic/harness_legacy/run_routeb.sh` TEST D
 > (`driver_intercept.c`).
 
 ## Decode bridge (the shim's own Cinemo pipeline)
@@ -189,7 +189,7 @@ from the unit's own `CinemoMediaEngineUtils::screenSetup` (proven on the unit).
 > decode/render is hardware, so **acceptance is live-only**. The bridge is therefore defensive: every
 > step is checked, any failure falls back to the surface path. Env `MIB3_SHIM_BRIDGE=0` disables it.
 > See **`../LANE_DECODE_BRIDGE_2026-10-09.md`**; desk-verified (wiring + stress: 200k frames,
-> malformed input, restart, bounded resources, clean degradation) by `harness/run_routeb.sh` TEST E/E2
+> malformed input, restart, bounded resources, clean degradation) by `attic/harness_legacy/run_routeb.sh` TEST E/E2
 > (`driver_bridge.c`).
 
 ## Half-2 (cluster delivery) diagnostic
@@ -210,16 +210,19 @@ resources, error paths, ABI, main-screen isolation) is in
 **`../LANE_SHIM_CORRECTNESS_2026-10-09.md`**. It found and fixed **two crash paths** — the chacha
 (HomeKit) key-derive argument and the RGBA fallback's out-of-bounds read — plus a reconnect
 state-corruption bug (now a per-thread context + a cluster-stream registry) and several robustness
-defects. New probes: `harness/run_adversarial.sh` (`driver_adversarial.c`, `driver_registry.c`) and
+defects. New probes: `attic/harness_legacy/run_adversarial.sh` (`driver_adversarial.c`, `driver_registry.c`) and
 native proofs (`native_logline_proof.c`, `native_chacha_contract.c`). All existing bench tests still
 pass.
 
 ## Desk verification (container harness)
-`harness/run_harness.sh` loads the unit's **real** libAirPlay/FW under the unit's own glibc 2.23
+
+> Archived 2026-11-02: these benches now live under `attic/harness_legacy/`; only `run_pathb.sh` and `run_pathb_daemon.sh` test the live chain; see attic/README.md.
+
+`attic/harness_legacy/run_harness.sh` loads the unit's **real** libAirPlay/FW under the unit's own glibc 2.23
 with the shim preloaded and proves the seam is reached (direct call **and** the framework's real
 `setDisplays`). See `LANE_SHIM_CONTAINER_2026-10-09.md` for results and gaps.
 
-`harness/run_routeb.sh` is the **route-B stub bench**: it loads the real framework with a stub
+`attic/harness_legacy/run_routeb.sh` is the **route-B stub bench**: it loads the real framework with a stub
 graphics stack (`libstubgfx.so`) and a stub RSI endpoint, and verifies the second-surface creation,
 the dynamic swap (discover→apply→restore), and the full type-111→surface→frame wiring. See
 `LANE_ROUTE_B_STUB_BENCH_2026-10-09.md`.
