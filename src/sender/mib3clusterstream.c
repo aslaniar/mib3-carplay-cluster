@@ -790,61 +790,27 @@ static void mux_push(Mux *m, const u8 *pkt)
 }
 
 /* ============================ INTRA-FRAME RELEASE ===========================
- * 2026-10-30 -- THE ONE THING THE MUXER NEVER DID.
+ * An access unit must leave paced, never as one clump.
  *
- * `mux_au` looped packets into `mux_push` with NO delay of any kind, and
- * `mux_flush` wrote the moment a datagram filled.  So an access unit left the
- * machine as one instantaneous clump: a 111 KB keyframe is ~98 datagrams in
- * ~zero time, and the measured wire confirmed it -- 144 datagrams inside any
- * 25 ms window, against the car's own 61 (measured on the same interface, the
- * same night).  MS-S's own spacing is ~1 ms between datagrams, because it is
- * paced by an encoder ticking every 100 ms.
+ * The muxer used to write every datagram as fast as the socket took it: a
+ * keyframe left as 144 datagrams inside a 25 ms window, against the car's own
+ * peak of 61 on the same interface.  A receiver with a finite ring buffer drops
+ * on that overshoot, and the decoder paints garbage over the macroblocks whose
+ * bits were lost.  A passive tap cannot see it -- the tap is not the ECU -- which
+ * is how "the wire is lossless" and "the picture is blocky" were both true.
  *
- * That is not cosmetic.  A receiver with a finite ring buffer sees a 2.4x
- * instantaneous overshoot and drops; the decoder then paints garbage over the
- * macroblocks whose bits were lost.  It does NOT show up at a passive tap,
- * because the tap is not the ECU -- which is exactly how "the wire is lossless"
- * and "the picture is blocky" were both true at once.
+ * So datagrams are buffered and released by the main loop, proportional to
+ * payload bytes:
  *
- * MHI2 does not have this problem by construction: /dev/mlb/isoTX2 is a MOST
- * ISOCHRONOUS channel, and the hardware hands over a fixed slice per frame.  We
- * have to provide that ourselves.
+ *     deadline(i) = t0 + iv * (payload bytes through datagram i) / AU size
  *
- * DEADLINE PACING, NOT PER-DATAGRAM SLEEP -- AND NOW NOT A SLEEP AT ALL
- * (2026-10-30, second pass).  The first attempt slept in the write path with
- * usleep().  That works, and it is why this comment used to justify it with
- * "HZ=100 => usleep(700) can round to ~10 ms".  That justification was WRONG:
- * this kernel has CONFIG_HIGH_RES_TIMERS=y + TICK_ONESHOT=y, so usleep() lands on
- * an hrtimer and is not tick-quantised at all.  The real defects were different:
+ * Byte-proportional deadlines cannot run out of budget the way a datagram-count
+ * estimate can: the last datagram carries the whole AU, so its deadline is the
+ * end of the slot, and the null padding rides the same cursor.  Nothing sleeps
+ * inside the write path -- that blinds the reader, leaving the arrival meter to
+ * measure its own latency.  The wait is ppoll's timeout between iterations.
  *
- *   1. It slept INSIDE the write path, so the AU reader was blind for up to a
- *      whole slot (~94 ms) while the phone was delivering every ~69 ms.  Both
- *      feedback sensors (the PTS-step EWMA and the arrival-rate meter) are fed by
- *      arrival timestamps taken at READ time, so the loop was measuring its own
- *      latency -- a feedback loop fed by its own error.
- *   2. It spread over a GUESSED datagram count, `(len+183)/184 + 2`, taken before
- *      muxing.  The muxer really emits optional PAT/PMT, a PES-start packet, the
- *      `n == 183 -> 182` re-splits and the null padding -- a few MORE than that.
- *      Once its index passed the guess it switched itself off, so the tail of
- *      every access unit still left as a clump.
- *   3. Its clock was now_ms(): a 1 ms grid for a ~3.2 ms spacing, i.e. 30% jitter
- *      before any kernel behaviour entered the picture.
- *
- * So the emitter is now driven by the MAIN LOOP instead.  mux_au still muxes the
- * whole AU in one pass -- so PSI/PCR decisions, RTP sequence numbers and every
- * byte on the wire are IDENTICAL to the unpaced build -- but the datagrams land
- * in `dbuf` instead of on the socket, and the loop releases them:
- *
- *     deadline(i) = t0 + iv * (cumulative PAYLOAD bytes through datagram i) / AU size
- *
- * Byte-proportional deadlines cannot run out of budget the way an estimate can:
- * the last datagram carries cum == AU size, so its deadline is exactly the end of
- * the slot, and the null padding rides that same cursor.  `ppoll` then takes the
- * time remaining as its TIMEOUT, so the wait happens between poll iterations
- * rather than inside a write, and the deadline is nanosecond-granular.
- *
- * 0 = disabled (file mode, --no-jit, catch-up drains), which reproduces the old
- * behaviour exactly. */
+ * 0 = disabled (file mode, --no-jit, catch-up drains). */
 
 /* Deadline, in ns, at which datagram `i` of the in-flight AU is due.
  *
@@ -980,21 +946,15 @@ static void mux_push_null(Mux *m)
 /* END EVERY ACCESS UNIT ON A DATAGRAM BOUNDARY (2026-10-27, measured).
  *
  * multi-screen-server never lets one datagram carry the tail of an access unit
- * and the head of the next: in the car's own nav capture, 16 of 1586 datagrams
- * straddle a boundary (1%, and those are the PSI insertions) and 76 datagrams
- * are padded with null packets to fill the last one.  Our sender straddled in
- * 1669 of 8948 (19%) and used no padding at all, because packets were packed
- * greedily and the buffer was only flushed when it reached six.
+ * and the head of the next: in the car's own capture 16 of 1586 datagrams
+ * straddle (the PSI insertions) and the last one is padded with null packets.
+ * We straddled 1669 of 8948 and padded nothing, so an AU whose packet count was
+ * not a multiple of six left its tail in the buffer until the NEXT AU arrived.
+ * With a static map that is most frames: the last picture of every burst sat
+ * incomplete on the wire for up to the length of the silence (600-840 ms).
  *
- * That is worse than cosmetic.  An AU whose packet count is not a multiple of
- * six left its final packets in the buffer until the NEXT AU arrived, so the
- * last picture before the phone went quiet -- which, with a static map, is most
- * of them -- sat on the wire incomplete for up to the length of the silence
- * (600-840 ms was measured).  The receiver could not finish that PES until the
- * next AU started.
- *
- * So: pad and flush.  Same total AUs, same order, same rate; every AU now
- * completes on the wire the moment it is emitted, and the wire matches MS-S. */
+ * So: pad to the datagram boundary, then flush.  Same AUs, same order, same
+ * rate; every AU completes on the wire the moment it is emitted. */
 static void mux_end_au(Mux *m)
 {
     while (m->ndg != 0) mux_push_null(m);
@@ -1409,38 +1369,27 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
 }
 
 /* ------------------------------------------------------- output pacer / fill ---
- * WHY (2026-10-27, measured on the car from OUR OWN wire): the phone does not
- * send a stream, it sends BURSTS.  In 41 s of captured stream: 226 frames at
- * 60 fps (16 ms apart), 53 frames stamped inside the same millisecond, and 99
- * stalls longer than 34 ms -- including 600-840 ms holes.  The car's own stream
- * has none of that: multi-screen-server re-encodes its surface every ~100 ms for
- * as long as it is up, so the ECU's pipeline is never starved and its clock never
- * jumps.  With the framing fixed the cluster drew a fully rendered frame and then
- * fell back to "Starting map display..." twice, which is a starved/desynced
- * receiver, not a decode error.
+ * The phone does not send a stream, it sends bursts: in 41 s of captured stream,
+ * 226 frames 16 ms apart, 53 stamped inside one millisecond, and 99 stalls over
+ * 34 ms including 600-840 ms holes.  The car's own stream has none of it --
+ * multi-screen-server re-encodes on a ~100 ms clock for as long as it is up --
+ * and a starved, desynced receiver is exactly what "draws a frame, then falls
+ * back to Starting map display" looks like.
  *
- * So the sender behaves like the unit's own encoder:
- *   --pace-ms N  (default 10)  floor between datagram groups: a 5-frame burst
- *                              leaves as an even trickle instead of a spike.
- *   --ka-ms N    (default 0 = OFF) idle fill: if nothing has arrived for N ms,
- *                              re-send the last reference frame.
- * Nothing is dropped, no frame rate is reduced: same AUs, same order, same
- * average rate -- only the delivery shape changes.
+ *   --pace-ms N   (default 10) floor between datagram groups, so a burst leaves
+ *                 as a trickle instead of a spike
+ *   --ka-ms N     (default 0 = off) idle fill: re-send the last reference frame
+ *                 after N ms of silence
  *
- * IDLE FILL IS OFF BY DEFAULT (2026-10-27, after the measurement).  It was built
- * on the theory that the ECU needs a continuous feed, and run 5 tested that
- * theory and refuted it: with the pacer and the fill the wire had ZERO gaps
- * > 150 ms and 429 byte-identical repeats, and the cluster still showed a map
- * for ~0.5 s and fell back.  Pacing alone (run 3, which also produced a labelled
- * map) behaved the same.  Meanwhile the fill has a real cost: re-sending a
- * P-frame byte-for-byte repeats its frame_num, which a tolerant decoder treats
- * as a redundant picture and a strict one may latch as an error.  So the fill is
- * not in the default path -- it stays as an experiment behind --ka-ms, so the
- * next session can still attribute with it.
+ * Nothing is dropped and no rate is reduced: same AUs, same order, same average,
+ * only the delivery shape changes.
  *
- * The AU boundary fix in mux_end_au is what actually removed the starvation the
- * fill was meant to cover: an AU's tail used to wait in the buffer for the next
- * AU, so the last picture of every burst sat incomplete on the wire.
+ * IDLE FILL IS OFF BY DEFAULT, measured: with pacing and fill the wire had zero
+ * gaps over 150 ms and 429 byte-identical repeats, and the cluster still fell
+ * back after ~0.5 s -- while a repeat re-uses its frame_num, which a strict
+ * decoder latches as an error.  The real starvation was the AU boundary above,
+ * not the silence.  The fill stays behind --ka-ms so a later session can still
+ * attribute with it. */
  */
 /* THE QUEUE IS THE JITTER BUFFER (2026-10-30).  8 entries was a latency bound
  * for a pass-through pacer; it is not a buffer.  A jitter buffer has to hold
@@ -1491,29 +1440,19 @@ static int au_is_ref(const u8 *d, usize_t n){
 }
 
 /* ---------------------------------------------------------------- CADENCE
- * WHY THIS EXISTS (2026-11-02).
+ * What we could not see before: RHYTHM, the gap between one emission and the
+ * next.  Latency says how old a frame is when it leaves; depth says how many are
+ * waiting; neither says whether the output stutters -- and the gap is exactly
+ * what the eye reads as judder.
  *
- * We log LATENCY (how old a frame is when it leaves) and DEPTH (how many are
- * waiting), but we have never logged RHYTHM -- the gap between one emission and
- * the next.  Rhythm is what the eye reads as judder, and it is the statistic the
- * MHI2 reference optimises and we never measured: refs/rgi pins its present to
- * the panel's vsync (`pipeline_timing.h`, EP_SWAP_INTERVAL 2) and subtracts the
- * time already spent drawing so it cannot double-wait, which makes the output
- * cadence independent of how the source behaves.
- *
- * We have no vsync to lock to (the ECU's refresh is invisible to us), so the
- * transferable part is the MEASUREMENT, not the mechanism.  Two rings, both ms:
- *
- *   cad_arr[]  gap between AUs as the SHIM hands them to us.  This is the source
- *              rhythm measured after the shim -- not inferred from the phone's
- *              own telemetry, which reports over an unknown window and is
- *              window-scaled in some records (FINDINGS_CLUSTER_FPS_CEILING).
- *   cad_emi[]  gap between the STARTS of two emissions.  If emi is wider than
- *              arr, the pacer is adding the jitter; if they match, it is not.
- *
- * Percentiles use the same insertion sort as the `lat:` ring so the two lines
- * are directly comparable.
- */
+ * Two rings, both in ms:
+ *   cad_arr[]  gap between AUs as the shim hands them to us (source rhythm,
+ *              measured here rather than inferred from the phone's telemetry,
+ *              which reports over an unknown window)
+ *   cad_emi[]  gap between the STARTS of two emissions.  Wider than arr means
+ *              the pacer is adding the jitter; equal means it is neutral.
+ * Percentiles use the same insertion sort as the `lat:` ring, so the two lines
+ * are directly comparable. */
 #define CAD_N 128
 static u64 cad_arr[CAD_N]; static int cad_arr_i, cad_arr_n;
 static u64 cad_emi[CAD_N]; static int cad_emi_i, cad_emi_n;
@@ -1555,29 +1494,18 @@ static void pace_emit(Pace *p, const u8 *au, usize_t len)
         cad_last_emi_ms = nowe;
     }
     g_au_out++;                    /* published for the supervisor (see the state block) */
-    /* A STEADY CLOCK, NOT A WALL CLOCK (2026-10-27, measured against the car).
+    /* A STEADY CLOCK, NOT A WALL CLOCK (2026-10-27, measured).
+     * Timestamps used to be now_ms() - t0, so every phone silence put a jump in
+     * the next frame: 5 jumps of 162-382 ms in 5 seconds, against a car stream
+     * whose largest step is 103 ms.  The PCR rides every AU and equals the PTS,
+     * so a jump became a PCR discontinuity -- and a demuxer that resynchronises
+     * its clock restarts the decode pipeline.
      *
-     * Our timestamps used to be `now_ms() - t0`, so every time the phone went
-     * quiet the next frame carried a jump.  Measured on the live wire during a
-     * real session: 5 jumps of 162-382 ms in 5 seconds.  The car's own stream,
-     * the one this ECU actually decodes, has NONE -- its largest step is 103 ms
-     * because multi-screen-server re-encodes on a fixed ~100 ms cadence whether
-     * or not the picture changed.
-     *
-     * The PCR rides on every access unit and equals the PTS, so a jump in the
-     * phone's silence became a jump in the PCR.  That is a clock discontinuity to
-     * a demuxer, and a demuxer that resynchronises its clock restarts the decode
-     * pipeline -- which is what "the map shows one frame then goes back to
-     * Starting map display..." looks like.
-     *
-     * So the timeline advances by a BOUNDED step per access unit instead:
-     *   floor  ~6.7 ms (a 150 fps burst cannot make us run backwards)
-     *   ceiling 100 ms (exactly MS-S's own cadence, and it satisfies the PCR
-     *           interval limit from ISO 13818-1)
-     * The timeline therefore tracks roughly real time, is always monotonic, and
-     * NEVER jumps.  Over a long session with many pauses it drifts behind real
-     * time, which is harmless here: this is a video-only surface with no audio to
-     * keep in sync, and lagging is strictly better than resynchronising. */
+     * So the timeline advances by a bounded step per AU: floor ~6.7 ms (a burst
+     * cannot run us backwards), ceiling 100 ms (MS-S's own cadence, and inside
+     * ISO 13818-1's PCR interval limit).  Monotonic, never jumps.  Over a long
+     * session it drifts behind real time, which is harmless: video-only surface,
+     * no audio to keep in sync, and lagging beats resynchronising. */
     /* A CONSTANT STEP, NOT A WALL-CLOCK DELTA (2026-10-27, second measurement).
      *
      * The clamp above bounds the jumps but does not remove them: the phone
@@ -1659,29 +1587,16 @@ static void pace_emit(Pace *p, const u8 *au, usize_t len)
     p->m->au_t0_ns   = now_ns();
     /* SPREAD BUDGET = A FRACTION OF THE INTERVAL, NOT THE WHOLE THING.
      *
-     * WHY (2026-11-02, measured on the car).  The spread budget used to BE the
-     * release interval, so an access unit finished going out at the exact
-     * instant the next one was due.  The first session with the `cad:` line
-     * showed `deferred_arms` firing 2,488 times in 120 s -- about once per
-     * emitted frame -- i.e. at nearly every release tick the previous frame's
-     * datagrams were still due, so the clock deferred half a slot and tried
-     * again.  Consequence: zero margin.  Any scheduler hitch, any Wi-Fi
-     * retransmit, any unusually large frame lands directly on the output,
-     * because there is no early to absorb it.  Measured spread: 47 ms typical,
-     * 156 ms worst, on a stream whose input run average was 45 ms.
+     * The budget used to BE the interval, so each AU finished going out exactly
+     * as the next was due: zero margin.  The first session with the cadence line
+     * showed deferred arms firing 2488 times in 120 s -- about once per frame --
+     * and any scheduler hitch or retransmit then landed directly on the output.
      *
-     * Ending the frame early also matches the shape the ECU was designed for:
-     * the car's own nav delivers each frame compactly and then goes idle,
-     * rather than trickling right up to the next frame's deadline.
-     *
-     * The budget is a fraction so there is a cushion; the RATE CEILING below
-     * still bounds the instantaneous rate, so this cannot re-create a clump.
-     * Headroom check from the same session: ~10 KB frames over ~45 ms was
-     * ~220 B/ms against a 2000 B/ms ceiling, so compressing the spread costs
-     * nothing that the wire cannot absorb.
-     *
-     * `--spread-pct` sweeps it without a rebuild; the banner prints the value
-     * in force so a silent default cannot waste a session again. */
+     * A fraction leaves a cushion, and matches the shape the ECU was designed
+     * for: the car's own nav delivers each frame compactly, then idles.  The
+     * rate ceiling below still bounds the instantaneous rate, so this cannot
+     * re-create a clump.  --spread-pct sweeps it without a rebuild, and the
+     * banner prints the value in force. */
     p->m->au_iv_ms   = p->iv_ms ? ((u64)p->iv_ms * (u64)g_spread_pct) / 100u : 0;
     if (p->iv_ms && p->m->au_iv_ms < 1) p->m->au_iv_ms = 1;
     /* RATE CEILING: a frame may never leave faster than OUT_RATE_B_PER_MS, no
@@ -2179,40 +2094,28 @@ int mib3_run(int argc, char **argv)
                 }
 
                 /* ================== ISOCHRONOUS RELEASE CLOCK ==================
-                 * WHY THIS EXISTS (2026-10-30, measured on the car).
+                 * Path B forwards the phone's TIMING as well as its pictures, and
+                 * the phone is bursty: 17.15 fps, cadence stray 83 % p95, and
+                 * fourteen silences of 350-490 ms in 20 s.  The car's own stream
+                 * has no gap over 20 ms, because MS-S re-encodes on a ~100 ms
+                 * clock; MHI2 writes to a MOST isochronous channel.  Both
+                 * guarantee the receiver is never starved.  This provides the
+                 * same guarantee in software:
                  *
-                 * Path B forwarded the phone's timing along with its pictures.
-                 * Measured on the live phone stream: 17.15 fps, cadence stray
-                 * 83 % p95, and FOURTEEN complete silences of 350-490 ms in 20
-                 * seconds.  The car's own stream -- which this ECU renders for
-                 * ever -- has ZERO gaps over 20 ms in the same window, because
-                 * MS-S re-encodes a surface on a ~100 ms clock and MHI2 writes
-                 * to a MOST ISOCHRONOUS channel.  Both guarantee the receiver is
-                 * never starved; neither forwards the source's silence.
+                 *   clock  = the phone's long-run average interval, so the
+                 *            buffer neither drains nor grows over time;
+                 *   buffer = absorbs the short-run variance (bursts and holes)
+                 *            up to --jit-ms.
                  *
-                 * Path B deleted that layer (that was the point -- no decode, no
-                 * re-encode, real frame rate), and deleted its two guarantees
-                 * with it.  This provides them in software:
+                 * Swapping those two -- clock from the latest interval -- walks
+                 * the buffer to empty or to maximum latency.  It must run every
+                 * poll iteration; the original bug was emission sitting inside
+                 * the arrival branch.
                  *
-                 *   clock  = the phone's LONG-RUN average interval (jit_iv), so
-                 *            the buffer neither drains nor grows over time;
-                 *   buffer = absorbs the phone's SHORT-RUN variance (its bursts
-                 *            and its holes) up to --jit-ms.
-                 *
-                 * Get those two the right way round and a bursty source produces
-                 * a metronomic wire.  Swap them (clock = latest interval) and the
-                 * buffer walks to empty or to maximum latency.
-                 *
-                 * It MUST run every poll iteration -- the whole bug was that
-                 * emission sat inside the arrival branch.
-                 *
-                 * A LONG pause (>--jit-ms: measured 1.5-2.3 s at guidance
-                 * start/stop) drains the buffer and the wire genuinely goes
-                 * quiet.  Deliberate: repeating the last frame was measured and
-                 * refuted (429 byte-identical repeats, and a repeated P-frame
-                 * re-uses its frame_num, which a strict decoder latches as an
-                 * error).  Recovery is the shim's 500 ms recovery-point pump.
-                 * ----------------------------------------------------------------- */
+                 * A pause longer than --jit-ms drains the buffer and the wire
+                 * goes quiet.  Deliberate: repeating the last frame was measured
+                 * and refuted (429 repeats, and a repeated P-frame re-uses
+                 * frame_num).  Recovery is the shim's 500 ms keyframe pump. */
                 { u64 now2 = now_ms();
 
                   /* ---- ARRIVAL RATE METER ------------------------------------
@@ -2229,24 +2132,17 @@ int mib3_run(int argc, char **argv)
                       if (win >= 1000) {
                           u64 ivm = win / rt_n;
                           /* HYSTERESIS ON THE CLOCK (2026-11-02).
-                           *
-                           * This used to adopt every window unconditionally, so
-                           * the release interval moved at least once a second
-                           * for no reason but measurement noise -- and the
-                           * interval is exactly what the eye reads as judder.
-                           * The reference project's cadence cannot wobble because
-                           * it IS the panel's vsync; we have no vsync, so the
-                           * equivalent is a clock that only moves when it must:
-                           *
-                           *   within +/-10%  -> ordinary variation, ignore it
-                           *   outside that   -> must persist for TWO windows
+                           * The interval used to be re-adopted every window, so
+                           * it moved at least once a second on measurement noise
+                           * alone -- and the interval is what the eye reads as
+                           * judder.  We have no vsync to lock to, so the clock
+                           * only moves when it must:
+                           *   within +/-10%      -> ordinary variation, ignore
+                           *   outside that band  -> must hold for two windows
                            *   then adopt by blending, so it cannot jump
-                           *
-                           * The 2-window rule costs up to ~2 s to follow a
-                           * genuine rate change.  Deliberate: the phone's rate
-                           * changes slowly, and transients are handled by the
-                           * depth controller and the latency cap, not here.
-                           */
+                           * Cost: up to ~2 s to follow a genuine rate change.
+                           * Deliberate -- transients belong to the depth
+                           * controller and the latency cap, not here. */
                           if (!iv_out) {
                               iv_out = ivm;
                           } else {
