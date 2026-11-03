@@ -2714,9 +2714,32 @@ static u64  g_au_fed;          /* VIDEO AUs handed to the sink (records are 2x t
 static int  g_gap_resume;      /* set when AU flow resumes after a pause (scene change) */
 static u64  g_flag_changes;    /* opcode-1 flag transitions this process (diagnostic only) */
 
+/* DELAYED RE-ACTIVATION (2026-11-02, field: "no location circle until guidance").
+ * The scene activation (showUI) is sent at stream-connected AND at first-IDR --
+ * about 100 ms apart -- and the phone ACKS both (rc=0).  But the cluster scene
+ * then renders without the vehicle marker until something forces a redraw
+ * (starting and stopping guidance does; so does quitting Maps, which redraws
+ * BOTH screens).  The reference project hit the identical thing and fixed it the
+ * same way: their note records that activation sent before the screen reports
+ * READY is accepted but does not fully draw, and they re-post it after a delay.
+ * So send one more, once, ~1.8 s later -- after the scene is really up.
+ * `MIB3_SHIM_SHOWUI_MS=0` disables it; the banner prints the value. */
+static u64 g_showui_retry_ms = 0;
+
+static void cluster_showui_retry(void *session)
+{
+  if (!session || !g_showui_retry_ms) return;
+  { u64 now = mono_ms();
+    if (now < g_showui_retry_ms) return;
+    g_showui_retry_ms = 0;
+    cluster_send_showui(session, "delayed-activation"); }
+}
+
 static void cluster_idr_pump(void *session)
 {
   if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  /* before every gate below: a paused phone must not swallow the re-activation */
+  cluster_showui_retry(session);
   if (!g_kf_seen_ms) return;                       /* the start sequence owns the first one */
   /* THE PUMP IS LOAD-BEARING -- DO NOT REMOVE IT AGAIN (2026-10-30, field).
    * Removing this timer for "encoder load" reasons produced exactly the
@@ -3464,8 +3487,12 @@ static void *cluster_thread(void *arg){
      * first interval) and g_night_applied could suppress a needed first send.
      * One line, zero risk; the counters stay cumulative on purpose. */
     { u64 now0 = mono_ms(); (void)now0;
-      g_kf_seen_ms = 0; g_kf_req_ms = 0; g_au_last_ms = 0;
+      g_kf_seen_ms = 0; g_kf_req_ms = 0; g_showui_retry_ms = 0; g_au_last_ms = 0;
       g_night_applied = -2; }
+    /* ...and only THEN arm the one delayed re-activation (see cluster_showui_retry) */
+    { long d = (long)env_num("MIB3_SHIM_SHOWUI_MS", 1800);
+      g_showui_retry_ms = (d > 0) ? (mono_ms() + (u64)d) : 0;
+      if (d > 0) logkv("cluster/cmd","showUI re-activation in ms",(u64)d,0); }
     u64 kf_base = g_kf_reqs;          /* per-session deltas for the close line */
     u64 flag_base = g_flag_changes;
     {

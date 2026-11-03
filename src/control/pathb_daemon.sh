@@ -106,7 +106,7 @@ SCOMM=${PATHB_D_SENDER_COMM:-}     # bench seam: expected /proc comm of the send
 
 POLL=${PATHB_POLL_MS:-200}
 READY_STABLE=${PATHB_READY_STABLE_MS:-400}
-GRACE=${PATHB_GRACE_MS:-3000}
+GRACE=${PATHB_GRACE_MS:-4500}
 RETRY=${PATHB_RETRY_MS:-2000}
 TAKEOVER_MS=${PATHB_TAKEOVER_MS:-9000}
 LOG_MAX=${PATHB_LOG_MAX:-65536}
@@ -662,6 +662,15 @@ do_tick(){
           NEXT_RETRY=$(( $(now_ms) + RETRY )); FLOW_SINCE=0; DEAD_SINCE=0
         fi
       else
+        # TOLERATED SILENCE IS LOGGED.  The phone pauses at scene changes and we
+        # must not treat that as a disconnect; recording the size of every pause
+        # we sat through turns the next grace decision into data instead of a
+        # guess.  Measured on WIRED CarPlay 2026-11-02: 3.1-4.1 s at guidance
+        # start/stop (wireless was 1.5-2.3 s), which is why the grace is 6 s.
+        if [ "${DEAD_SINCE:-0}" != "0" ]; then
+          _gap=$(( _now - DEAD_SINCE ))
+          [ "$_gap" -ge 2000 ] && log "tolerated a ${_gap}ms silence (phone paused; not a disconnect)"
+        fi
         LAST_AU=$S_AU; DEAD_SINCE=0
       fi
       if [ "$ST" = "ACTIVE" ]; then
