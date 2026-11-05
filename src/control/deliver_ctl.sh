@@ -506,7 +506,7 @@ do_restore() {
   [ -n "$SP" ] && { bc "restore:resync"; h POST "http://$RSI:$DMP$SP" '{"resync":true}' >/dev/null; echo; sleep 3; }
   oracle_tail
   bc "restore:done (helper/presenter still running: kill \$(pidof mib3egl2) if you want)"
-  say "if the cluster is still blank, the ECU session lever:  sh patha_deliver.sh toggle"
+  say "if the cluster is still blank, the ECU may be latched -- an ignition cycle clears it"
 }
 
 do_verify() {
@@ -1069,7 +1069,7 @@ do_handover() {
   rsi_report
   do_verify
   bc "handover:done stage=$_st"
-  say "HANDOVER COMPLETE: look at the cluster. If blank: sh patha_deliver.sh toggle (ECU lever)"
+  say "HANDOVER COMPLETE: look at the cluster. If blank, the ECU may be latched -- an ignition cycle clears it"
 }
 
 

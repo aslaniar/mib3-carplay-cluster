@@ -110,5 +110,5 @@ echo "[!] AFTER A HOT-SWAP of this shim (re-injection while an AU sender is runn
 echo "    the sender still holds the PREVIOUS shim copy's AU-socket connection and will not"
 echo "    accept the new copy's until that one ends -> the cluster freezes on its last frame"
 echo "    with every counter healthy.  ALWAYS follow a hot-swap with:"
-echo "        sh /tmp/kit/pathb_ctl.sh down && sh /tmp/kit/pathb_ctl.sh up"
+echo "        sh /tmp/kit/pathbctl stop && sh /tmp/kit/pathbctl start"
 echo "    (the 100 ms reattach pump reconnects the new copy within ~1 s; no phone replug)."
