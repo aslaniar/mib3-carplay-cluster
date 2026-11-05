@@ -1,0 +1,14 @@
+# build output from the benches (regenerated; never committed)
+tests/build/
+
+# python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# the unit's firmware rootfs, needed to cross-build but not distributed here
+R8830L_ROOTFS/
+
+# bin/ is committed on purpose: those are the pinned builds that ran on the car.
