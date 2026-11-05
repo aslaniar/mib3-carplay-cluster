@@ -25,11 +25,11 @@
 #   D14  a hand-back that fails must NOT report IDLE (it degrades, then recovers)
 #   D15  a takeover that fails before we bind leaves IDLE with the nav restored
 #
-# Usage: sh MIB3_RE/shim/harness/run_pathb_daemon.sh
+# Usage: sh tests/run_pathb_daemon.sh
 # ============================================================================
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-KIT="$(cd "$HERE/../live_kit" && pwd)"
+KIT="$(cd "$HERE/../src/control" && pwd)"
 DAEMON="$KIT/pathb_daemon.sh"
 CLI="$KIT/pathbctl"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pathbd.XXXXXX") || exit 1

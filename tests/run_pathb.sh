@@ -23,12 +23,14 @@
 # ============================================================================
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SHIMDIR="$(cd "$HERE/.." && pwd)"
-REPO="$(cd "$SHIMDIR/../.." && pwd)"
-SRC="$SHIMDIR/tools/mib3clusterstream.c"
+REPO="$(cd "$HERE/.." && pwd)"
+SHIMDIR="$REPO/src/shim"
+TOOLS="$REPO/tools"
+KIT="$REPO/src/control"
+SRC="$REPO/src/sender/mib3clusterstream.c"
 ROOT="$REPO/R8830L_ROOTFS"
-FIX="$REPO/MIB3_RE/data/PATHB_20261026/pathb_base.264"
-OUT="${PATHB_OUT:-$REPO/MIB3_RE/data/PATHB_20261026/bench}"
+FIX="$REPO/tests/fixtures/pathb_base.264"
+OUT="${PATHB_OUT:-$REPO/tests/build}"
 CC=${CC:-cc}
 LLVMCC=/opt/homebrew/opt/llvm/bin/clang
 LLD=/opt/homebrew/opt/lld/bin/ld.lld
@@ -62,7 +64,10 @@ else
 fi
 
 echo; echo "############ T2: unit build (aarch64 + unit glibc) ############"
-if "$LLVMCC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
+if [ ! -d "$ROOT" ]; then
+  echo "  SKIP: R8830L_ROOTFS not present -- the aarch64/unit-glibc leg needs the"
+  echo "        firmware's lib64.  It is not distributed with this repository."
+elif "$LLVMCC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
         -fuse-ld="$LLD" -pie -Wl,-e,_start \
         -Wl,--dynamic-linker,/lib64/ld-linux-aarch64.so.1 \
         -o "$UNIT" "$SRC" "$ROOT/lib64/libc.so.6" 2>"$OUT/unitbuild.log"; then
@@ -81,7 +86,7 @@ frame_case(){   # $1=tag  $2=extra muxer args
   "$NAT" --in "unix:$sock" --out "file:$dg" "$@" 2>"$OUT/$tag.mux.log" &
   local mp=$!; track $mp
   for _ in $(seq 1 40); do [ -S "$sock" ] && break; sleep 0.05; done
-  $PY "$SHIMDIR/live_kit/pathb/fake_shim.py" "$FIX" 40 "$sock" --es-out "$OUT/$tag.fed.264" \
+  $PY "$KIT/pathb/fake_shim.py" "$FIX" 40 "$sock" --es-out "$OUT/$tag.fed.264" \
       >"$OUT/$tag.feed.log" 2>&1
   sleep 0.5
   kill $mp 2>/dev/null; wait $mp 2>/dev/null
@@ -99,7 +104,7 @@ echo; echo "############ T3: FRAMING -- params ride ONLY the IDR access units ##
 # defect, and the assertion below USED to demand the broken behaviour ("50 of 50
 # PES carry params") -- the bench enshrined the bug instead of catching it.
 DG=$(frame_case fold)
-$PY "$SHIMDIR/tools/pes_frames.py" "$DG" --json >"$OUT/fold.json" 2>"$OUT/fold.err"
+$PY "$TOOLS/pes_frames.py" "$DG" --json >"$OUT/fold.json" 2>"$OUT/fold.err"
 J(){ $PY -c "import json,sys;print(json.load(open('$OUT/fold.json')).get('$1'))" 2>/dev/null; }
 PES=$(J pes); VCL=$(J vcl_pes); PARAM=$(J param_pes); BOTH=$(J vcl_with_sps_pps)
 [ "$PES" = "50" ] && ok framing_pes_per_frame 50 || no framing_pes_per_frame 50 "$PES"
@@ -108,7 +113,7 @@ PES=$(J pes); VCL=$(J vcl_pes); PARAM=$(J param_pes); BOTH=$(J vcl_with_sps_pps)
 
 # The invariant, stated positively: params appear EXACTLY on the IDR-bearing PES.
 # `pes_extract.py` computes it independently of the fold, straight off the wire.
-$PY "$SHIMDIR/tools/pes_extract.py" "$DG" --brief >"$OUT/fold.brief" 2>/dev/null
+$PY "$TOOLS/pes_extract.py" "$DG" --brief >"$OUT/fold.brief" 2>/dev/null
 BR=$(cat "$OUT/fold.brief" 2>/dev/null)
 case "$BR" in
   *framing=ok*) ok framing_params_only_on_idr "framing=ok" ;;
@@ -118,17 +123,17 @@ IDRN=$($PY -c "import re,sys;print((re.search(r'idr=(\d+)',sys.argv[1]) or [0,'0
 [ "${IDRN:-0}" -ge 1 ] && ok framing_idr_present ">=1" || no framing_idr_present ">=1" "${IDRN:-0}"
 [ "${IDRN:-0}" -lt 50 ] && ok framing_most_frames_are_bare "<idr count" || no framing_most_frames_are_bare "<idr count" "${IDRN:-0}"
 echo "  $BR"
-echo "  ($($PY "$SHIMDIR/tools/pes_frames.py" "$DG" --quiet 2>/dev/null || true))"
+echo "  ($($PY "$TOOLS/pes_frames.py" "$DG" --quiet 2>/dev/null || true))"
 
 echo; echo "############ T4: the assertion is not vacuous (old framing must fail) ############"
 DG0=$(frame_case nofold --no-fold)
-$PY "$SHIMDIR/tools/pes_extract.py" "$DG0" --brief >"$OUT/nofold.brief" 2>"$OUT/nofold.err"
+$PY "$TOOLS/pes_extract.py" "$DG0" --brief >"$OUT/nofold.brief" 2>"$OUT/nofold.err"
 BR0=$(cat "$OUT/nofold.brief" 2>/dev/null)
 case "$BR0" in
   *framing=suspect*) ok old_framing_detected "framing=suspect" ;;
   *)                 no old_framing_detected "framing=suspect" "${BR0:-no output}" ;;
 esac
-OLD_PARAM=$($PY "$SHIMDIR/tools/pes_frames.py" "$DG0" --json 2>/dev/null | \
+OLD_PARAM=$($PY "$TOOLS/pes_frames.py" "$DG0" --json 2>/dev/null | \
             $PY -c "import json,sys;print(json.load(sys.stdin)['param_pes'])" 2>/dev/null)
 [ "${OLD_PARAM:-0}" -gt 0 ] && ok old_framing_has_param_only_pes ">0" || no old_framing_has_param_only_pes ">0" "${OLD_PARAM:-0}"
 echo "  old behaviour: $BR0"
@@ -141,7 +146,7 @@ echo; echo "############ T5: ES survives the fold byte-exact ############"
 # remaining bytes must be identical -- nothing is rewritten, nothing is lost, and
 # the only thing removed is redundancy.  (A 183-byte TS tail used to lose one
 # payload byte here; that is covered by T5b.)
-$PY "$SHIMDIR/tools/pathb_report.py" "$DG" --extract "$OUT/fold.es.264" >"$OUT/fold.report" 2>&1
+$PY "$TOOLS/pathb_report.py" "$DG" --extract "$OUT/fold.es.264" >"$OUT/fold.report" 2>&1
 # State the contract in the only form that is unambiguous: compare the sequence of
 # (NAL type, payload) with the parameter sets removed, using a normalised start
 # code.  Comparing raw bytes instead makes the result depend on whether a start
@@ -183,7 +188,7 @@ else
      "differs ($(wc -c < "$OUT/fed.nops" | tr -d ' ') vs $(wc -c < "$OUT/wire.nops" | tr -d ' ') B)"
 fi
 # and the header must NOT have been silently dropped altogether
-$PY "$SHIMDIR/tools/pes_extract.py" "$DG" --brief 2>/dev/null | grep -q 'params=0' \
+$PY "$TOOLS/pes_extract.py" "$DG" --brief 2>/dev/null | grep -q 'params=0' \
   && no framing_header_survived "params>0" "params=0 (header lost)" \
   || ok framing_header_survived "params>0"
 grep -q "0 discontinuities" "$OUT/fold.report" && ok rtp_seq_continuous 0 || no rtp_seq_continuous 0 "$(grep 'discontin' "$OUT/fold.report")"
@@ -193,7 +198,7 @@ echo; echo "############ T5b: every AU ends on a datagram boundary (MS-S format)
 # (1%, the PSI insertions) and 76 are padded with TS null packets.  Ours straddled
 # in 1669 of 8948 (19%) and padded none, which meant the last AU of every burst
 # sat on the wire incomplete until the next AU arrived.  This pins the fix.
-$PY "$SHIMDIR/tools/au_boundary.py" "$DG" >"$OUT/boundary.txt" 2>&1
+$PY "$TOOLS/au_boundary.py" "$DG" >"$OUT/boundary.txt" 2>&1
 BS=$(cat "$OUT/boundary.txt" 2>/dev/null | tr '\n' ' ')
 STRAD=$(echo "$BS" | sed -n 's/.*straddle=\([0-9]*\).*/\1/p')
 DGS=$(echo "$BS" | sed -n 's/.*datagrams=\([0-9]*\).*/\1/p')
@@ -229,7 +234,7 @@ import sys
 sys.stdout.buffer.write(bytes(out))
 PY
 "$NAT" --in "$OUT/tail183.264" --out "file:$OUT/tail183.dgrams" 2>"$OUT/tail183.log"
-$PY "$SHIMDIR/tools/cluster_rtp_ts.py" "$OUT/tail183.dgrams" --extract "$OUT/tail183.rt.264" \
+$PY "$TOOLS/cluster_rtp_ts.py" "$OUT/tail183.dgrams" --extract "$OUT/tail183.rt.264" \
     --expect-frames 6 >"$OUT/tail183.verify" 2>&1
 if cmp -s "$OUT/tail183.264" "$OUT/tail183.rt.264"; then
   ok ts_183_byte_tail_lossless "6 AUs exact"
@@ -243,12 +248,12 @@ SOCK="$OUT/sock.recon"; DG2="$OUT/recon.dgrams"; rm -f "$SOCK" "$DG2"
 "$NAT" --in "unix:$SOCK" --out "file:$DG2" 2>"$OUT/recon.mux.log" &
 MP=$!; track $MP
 for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.05; done
-$PY "$SHIMDIR/live_kit/pathb/fake_shim.py" "$FIX" 40 "$SOCK" >/dev/null 2>&1
-$PY "$SHIMDIR/live_kit/pathb/fake_shim.py" "$FIX" 40 "$SOCK" >/dev/null 2>&1
+$PY "$KIT/pathb/fake_shim.py" "$FIX" 40 "$SOCK" >/dev/null 2>&1
+$PY "$KIT/pathb/fake_shim.py" "$FIX" 40 "$SOCK" >/dev/null 2>&1
 sleep 0.5
 kill -0 $MP 2>/dev/null && chk survived_two_connections 1 alive || chk survived_two_connections 0 alive dead
 kill $MP 2>/dev/null; wait $MP 2>/dev/null
-$PY "$SHIMDIR/tools/pathb_report.py" "$DG2" >"$OUT/recon.report" 2>&1
+$PY "$TOOLS/pathb_report.py" "$DG2" >"$OUT/recon.report" 2>&1
 grep -q "0 discontinuities" "$OUT/recon.report" && ok seq_continuous_across_reconnect 0 || no seq_continuous_across_reconnect 0 "$(grep 'discontin' "$OUT/recon.report")"
 # PSI must be re-emitted for each NEW connection so a receiver which joined late
 # re-acquires the program map.  The old assertion was a bare ">= 8 PATs", which was
@@ -260,7 +265,7 @@ PAT=$(grep -o 'TS PIDs: {0: [0-9]*' "$OUT/recon.report" | grep -o '[0-9]*$')
 [ "${PAT:-0}" -ge "${CONNS:-1}" ] \
   && ok psi_reemitted_per_connection ">= conns(${CONNS:-1})" \
   || no psi_reemitted_per_connection ">= conns(${CONNS:-1})" "${PAT:-0}"
-$PY "$SHIMDIR/tools/au_boundary.py" "$DG2" --quiet 2>/dev/null | head -1 >"$OUT/recon.psi"
+$PY "$TOOLS/au_boundary.py" "$DG2" --quiet 2>/dev/null | head -1 >"$OUT/recon.psi"
 FIRST=$($PY - "$DG2" <<'PY'
 import sys
 d = open(sys.argv[1], 'rb').read()
@@ -270,7 +275,7 @@ print(pid)
 PY
 )
 [ "${FIRST:-x}" = "0" ] && ok psi_at_stream_head "PID 0 first" || no psi_at_stream_head "PID 0 first" "first PID ${FIRST:-?}"
-FR=$($PY "$SHIMDIR/tools/pes_frames.py" "$DG2" --json | $PY -c "import json,sys;print(json.load(sys.stdin)['vcl_pes'])" 2>/dev/null)
+FR=$($PY "$TOOLS/pes_frames.py" "$DG2" --json | $PY -c "import json,sys;print(json.load(sys.stdin)['vcl_pes'])" 2>/dev/null)
 [ "${FR:-0}" -ge 100 ] && ok frames_across_reconnect ">=100" || no frames_across_reconnect ">=100" "$FR"
 echo "  $(grep -E 'conn open|conn close' "$OUT/recon.mux.log" | tr '\n' ' ')"
 
@@ -284,11 +289,11 @@ SOCKF="$OUT/sock.fast"; DGF="$OUT/fast.dgrams"; rm -f "$SOCKF" "$DGF"
 "$NAT" --in "unix:$SOCKF" --out "file:$DGF" --pace-ms 40 2>"$OUT/fast.mux.log" &
 FP=$!; track $FP
 for _ in $(seq 1 40); do [ -S "$SOCKF" ] && break; sleep 0.05; done
-$PY "$SHIMDIR/live_kit/pathb/fake_shim.py" "$FIX" 5000 "$SOCKF" >"$OUT/fast.feed.log" 2>&1
+$PY "$KIT/pathb/fake_shim.py" "$FIX" 5000 "$SOCKF" >"$OUT/fast.feed.log" 2>&1
 FEDN=$(sed -n 's/.*frames \([0-9]*\)$/\1/p' "$OUT/fast.feed.log" | head -1)
 sleep 2.0
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
-WIREN=$($PY "$SHIMDIR/tools/pes_extract.py" "$DGF" --brief 2>/dev/null | sed -n 's/.*pes=\([0-9]*\).*/\1/p')
+WIREN=$($PY "$TOOLS/pes_extract.py" "$DGF" --brief 2>/dev/null | sed -n 's/.*pes=\([0-9]*\).*/\1/p')
 [ -n "${WIREN:-}" ] && [ "${WIREN:-0}" = "${FEDN:-x}" ] \
   && ok pacer_drains_on_close "${FEDN:-?} AUs" || no pacer_drains_on_close "${FEDN:-?} AUs" "${WIREN:-0}"
 grep -q "drained-at-close=" "$OUT/fast.mux.log" && ok pacer_reports_drain yes || no pacer_reports_drain yes no
@@ -336,7 +341,7 @@ echo "  source ports observed: $SEEN"
 
 # WIRE ROUND-TRIP: what left our socket, re-parsed on the far side, must be the
 # elementary stream we were given -- byte for byte.
-$PY "$SHIMDIR/tools/pathb_report.py" "$OUT/sport.cap" --extract "$OUT/sport.es.264" \
+$PY "$TOOLS/pathb_report.py" "$OUT/sport.cap" --extract "$OUT/sport.es.264" \
     >"$OUT/sport.report" 2>&1
 if cmp -s "$FIX" "$OUT/sport.es.264"; then
   ok onwire_es_roundtrip exact
@@ -386,7 +391,7 @@ MODE=$(perl -e 'printf "%04o", (stat($ARGV[0]))[2] & 07777' "$SOCK3" 2>/dev/null
 kill $HP 2>/dev/null; wait $HP 2>/dev/null
 
 echo; echo "############ T11: msport.py against fake /proc trees ############"
-MS="$SHIMDIR/live_kit/pathb/msport.py"
+MS="$KIT/pathb/msport.py"
 mkfix(){   # $1=dir  $2="inode:porthex" ...   ; env MK_PID=yes|no
   local d="$1"; shift
   rm -rf "$d"; mkdir -p "$d/net"
@@ -437,9 +442,9 @@ $PY "$MS" --proc "$OUT/proc.ok" --json 2>/dev/null | grep -q '"port": 42989' \
 
 echo; echo "############ T12: FILE MODE still verified (no regression) ############"
 cleanup
-$PY "$SHIMDIR/tools/mk_h264.py" 6 320 240 >"$OUT/frames.264" 2>/dev/null
+$PY "$TOOLS/mk_h264.py" 6 320 240 >"$OUT/frames.264" 2>/dev/null
 "$NAT" --in "$OUT/frames.264" --out "file:$OUT/file.dgrams" --fps 30 2>/dev/null
-if $PY "$SHIMDIR/tools/cluster_rtp_ts.py" "$OUT/file.dgrams" --extract "$OUT/file.rt.264" \
+if $PY "$TOOLS/cluster_rtp_ts.py" "$OUT/file.dgrams" --extract "$OUT/file.rt.264" \
       --expect-frames 6 >"$OUT/file.verify" 2>&1; then
   ok file_mode_verified "VERIFY OK"
 else
@@ -454,7 +459,7 @@ if command -v container >/dev/null 2>&1 && [ -x "$UNIT" ]; then
       /mnt/rootfs/lib64/ld-2.23.so --library-path "$LP" /out/mib3clusterstream.unit \
          --in /out/frames.264 --out file:/out/unit.dgrams --fps 30 >/dev/null 2>&1; echo rc=$?' \
     >"$OUT/unitrun.log" 2>&1
-  if $PY "$SHIMDIR/tools/cluster_rtp_ts.py" "$OUT/unit.dgrams" --quiet >/dev/null 2>&1; then
+  if $PY "$TOOLS/cluster_rtp_ts.py" "$OUT/unit.dgrams" --quiet >/dev/null 2>&1; then
     ok unit_binary_under_unit_loader verified
   else
     no unit_binary_under_unit_loader verified "$(tail -1 "$OUT/unitrun.log")"
@@ -490,12 +495,12 @@ gate_case(){   # $1=tag  $2..=extra muxer args
   "$NAT" --in "unix:$sock" --out "file:$dg" "$@" 2>"$OUT/$tag.mux.log" &
   local mp=$!; track $mp
   for _ in $(seq 1 40); do [ -S "$sock" ] && break; sleep 0.05; done
-  $PY "$SHIMDIR/live_kit/pathb/fake_shim.py" "$OUT/midgop.264" 60 "$sock" >/dev/null 2>&1
+  $PY "$KIT/pathb/fake_shim.py" "$OUT/midgop.264" 60 "$sock" >/dev/null 2>&1
   sleep 0.4; kill $mp 2>/dev/null; wait $mp 2>/dev/null
   echo "$dg"
 }
 DG_GATE=$(gate_case gate)
-$PY "$SHIMDIR/tools/pes_frames.py" "$DG_GATE" --json >"$OUT/gate.json" 2>/dev/null
+$PY "$TOOLS/pes_frames.py" "$DG_GATE" --json >"$OUT/gate.json" 2>/dev/null
 FIRST_NAL=$($PY -c "import json;print(json.load(open('$OUT/gate.json'))['frames'][0]['nal'])" 2>/dev/null)
 echo "$FIRST_NAL" | grep -q "5" && ok gate_starts_on_idr "first PES carries an IDR" || no gate_starts_on_idr "IDR first" "$FIRST_NAL"
 grep -q "gate: waiting for a decodable start" "$OUT/gate.mux.log" 2>/dev/null \
@@ -504,7 +509,7 @@ grep -q "IDR in hand" "$OUT/gate.mux.log" 2>/dev/null && ok gate_announces_start
 echo "  gate ON: first PES nal types $FIRST_NAL, log: $(grep -c 'gate:' "$OUT/gate.mux.log" 2>/dev/null) gate lines"
 
 DG_NOGATE=$(gate_case nogate --no-idr-gate)
-$PY "$SHIMDIR/tools/pes_frames.py" "$DG_NOGATE" --json >"$OUT/nogate.json" 2>/dev/null
+$PY "$TOOLS/pes_frames.py" "$DG_NOGATE" --json >"$OUT/nogate.json" 2>/dev/null
 NG_FIRST=$($PY -c "import json;print(json.load(open('$OUT/nogate.json'))['frames'][0]['nal'])" 2>/dev/null)
 if echo "$NG_FIRST" | grep -q "5"; then
   no gate_is_not_vacuous "P-slice first with gate off" "still IDR-first, so T17 proves nothing"

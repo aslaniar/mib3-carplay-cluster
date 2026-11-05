@@ -6,7 +6,7 @@ CC=/opt/homebrew/opt/llvm/bin/clang
 LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOTFS="$(cd "$HERE/../../../R8830L_ROOTFS" && pwd)"
+ROOTFS="$(cd "$HERE/../../R8830L_ROOTFS" && pwd)"
 LIBC="$ROOTFS/lib64/libc.so.6"
 
 echo "linking against $LIBC"

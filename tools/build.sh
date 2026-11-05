@@ -21,14 +21,17 @@ CC=/opt/homebrew/opt/llvm/bin/clang
 LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOTFS="$(cd "$HERE/../../../R8830L_ROOTFS" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+ROOTFS="$(cd "$REPO/R8830L_ROOTFS" && pwd)"
+BIN="$REPO/bin"
+mkdir -p "$BIN"
 cd "$HERE" || exit 1
 
 MD5SUM() { if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
 LIBC="$ROOTFS/lib64/libc.so.6"
 LIBDL="$ROOTFS/lib64/libdl-2.23.so"
 for f in "$LIBC" "$LIBDL"; do
-  [ -f "$f" ] || { echo "MISSING: $f (is R8830L_ROOTFS present beside MIB3_RE?)"; exit 1; }
+  [ -f "$f" ] || { echo "MISSING: $f (is R8830L_ROOTFS present at the repo root?)"; exit 1; }
 done
 
 echo "cross-compiling on-unit tools for aarch64 (unit libs from $ROOTFS)"
@@ -44,19 +47,19 @@ build() { # build <source> <output> [extra-libs...]
   echo "  -> $_out ($(wc -c < "$_out") bytes)"
 }
 
-build mib3wheel.c         mib3wheel         "$LIBDL"
-build mib3clusterstream.c mib3clusterstream
+build "$REPO/src/wheel/mib3wheel.c"          "$BIN/mib3wheel"         "$LIBDL"
+build "$REPO/src/sender/mib3clusterstream.c" "$BIN/mib3clusterstream"
 
 echo
 echo "--- sanity: machine + NEEDED (want AArch64, unit sonames only) ---"
-for b in mib3wheel mib3clusterstream; do
-  printf '%s: ' "$b"
+for b in "$BIN/mib3wheel" "$BIN/mib3clusterstream"; do
+  printf '%s: ' "$(basename "$b")"
   $READELF -h "$b" | grep -o 'AArch64'
   $READELF -d "$b" | grep NEEDED | sed 's/^/    /'
 done
 
 echo
 echo "--- pins (md5) ---"
-for b in mib3wheel mib3clusterstream; do
-  printf '  %-20s %s\n' "$b" "$(MD5SUM "$b")"
+for b in "$BIN/mib3wheel" "$BIN/mib3clusterstream"; do
+  printf '  %-20s %s\n' "$(basename "$b")" "$(MD5SUM "$b")"
 done

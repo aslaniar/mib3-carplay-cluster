@@ -1,5 +1,10 @@
 # shim/ — the CarPlay cluster shim (MIB3 LG / R8830L)
 
+> Paths beginning `MIB3_RE/`, `../artifacts/` or `../LANE_*` in this file are citations of
+> the private research notes these comments were written against. They are kept because the
+> reasoning behind each constant lives there; the files themselves are not part of this
+> repository.
+
 > **STATUS 2026-10-29 — PATH B ONLY (redteam refactor).** The in-process Path A
 > machinery is REMOVED from `mib3shim.c`: the Cinemo decode bridge, the
 > EGL/Wayland surface module, the `dry`/`local` sink modes, the
@@ -101,7 +106,8 @@ one knob, one source of truth) · `MIB3_SHIM_CFEAT` /
 `MIB3_SHIM_CINDEV` = cluster `features`/`primaryInputDevice` (default `0`/`0`; cluster is display-only) ·
 **`MIB3_SHIM_PORT=<n>`** = preferred cluster data port; the chain is knob → **5000** (inside the
 unit's own firewall allowlist `ncm0 tcp 5000:5001`, observed free; see `REDTEAM_SHIM_2026-10-16.md`) →
-**6031** (MHI3-native alt; firewall-dropped without `the unit's own firewall helper (not part of this repository)`) → ephemeral ·
+**6031** (MHI3-native alt; firewall-dropped without the unit's own firewall helper, which
+is not part of this repository) → ephemeral ·
 **`MIB3_SHIM_CMDS=0/1`** (default 1) send `forceKeyFrame`/`showUI`/`setNightMode` to the phone once the
 111 stream connects (the refs' post-connect sequence — without them the phone connects but sends no
 video) · **`MIB3_SHIM_EF_IAPCHANNEL=1`** / **`MIB3_SHIM_EF_UICONTEXT=1`** = also claim that feature in

@@ -12,21 +12,24 @@ READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
 # `sh shim/build.sh` (from MIB3_RE) fail with "cd: ... No such file or
 # directory".  Works from any cwd now.
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOTFS="$(cd "$HERE/../../R8830L_ROOTFS" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+ROOTFS="$(cd "$REPO/R8830L_ROOTFS" && pwd)"
+BIN="$REPO/bin"
+mkdir -p "$BIN"
 cd "$HERE" || exit 1
 LIBC="$ROOTFS/lib64/libc.so.6"
 LIBDL="$(ls "$ROOTFS"/lib64/libdl-*.so 2>/dev/null | head -n1)"
 echo "linking against: $LIBC  $LIBDL"
 $CC --target=aarch64-linux-gnu -O2 -fPIC -fvisibility=default -nostdlib \
     -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-unused-but-set-variable \
-    -fuse-ld=$LLD -shared -o mib3shim.so mib3shim.c "$LIBC" "$LIBDL"
-echo "built mib3shim.so ($(wc -c < mib3shim.so) bytes)"
-$READELF -h mib3shim.so | grep -E "Class|Machine|Type"
-echo "--- NEEDED ---"; $READELF -d mib3shim.so | grep NEEDED
-echo "--- GLIBC version refs (want <= 2.23) ---"; $READELF -V mib3shim.so | grep -oE "GLIBC_[0-9.]+" | sort -u
-echo "--- exported seams ---"; $READELF --dyn-syms mib3shim.so | grep -E "FUNC.*GLOBAL.*(AirPlayInfoArrayAddScreenDisplay|AirPlayReceiverSessionSetup|AirPlayCopyServerInfo)"
+    -fuse-ld=$LLD -shared -o "$BIN/mib3shim.so" mib3shim.c "$LIBC" "$LIBDL"
+echo "built $BIN/mib3shim.so ($(wc -c < "$BIN/mib3shim.so") bytes)"
+$READELF -h "$BIN/mib3shim.so" | grep -E "Class|Machine|Type"
+echo "--- NEEDED ---"; $READELF -d "$BIN/mib3shim.so" | grep NEEDED
+echo "--- GLIBC version refs (want <= 2.23) ---"; $READELF -V "$BIN/mib3shim.so" | grep -oE "GLIBC_[0-9.]+" | sort -u
+echo "--- exported seams ---"; $READELF --dyn-syms "$BIN/mib3shim.so" | grep -E "FUNC.*GLOBAL.*(AirPlayInfoArrayAddScreenDisplay|AirPlayReceiverSessionSetup|AirPlayCopyServerInfo)"
 for s in AirPlayInfoArrayAddScreenDisplay AirPlayReceiverSessionSetup AirPlayCopyServerInfo; do
-  $READELF --dyn-syms mib3shim.so | grep -q "GLOBAL.* $s\$" || { echo "MISSING SEAM: $s"; exit 1; }
+  $READELF --dyn-syms "$BIN/mib3shim.so" | grep -q "GLOBAL.* $s\$" || { echo "MISSING SEAM: $s"; exit 1; }
 done
 
 # mib3clusterhelper (the out-of-process Cinemo decode host) is not built: it

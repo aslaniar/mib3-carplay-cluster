@@ -22,9 +22,9 @@
 # =============================================================================
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$HERE/../../.." && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
 ROOT="$REPO/R8830L_ROOTFS"
-OUT="$REPO/MIB3_RE/data/PATHB_20261016"
+OUT="${PATHB_OUT:-$REPO/tests/build}"
 CC=/opt/homebrew/opt/llvm/bin/clang
 LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
@@ -36,7 +36,7 @@ ok(){ echo "PBENCH $1 exp=$2 got=$2 PASS"; P=$((P+1)); }
 no(){ echo "PBENCH $1 exp=$2 got=$3 FAIL"; F=$((F+1)); }
 
 echo "############ T1: native build ############"
-if cc -O2 -Wall -Wextra -o "$OUT/mib3clusterstream.native" "$HERE/mib3clusterstream.c" 2>"$OUT/native.build.log"; then
+if cc -O2 -Wall -Wextra -o "$OUT/mib3clusterstream.native" "$REPO/src/sender/mib3clusterstream.c" 2>"$OUT/native.build.log"; then
   ok native_build OK
 else
   no native_build OK "$(tail -1 "$OUT/native.build.log")"
@@ -47,7 +47,7 @@ echo; echo "############ T2: unit build (aarch64 + unit glibc) ############"
 if "$CC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
         -fuse-ld="$LLD" -pie -Wl,-e,_start \
         -Wl,--dynamic-linker,/lib64/ld-linux-aarch64.so.1 \
-        -o "$OUT/mib3clusterstream.unit" "$HERE/mib3clusterstream.c" "$LIBC" \
+        -o "$OUT/mib3clusterstream.unit" "$REPO/src/sender/mib3clusterstream.c" "$LIBC" \
         2>"$OUT/unit.build.log"; then
   ARCH="$("$READELF" -h "$OUT/mib3clusterstream.unit" | awk '/Machine/{print $2}')"
   NEED="$("$READELF" -d "$OUT/mib3clusterstream.unit" | awk '/NEEDED/{print $NF}' | tr -d '[]' | head -1)"
@@ -60,7 +60,7 @@ else
 fi
 
 echo; echo "############ T3: generate a VALID H.264 test stream ############"
-python3 "$HERE/mk_h264.py" 6 320 240 > "$OUT/frames.264" || { no h264_gen OK "mk_h264 failed"; }
+python3 "$REPO/tools/mk_h264.py" 6 320 240 > "$OUT/frames.264" || { no h264_gen OK "mk_h264 failed"; }
 NAL=$(python3 - "$OUT/frames.264" <<'PY'
 import sys
 d=open(sys.argv[1],'rb').read()
@@ -75,7 +75,7 @@ echo; echo "############ T4: file mode mux ############"
 [ -s "$OUT/stream.dgrams" ] && ok mux_produced_bytes nonempty || no mux_produced_bytes nonempty "empty"
 
 echo; echo "############ T5+T6: independent parse + round trip ############"
-if python3 "$HERE/cluster_rtp_ts.py" "$OUT/stream.dgrams" --extract "$OUT/roundtrip.264" \
+if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/stream.dgrams" --extract "$OUT/roundtrip.264" \
         --pcap "$OUT/stream.pcap" --expect-frames 6 > "$OUT/verify.json" 2>&1; then
   grep -q "VERIFY OK" "$OUT/verify.json" && ok verify_structure "VERIFY OK" || no verify_structure "VERIFY OK" "$(tail -1 "$OUT/verify.json")"
   cat "$OUT/verify.json"
@@ -127,7 +127,7 @@ MUXPID=$!
 wait $PY_PEER 2>/dev/null
 sleep 0.6
 kill $MUXPID 2>/dev/null; wait $MUXPID 2>/dev/null
-if python3 "$HERE/cluster_rtp_ts.py" "$OUT/stream_unix.dgrams" --quiet >/dev/null 2>&1; then
+if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/stream_unix.dgrams" --quiet >/dev/null 2>&1; then
   ok unix_helper_protocol verified
 else
   no unix_helper_protocol verified "$(tail -1 "$OUT/unix.log")"
@@ -144,7 +144,7 @@ if command -v container >/dev/null 2>&1 && [ -x "$OUT/mib3clusterstream.unit" ];
       $LD --library-path "$LP" /out/mib3clusterstream.unit --in /out/frames.264 --out file:/out/stream_unit.dgrams --fps 30
       echo "rc=$?"
     ' > "$OUT/container.log" 2>&1
-  if python3 "$HERE/cluster_rtp_ts.py" "$OUT/stream_unit.dgrams" --quiet >/dev/null 2>&1; then
+  if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/stream_unit.dgrams" --quiet >/dev/null 2>&1; then
     ok unit_binary_runs_under_unit_loader verified
   else
     no unit_binary_runs_under_unit_loader verified "$(tr -d '\r' < "$OUT/container.log" | tail -2 | tr '\n' ' ')"
@@ -161,7 +161,7 @@ sleep 0.6
 "$NAT" --probe --dst "ff14::2:4%lo0" --port 45888 --probe-count 12 --out "file:$OUT/probe.bin" \
       >/dev/null 2>"$OUT/probe.log"
 kill $SP 2>/dev/null; wait $SP 2>/dev/null
-if python3 "$HERE/cluster_rtp_ts.py" "$OUT/probe.bin" --quiet --no-psi >/dev/null 2>&1; then
+if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/probe.bin" --quiet --no-psi >/dev/null 2>&1; then
   ok probe_capture verified
 else
   no probe_capture verified "$(tail -1 "$OUT/probe.log")"

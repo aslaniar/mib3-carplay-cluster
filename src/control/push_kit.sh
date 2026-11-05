@@ -25,14 +25,14 @@
 #   mib3wheel          its watcher binary
 #
 # The four binaries are md5-fenced against the sources in this tree, so a stale
-# build cannot reach the car: rebuild with `sh shim/build.sh` and
-# `sh shim/tools/build.sh` if the pre-flight complains.
+# build cannot reach the car: rebuild with `sh src/shim/build.sh` and
+# `sh tools/build.sh` if the pre-flight complains.
 # ============================================================================
 set -e
 HOST="${1:-mib3}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SHIM="$(cd "$HERE/.." && pwd)"
-cd "$SHIM" || exit 1
+ROOT="$(cd "$HERE/../.." && pwd)"
+cd "$ROOT" || exit 1
 
 md5of() { if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
 
@@ -45,19 +45,19 @@ checkpin() { # checkpin <path> <want>
   _got=$(md5of "$1" 2>/dev/null || echo missing)
   [ "$_got" = "$2" ] || {
     echo "[!] PRE-FLIGHT: $1 is $_got, want $2"
-    echo "    rebuild: sh shim/build.sh && sh shim/tools/build.sh"
+    echo "    rebuild: sh src/shim/build.sh && sh tools/build.sh"
     exit 1
   }
 }
-checkpin mib3shim.so               "$SHIM_WANT"
-checkpin tools/mib3clusterstream   "$SENDER_WANT"
-checkpin tools/mib3wheel           "$WHEEL_WANT"
+checkpin bin/mib3shim.so             "$SHIM_WANT"
+checkpin bin/mib3clusterstream       "$SENDER_WANT"
+checkpin bin/mib3wheel               "$WHEEL_WANT"
 
-FILES="mib3shim.so \
-  inject/inject.py inject/inject_shim.py inject/target_env.py inject/run_inject.sh \
-  live_kit/pathb_daemon.sh live_kit/pathbctl live_kit/deliver_ctl.sh \
-  live_kit/wheel_zoom.sh live_kit/pathb/msport.py \
-  tools/mib3clusterstream tools/mib3wheel"
+FILES="bin/mib3shim.so \
+  src/inject/inject.py src/inject/inject_shim.py src/inject/target_env.py src/inject/run_inject.sh \
+  src/control/pathb_daemon.sh src/control/pathbctl src/control/deliver_ctl.sh \
+  src/control/wheel_zoom.sh src/control/pathb/msport.py \
+  bin/mib3clusterstream bin/mib3wheel"
 
 for f in $FILES; do
   [ -f "$f" ] || { echo "[!] missing $f"; exit 1; }
@@ -66,7 +66,7 @@ done
 ssh "$HOST" 'mkdir -p /tmp/kit'
 for f in $FILES; do cat "$f" | ssh "$HOST" "cat > /tmp/kit/$(basename "$f")"; done
 # the hot-swap copy of the shim, under a name glibc cannot confuse with the first
-cat mib3shim.so | ssh "$HOST" 'cat > /tmp/kit/mib3shim2.so'
+cat bin/mib3shim.so | ssh "$HOST" 'cat > /tmp/kit/mib3shim2.so'
 
 ssh "$HOST" 'chmod +x /tmp/kit/*.sh /tmp/kit/*.py /tmp/kit/mib3shim.so /tmp/kit/mib3shim2.so /tmp/kit/mib3clusterstream /tmp/kit/mib3wheel; echo "--- /tmp/kit ---"; ls -l /tmp/kit'
 
