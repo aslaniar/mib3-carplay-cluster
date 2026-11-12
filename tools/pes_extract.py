@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """pes_extract.py -- read a cluster-group capture and report the VIDEO stream's shape.
 
 WHY THIS EXISTS (2026-10-27).  `pathb_report.py` and `pes_frames.py` walk the capture at a

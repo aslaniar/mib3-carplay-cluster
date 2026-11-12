@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* ============================================================================
  * toolkit.h -- the boilerplate EVERY on-unit tool needs, in one place.
  *

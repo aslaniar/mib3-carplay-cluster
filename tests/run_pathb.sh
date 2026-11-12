@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # run_pathb.sh -- PATH B BENCH: the muxer as a LIVE component.
 #

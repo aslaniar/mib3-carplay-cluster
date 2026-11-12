@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* ============================================================================
  * mib3wheel.c -- STEERING-WHEEL up/down -> CarPlay cluster zoom.
  *
@@ -463,9 +464,9 @@ static int flush_pending(void){
   return sent;
 }
 /* Accept a signed step; emit immediately if the pacing gap allows, else keep
- * the pending tail.  A REVERSAL DROPS the unsent tail in the old direction
- * (rgi's policy): the user's latest intent wins, and a stale direction is never
- * replayed at the phone. */
+ * the pending tail.  A REVERSAL DROPS the unsent tail in the old direction:
+ * the user's latest intent wins, and a stale direction is never replayed at the
+ * phone. */
 static int step(int dir){
   s64 t = now_ms();
   if (!dir) return 0;
@@ -632,7 +633,7 @@ static int tapb_element(const char *obj, int invert, int *accepted, int *steps){
 
 /* ---- renderer POLL (added after measuring the car) ----------------------
  * RSI answers GET for /maprenderer/renderers but does NOT push these changes over
- * the WS subscription: the owner rolled the wheel, the car's own `kombi` renderer
+ * the WS subscription: a wheel step arrived, the car's own `kombi` renderer
  * went distancePerPixel 3.838 -> 26.312 and zoomMode auto -> manual, and mib3wheel
  * logged NOTHING.  A GET diff is the reliable instrument; the WS taps stay because
  * they cost nothing and may push on another build. */

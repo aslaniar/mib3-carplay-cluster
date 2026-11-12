@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # deliver_ctl.sh -- the ONE deterministic, idempotent, reversible controller for
 #                   Path-A cluster delivery.  Runs ON THE UNIT only.
@@ -7,7 +8,7 @@
 #       rsi-display-management / displaymgr); it only POSTs/DELETEs RSI elements
 #       and starts/stops OUR OWN processes.  A reboot is the full undo. ***
 #
-# MECHANISM (do not re-derive; LANE_PATH_A_SURFACES_MAP_2026-10-16 S7e):
+# MECHANISM (do not re-derive):
 #   multi-screen-server (MS-S) streams whatever ivi surface id is written on a
 #   `displaymanagement.renderingSurfaces` element's `internalIdentifier`, and that
 #   id is assigned at CREATE from a table COMPILED INTO rsi-display-management:
@@ -165,7 +166,7 @@ tstep() {
 # PHASE 0 SUB-TIMERS -- PASSIVE: they only add log fields.
 #
 # `tstep mutations` reported ~3 s in the field for a DELETE and a POST that each
-# cost 20-30 ms (HANDOFF_2026-10-21 S4).  That span also carried a `wc -c` over a
+# cost 20-30 ms.  That span also carried a `wc -c` over a
 # file reaching hundreds of MB, TWO breadcrumbs that each do a `sync`, three list
 # GETs and, in `back`, a 2 MB `tail | grep`; so each is timed on its own and the
 # printed parts SUM to the step:
@@ -526,8 +527,7 @@ do_verify() {
 # park by the time we register ours, and never verifies it.  A park MS-S did not
 # process (the nav engine re-created its element; a missed 1 Hz check) leaves the
 # nav's TransportStream holding (ip,port) and our start dies SILENTLY with
-# `Failed to create transportStream` (startShareInternal @0x1175d0).  See
-# LANE_MS_S_HANDOVER_2026-10-18.md S1.
+# `Failed to create transportStream` (startShareInternal @0x1175d0).
 #
 # HANDOVER gates on MS-S's OWN decisions (the oracle), one at a time:
 #   check   our presenter owns ivi $OURID with a committed buffer

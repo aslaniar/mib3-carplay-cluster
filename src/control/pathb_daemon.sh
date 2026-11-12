@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # pathb_daemon.sh -- Path B's resident supervisor.
 #

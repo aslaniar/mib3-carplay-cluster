@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # wheel_zoom.sh -- the STEERING-WHEEL zoom lane's one-stop driver (2026-10-18).
 #
@@ -19,7 +20,7 @@
 #   sh wheel_zoom.sh stop        # stop the watcher
 #
 # WHY `probe` COMES FIRST
-#   The zoom COMMAND is pinned down by the reference implementation (rgi) and the
+#   The zoom COMMAND is pinned down by a working receiver's wire format and the
 #   bench; what is NOT proved from the desk is WHICH interface carries the wheel's
 #   step.  navsd posts {relativeSteps} to the renderer's discreteInput (the shipped
 #   code says so) but only the car can confirm it, so `probe` prints the raw

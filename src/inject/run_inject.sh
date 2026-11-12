@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # run_inject.sh -- stage the shim and INSTALL ITS SEAMS into the RUNNING carplay.
 # Run ON THE UNIT, from the stick. No restart. No reboot. Re-runnable.
@@ -47,7 +48,7 @@ echo "    md5:   $GOT_MD5   want $WANT_MD5"
 
 # Do NOT pre-create /tmp/mib3shim.log as root: a root-created file is labelled
 # common::bin, which carplay::app cannot write -> the shim's log stays EMPTY even
-# when it works (THE LABEL TRAP, LANE_INJECTION_2026-10-15).  Let the shim create
+# when it works (THE LABEL TRAP).  Let the shim create
 # it (then it carries carplay::app).  The additive grant is a belt.
 rm -f /tmp/mib3shim.log
 echo "carplay::app common::bin rwx" > /smack/load2 2>/dev/null
@@ -72,7 +73,7 @@ echo "    shim mapped: $(grep -c mib3shim /proc/$CP/maps)"
 echo "    carplay:     $(systemctl is-active carplay 2>&1)"
 echo "    cores dir:   $(ls /var/lib/nav/coredump/ | tail -1)"
 
-# ---- ALWAYS-ON CARPLAY COMPONENTS (owner, 2026-10-28) --------------------
+# ---- ALWAYS-ON CARPLAY COMPONENTS ----------------------------------------
 # The steering-wheel watcher is PART of the shim project, not a side add-on:
 # every deploy of this kit brings it up, every time, on every path.  It is
 # read-only RSI (no service restarted, no display call, nothing outside

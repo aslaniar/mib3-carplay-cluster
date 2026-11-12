@@ -1,6 +1,9 @@
 # build output from the benches (regenerated; never committed)
 tests/build/
 
+# the injection-proof library src/inject/build_proof.sh produces
+src/inject/libinjectproof.so
+
 # python
 __pycache__/
 *.pyc
@@ -8,7 +11,9 @@ __pycache__/
 # macOS
 .DS_Store
 
-# the unit's firmware rootfs, needed to cross-build but not distributed here
+# the unit's firmware rootfs. Optional: the build generates link stubs into
+# tests/build/linkstubs instead, so only a maintainer working from the real libs
+# needs this beside the repo.
 R8830L_ROOTFS/
 
 # bin/ is committed on purpose: those are the pinned builds that ran on the car.

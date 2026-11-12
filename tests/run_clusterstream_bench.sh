@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # =============================================================================
 # run_clusterstream_bench.sh -- Path B desk bench (2026-10-16)
 #

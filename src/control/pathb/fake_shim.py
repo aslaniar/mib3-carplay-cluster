@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: GPL-3.0-or-later
 """fake_shim.py -- play an Annex-B file into the muxer's AU socket EXACTLY the way the
 shim feeds it: one record for the parameter sets (SPS/PPS), then one record per frame,
 with the frame records carrying SLICES ONLY.

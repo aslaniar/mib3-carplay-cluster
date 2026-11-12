@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """pathb_report.py -- classify a Path B datagram capture on the laptop.
 
 Reads either:

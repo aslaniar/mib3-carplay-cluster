@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """pes_frames.py -- report the PES / access-unit structure of a Path B datagram capture.
 
 Unlike pathb_report.py (which concatenates the ES and so cannot see PES boundaries),

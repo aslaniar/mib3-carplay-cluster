@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # up.sh -- ONE command that brings the CarPlay cluster lane up.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# SPDX-License-Identifier: GPL-3.0-or-later
 # feed_test.py -- drive the OUT-OF-PROCESS delivery helper with a local Annex-B H.264 stream.
 #   *** Runs ON THE UNIT.  NO PHONE NEEDED. ***
 #

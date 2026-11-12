@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # push_kit.sh -- stage the Path B kit into the unit's /tmp/kit.
 #

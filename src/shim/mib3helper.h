@@ -1,10 +1,10 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* ============================================================================
- * mib3helper.h -- the shim <-> delivery-helper frame protocol (2026-10-16).
+ * mib3helper.h -- the shim <-> delivery-helper frame protocol.
  *
  * WHY THIS EXISTS.  The cluster frames must reach a surface the car will
  * stream, but doing that *inside* the carplay process is what blacked the
- * centre screen and reset the unit on 2026-10-16 (see
- * ../LANE_CLUSTER_LIVE_2026-10-16.md S5b).  The safe architecture is to keep
+ * centre screen and reset the unit.  The safe architecture is to keep
  * every display-touching call OUT of carplay: the shim forwards the already
  * decrypted compressed frames over an AF_UNIX socket to a separate helper
  * process that owns the surface + decode.  A fault there cannot take down

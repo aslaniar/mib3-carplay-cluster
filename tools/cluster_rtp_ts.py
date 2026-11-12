@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """cluster_rtp_ts.py -- independent verifier for Path B's cluster stream.
 
 Reads the raw datagrams mib3clusterstream emits (RTP/PT=33 + MPEG-TS), parses

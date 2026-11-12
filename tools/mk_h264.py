@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """mk_h264.py -- emit a *valid* Annex-B H.264 baseline stream for the desk bench.
 
 Every access unit is SPS + PPS + an IDR I-slice whose macroblocks are all I_PCM

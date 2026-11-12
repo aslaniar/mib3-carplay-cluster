@@ -1,9 +1,8 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* ============================================================================
  * mib3clusterstream.c -- Path B: publish H.264 directly onto the head unit's
  * cluster video stream (RTP/MPEG-TS over UDP/IPv6 multicast), with NO
  * display-surface / displaymgr / multi-screen-server involvement.
- *
- * See ../../LANE_STREAM_INJECT_PATH_B_2026-10-16.md for the full derivation.
  *
  * The Arteon instrument cluster ("Digital Cockpit Pro") is a SEPARATE ECU fed by
  * the MIB3 head unit over an automotive-Ethernet VLAN (eth0.5).  The unit's
@@ -38,7 +37,7 @@
  *
  * INPUT   --in <file>        Annex-B ES (AUs split here)
  *         --in unix:<path>   shim helper protocol (mib3helper.h): 16-byte header,
- *                            one AU per message -- drop-in for mib3clusterhelper
+ *                            one AU per message -- drop-in for the shim's helper output
  *         --in-fmt annexb|avcc
  * OUTPUT  --dst <ipv6>[%iface] (default ff14::2:4%eth0.5)   --src <ipv6>
  *         --port <n> (default 42800)   --out file:<path>  (desk capture)
@@ -49,7 +48,7 @@
  *                      (`--proc`, read-only, /proc/<pid>/fd + /proc/net/udp6);
  *                      this tool refuses to guess and exits 3 if the bind fails.
  *
- * LIVE MODE (2026-10-26 and later)
+ * LIVE MODE
  *   unix input now RE-ACCEPTS forever: the shim reconnects freely and each new
  *   connection continues the same RTP sequence and PTS clock (PSI is re-emitted
  *   first, so the receiver re-acquires).  It also FOLDS the shim's parameter-set
@@ -58,14 +57,14 @@
  *   `--no-fold` reproduces the old behaviour and exists ONLY so the bench can
  *   prove its framing assertion detects the difference.
  *
- * START GATE (2026-10-26 later).  The ECU's map app is a waiting state that a
- * stream has to *start* correctly: it shows its placeholder when it acquires a
- * stream it cannot decode, and it does not retry within that acquisition (see
- * FINDINGS_CLUSTER_PLACEHOLDER_2026-10-26.md).  So: hold everything until the
- * pending sequence header AND an IDR slice are both in hand, emit that first
+ * START GATE.  The ECU's map app is a waiting state that a stream has to *start*
+ * correctly: it shows its placeholder when it acquires a stream it cannot
+ * decode, and it does not retry within that acquisition.  So: hold everything
+ * until the pending sequence header AND an IDR slice are both in hand, emit
+ * that first
  * complete access unit, and only then stream continuously.  This is the same
- * invariant the decoder has enforced since 2026-10-24 ("never feed a P-slice
- * before a keyframe") and the one thing the 2026-10-26 live run did not do.
+ * invariant the decoder has always enforced ("never feed a P-slice before a
+ * keyframe") and the one thing an earlier live run did not do.
  * `--no-idr-gate` disables it (bench comparison / old behaviour).
  *
  * The gate is NOT reset when the shim reconnects -- a transient socket reconnect
@@ -270,7 +269,7 @@ static void say_num(long v)
 #define DEF_CTL        "/dev/shm/pathb_sender.ctl"
 
 /* ------------------------------------------------- connection-state publisher
- * WHY THIS EXISTS (owner, 2026-10-30).  The cluster must be handed back on the
+ * WHY THIS EXISTS.  The cluster must be handed back on the
  * EVENT "the phone's stream ended", not on an idle timer.  That event is the EOF
  * this loop sees when the shim closes the AU socket, and NOBODY OUTSIDE THIS
  * PROCESS can observe it with the same precision:
@@ -1406,7 +1405,7 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
  * 169-datagram clump that caused the artifacts. */
 #define OUT_RATE_B_PER_MS 2000u
 /* LATENCY CAP: if the oldest queued frame is older than this, drain at the
- * ceiling above.  This is the number the owner actually feels. */
+ * ceiling above.  This is the number the driver actually feels. */
 #define LAT_CAP_MS 400u
 
 typedef struct {
@@ -2012,8 +2011,7 @@ int mib3_run(int argc, char **argv)
             m.last_psi_ms = 0;          /* PSI first: let the receiver re-acquire */
             cfg_reset(&cfg);            /* a fresh connection owes us a header   */
             hdr_pending = 1;            /* ...which must ride its next VCL AU     */
-            /* A NEW CONNECTION IS A NEW STREAM (P0-4, REVIEW_PATHB_2026-10-28 --
-             * applied to the tree now).  The shim closes the AU socket when the
+            /* A NEW CONNECTION IS A NEW STREAM.  The shim closes the AU socket when the
              * phone's stream ends, so a close here usually means the reference
              * chain is dead; the start gate therefore re-arms per connection.
              * (The pre-2026-10-26 decode path once lost 1749 AUs to a gate reset
@@ -2395,9 +2393,8 @@ int mib3_run(int argc, char **argv)
 
                 if (ready) {
                 u8 hdr[MIB3_HELP_HDRLEN];
-                /* LOOP THE 16 HEADER BYTES (P1-8, REVIEW_PATHB_2026-10-28 -- was
-                 * never applied to the tree until now).  A stream socket may
-                 * split them across reads; the old single read() treated any
+                /* LOOP THE 16 HEADER BYTES.  A stream socket may split them
+                 * across reads; the old single read() treated any
                  * short read as a dead connection and threw away a healthy
                  * session (and its reference chain) for nothing.  The body below
                  * already loops exactly like this. */
@@ -2455,10 +2452,9 @@ int mib3_run(int argc, char **argv)
                     if (d <= 1000) cad_push(cad_arr, &cad_arr_i, &cad_arr_n, d);
                 }
                 /* CALIBRATE THE PTS STEP from the phone's own cadence (EWMA),
-                 * but COMMIT it only once per second (P1-7 / N2, REVIEW
-                 * PATHB_2026-10-28 -- the per-frame commit the tree shipped
-                 * until now is exactly the "breathing clock" that review
-                 * measured: our wire min/med/max 1800/2464/5043 ticks against
+                 * but COMMIT it only once per second (committing per frame is
+                 * exactly the "breathing clock" measured on the wire: our
+                 * min/med/max 1800/2464/5043 ticks against
                  * the car's constant 9000 +-3%).  The sensor follows every
                  * arrival; the emitted timeline changes at most 1x/s, which is
                  * what a fixed-rate encoder looks like to a demuxer.  Ignore
@@ -2562,7 +2558,7 @@ int mib3_run(int argc, char **argv)
                 if (!noidr && qn > 3) {
                     long pend = pending_bytes(uni);
                     if (pend > (long)MAX_PENDING) {
-                        /* COUNT WHAT WE DISCARD (P1-9): resetting the queue used
+                        /* COUNT WHAT WE DISCARD: resetting the queue used
                          * to drop up to QCAP access units with no counter
                          * anywhere -- a high-drain session could masquerade as
                          * lossless.  The AUs are the number that reconciles

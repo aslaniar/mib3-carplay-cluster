@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # run_pathb_daemon.sh -- desk bench for pathb_daemon.sh + pathbctl (2026-11-02)
 #

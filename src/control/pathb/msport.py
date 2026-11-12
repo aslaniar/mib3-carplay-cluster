@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: GPL-3.0-or-later
 """msport.py -- discover the UDP SOURCE PORT multi-screen-server sends the
 cluster video from.  Read-only; works on the unit's python 2.7 and on python 3.
 

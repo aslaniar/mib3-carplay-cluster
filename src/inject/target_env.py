@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # target_env.py -- set an environment variable INSIDE a running process.
 #

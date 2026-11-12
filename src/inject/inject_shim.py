@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # inject_shim.py -- install the shim's seams into an ALREADY RUNNING carplay.
 #

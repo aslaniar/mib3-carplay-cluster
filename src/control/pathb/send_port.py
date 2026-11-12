@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# SPDX-License-Identifier: GPL-3.0-or-later
 """send_port.py -- replay a mib3clusterstream datagram file from a chosen SOURCE PORT,
 paced over a given duration.  Runs ON THE UNIT.
 

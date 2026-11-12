@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # pathbctl -- the operator's interface to the Path B daemon (2026-11-02).
 #

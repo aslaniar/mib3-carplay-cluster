@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """au_boundary.py -- does every access unit END on a datagram boundary?
 
 WHY (2026-10-27).  This is a wire-format property nobody had measured, and getting
