@@ -233,7 +233,7 @@ static void logline(const char *tag, const char *msg){
 static void hit(const char *tag, unsigned long n)
 {
   int f = open("/dev/shm/mib3shim_hit", O_WRONLY|O_CREAT|O_TRUNC, 0666);
-  if (f >= 0) write(f, tag, n);
+  if (f >= 0){ write(f, tag, n); close(f); }
 }
 static void logkv(const char *tag, const char *key, u64 v, int hex){
   char mem[256]; buf b={mem,sizeof(mem)-2,0};
