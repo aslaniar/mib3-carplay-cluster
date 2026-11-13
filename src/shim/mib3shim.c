@@ -1878,7 +1878,7 @@ static void panels_build(CFMutableDictionaryRef info){
     ub[0] = 0;
     if (!p_CFStringGetCString(uuid, ub, sizeof(ub), K128)) continue;
     while (ub[k] && k < 60){ pb[k] = ub[k]; k++; }
-    while (j < 8 && k < 79){ pb[k++] = "-panel"[j++]; }  /* uid = uuid + "-panel" */
+    while (j < sizeof("-panel") - 1 && k < 79){ pb[k++] = "-panel"[j++]; }  /* uid = uuid + "-panel" */
     pb[k] = 0;
     panel = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
     if (!panel) continue;
