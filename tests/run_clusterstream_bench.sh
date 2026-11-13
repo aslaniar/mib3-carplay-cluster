@@ -157,10 +157,12 @@ MUXPID=$!
 wait $PY_PEER 2>/dev/null
 sleep 0.6
 kill $MUXPID 2>/dev/null; wait $MUXPID 2>/dev/null
-if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/stream_unix.dgrams" --quiet >/dev/null 2>&1; then
-  ok unix_helper_protocol verified
+# frames.264 holds 6 IDR AUs and the peer sends one message per AU.
+if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/stream_unix.dgrams" --expect-frames 6 --quiet \
+        >"$OUT/unix.verify" 2>&1; then
+  ok unix_helper_protocol "verified, 6 AUs"
 else
-  no unix_helper_protocol verified "$(tail -1 "$OUT/unix.log")"
+  no unix_helper_protocol "verified, 6 AUs" "$(tail -1 "$OUT/unix.verify")"
 fi
 
 echo; echo "############ T9: the aarch64 build under the unit's own ld-2.23.so ############"
