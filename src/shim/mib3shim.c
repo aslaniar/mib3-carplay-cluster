@@ -3422,7 +3422,7 @@ static void *cluster_thread(void *arg){
                          * screen opcode at all -- it is an RTSP /command type.)
                          * Logged anyway: navigation start drops the whole session
                          * and control traffic is the prime suspect. */
-            { const char *H = "0123456789abcdef"; int k; char hs[96]; char bh[192];
+            { const char *H = "0123456789abcdef"; int k; char hs[97]; char bh[192];
               unsigned lim = 48, bl = (bs < 64u) ? (unsigned)bs : 64u;
               for (k = 0; k < (int)lim; k++){ unsigned char cc = hdr[k]; hs[k*2] = H[cc>>4]; hs[k*2+1] = H[cc&15]; }
               hs[lim*2] = 0;
