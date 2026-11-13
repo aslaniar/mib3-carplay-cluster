@@ -1553,8 +1553,8 @@ static void pace_emit(Pace *p, const u8 *au, usize_t len)
         } else if (err > 50 || err < -50) {
             long adj  = (long)(step / 10);
             long corr = (err > 0) ? adj : -adj;
-            if (corr > 0 && (u64)corr > step - 1800) corr = (long)(step - 1800);
-            if (corr < 0 && (u64)(-corr) > 90000 - step) corr = -(long)(90000 - step);
+            if (corr > 0 && (u64)corr > 90000 - step) corr = (long)(90000 - step);
+            if (corr < 0 && (u64)(-corr) > step - 1800) corr = -(long)(step - 1800);
             step = (u64)((long)step + corr);
         }
     }
