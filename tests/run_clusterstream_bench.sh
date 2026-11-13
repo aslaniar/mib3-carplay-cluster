@@ -47,7 +47,10 @@ fi
 NAT="$OUT/mib3clusterstream.native"
 
 echo; echo "############ T2: unit build (aarch64 + unit glibc) ############"
-if "$CC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
+if [ ! -d "$ROOT" ]; then
+  echo "  SKIP: R8830L_ROOTFS not present -- the aarch64/unit-glibc leg needs the"
+  echo "        firmware's lib64.  It is not distributed with this repository."
+elif "$CC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
         -fuse-ld="$LLD" -pie -Wl,-e,_start \
         -Wl,--dynamic-linker,/lib64/ld-linux-aarch64.so.1 \
         -o "$OUT/mib3clusterstream.unit" "$REPO/src/sender/mib3clusterstream.c" "$LIBC" \
