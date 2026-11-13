@@ -119,6 +119,7 @@ static void *R(const char *name)
 #define O_WRONLY 1
 #define O_CREAT  0100
 #define O_APPEND 02000
+#define O_TRUNC  01000
 
 /* ---- minimal string/format helpers (no libc stdio) ----------------------- */
 
@@ -137,10 +138,46 @@ static void bu64(buf *b, u64 v, int base, int minw){
 }
 static void bhex(buf *b, u64 v){ bs(b,"0x"); bu64(b,v,16,0); }
 
-/* ---- logging ------------------------------------------------------------- */
+/* ---- logging -------------------------------------------------------------
+ * /tmp is RAM, so the log rotates to /tmp/mib3shim.log.1 at LOG_ROTATE_BYTES.
+ * Rotation never closes the fd other threads write through: dup2() swaps the new
+ * file in under the same fd number, so a concurrent write lands in one file or
+ * the other, never in an fd number something else has reused. */
+#define LOG_PATH "/tmp/mib3shim.log"
+#define LOG_ROTATE_BYTES (4UL << 20)
+extern int rename(const char *from, const char *to);
 static int logfd = -1;
+static unsigned long log_bytes;          /* size of the current file */
+static int log_rotating;
+static int (*p_dup2)(int, int);
 static void log_open(void){
-  if (logfd < 0) logfd = open("/tmp/mib3shim.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+  if (logfd < 0){
+    long (*lsk)(int, long, int) = (long (*)(int, long, int))R("lseek");
+    p_dup2 = (int (*)(int, int))R("dup2");
+    logfd = open(LOG_PATH, O_WRONLY|O_CREAT|O_APPEND, 0644);
+    if (logfd >= 0 && lsk){ long sz = lsk(logfd, 0, 2 /*SEEK_END*/); if (sz > 0) log_bytes = (unsigned long)sz; }
+  }
+}
+static void log_rotate(void){
+  int nfd;
+  if (__atomic_exchange_n(&log_rotating, 1, __ATOMIC_ACQUIRE)) return;
+  /* re-check: another thread may have rotated between our add and here */
+  if (__atomic_load_n(&log_bytes, __ATOMIC_RELAXED) >= LOG_ROTATE_BYTES && p_dup2){
+    /* no rename (the log was deleted, say): truncate instead, so the bound holds */
+    int moved = rename(LOG_PATH, LOG_PATH ".1") == 0;
+    nfd = open(LOG_PATH, O_WRONLY|O_CREAT|O_APPEND|(moved ? 0 : O_TRUNC), 0644);
+    if ((nfd < 0 || p_dup2(nfd, logfd) < 0) && moved)
+      rename(LOG_PATH ".1", LOG_PATH);         /* keep writing where readers look */
+    if (nfd >= 0) close(nfd);
+    __atomic_store_n(&log_bytes, 0, __ATOMIC_RELAXED);
+  }
+  __atomic_store_n(&log_rotating, 0, __ATOMIC_RELEASE);
+}
+static void log_write(const char *mem, unsigned long n){
+  log_open();
+  if (logfd < 0) return;
+  write(logfd, mem, n);
+  if (__atomic_add_fetch(&log_bytes, n, __ATOMIC_RELAXED) >= LOG_ROTATE_BYTES) log_rotate();
 }
 /* ---- KNOB SNAPSHOT --------------------------------------------------------
  * The supervisor can setenv() into carplay while it runs, and glibc's setenv may
@@ -234,8 +271,7 @@ static void logline(const char *tag, const char *msg){
   char mem[2048]; buf b = { mem, sizeof(mem)-2, 0 };
   bs(&b,"[mib3shim] "); bs(&b,tag); bs(&b,": "); bs(&b,msg); bch(&b,'\n');
   mem[b.n]=0;                       /* b.n <= cap = sizeof-2 -> always in-bounds */
-  log_open();
-  if (logfd >= 0) write(logfd, mem, b.n);
+  log_write(mem, b.n);
 }
 
 /* ---------------------------------------------------------------------------
@@ -243,7 +279,6 @@ static void logline(const char *tag, const char *msg){
  * not the /tmp log path, not any env.  If /dev/shm/mib3shim_hit never appears,
  * the shim was never entered at all and the call never reached us.
  * ------------------------------------------------------------------------- */
-#define O_TRUNC 01000
 static void hit(const char *tag, unsigned long n)
 {
   int f = open("/dev/shm/mib3shim_hit", O_WRONLY|O_CREAT|O_TRUNC, 0666);
@@ -398,11 +433,17 @@ static const char *helper_path(void){
  * a time, and can idle for minutes -- nothing called connect() and the cluster
  * stayed dark until the picture moved.  The attempt now rides the 100 ms clock
  * tick that already exists (cluster_wait_frame's poll), gated to 1/s. */
+/* SINK dispatch modes: see THE SINK DISPATCHER at the bottom of this file.
+ * MIB3_SHIM_SINK = off (default) | helper (the Path B sender on the AU socket). */
+#define SINK_OFF 0
+#define SINK_HELPER 2
+static int g_sink = -1;          /* -1 = unresolved */
 static int helper_connect(void);          /* forward: the pump hands the attempt to it */
 static void helper_reattach_pump(void)
 {
   static long last_try = -1;
   long now = time(0);
+  if (g_sink != SINK_HELPER) return;        /* sink off: no helper to reattach to */
   if (hlp_fd >= 0) return;
   if (now == last_try) return;
   last_try = now;
@@ -419,8 +460,17 @@ static int helper_connect(void){
   fd = socket(1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
   if (fd < 0){ logkv("sink","helper socket() errno",(u64)(unsigned)SHIM_ERRNO,0); return -1; }
   if (connect(fd, &sa, sizeof(sa)) != 0){
-    logline("sink/helper-path", helper_path());
-    logkv("sink","helper connect() errno",(u64)(unsigned)SHIM_ERRNO,0);
+    /* retried every second while the sender is down: log at most every 10 s */
+    static long last_log = -1;
+    static unsigned long quiet = 0;
+    int e = SHIM_ERRNO;
+    long now = time(0);
+    if (last_log < 0 || now - last_log >= 10){
+      logline("sink/helper-path", helper_path());
+      logkv("sink","helper connect() errno",(u64)(unsigned)e,0);
+      if (quiet) logkv("sink","helper connect() failures not logged (10 s limit)",(u64)quiet,0);
+      last_log = now; quiet = 0;
+    } else quiet++;
     close(fd); return -1;
   }
   { struct { long s; long us; } tv; tv.s = 0; tv.us = 200000;
@@ -2226,11 +2276,6 @@ static int info_check(CFMutableDictionaryRef info)
  * (chacha key derive; the two screen time-sync callbacks): those are called by RVA
  * off the libAirPlay base (train-specific, logged as such).
  * ========================================================================*/
-/* SINK dispatch modes: see THE SINK DISPATCHER at the bottom of this file.
- * MIB3_SHIM_SINK = off (default) | helper (the Path B sender on the AU socket). */
-#define SINK_OFF 0
-#define SINK_HELPER 2
-static int g_sink = -1;          /* -1 = unresolved */
 static void sink_resolve(void);
 static int  sink_start(void);                    /* deferred to cluster_thread */
 static int  sink_feed(const void *data, unsigned long len, unsigned long ts);
@@ -3848,8 +3893,7 @@ static void run_banner(void){
   bs(&b," ======\n");
   bs(&b,"[mib3shim] ================================================================\n");
   mem[b.n]=0;
-  log_open();
-  if (logfd >= 0) write(logfd, mem, b.n);
+  log_write(mem, b.n);
 }
 
 int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
