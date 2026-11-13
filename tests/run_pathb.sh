@@ -190,9 +190,11 @@ else
      "differs ($(wc -c < "$OUT/fed.nops" | tr -d ' ') vs $(wc -c < "$OUT/wire.nops" | tr -d ' ') B)"
 fi
 # and the header must NOT have been silently dropped altogether
-$PY "$TOOLS/pes_extract.py" "$DG" --brief 2>/dev/null | grep -q 'params=0' \
-  && no framing_header_survived "params>0" "params=0 (header lost)" \
-  || ok framing_header_survived "params>0"
+HDR=$($PY "$TOOLS/pes_extract.py" "$DG" --brief 2>/dev/null)
+case "$HDR" in
+  *params=[1-9]*) ok framing_header_survived "params>0" ;;
+  *)              no framing_header_survived "params>0" "${HDR:-no output}" ;;
+esac
 grep -q "0 discontinuities" "$OUT/fold.report" && ok rtp_seq_continuous 0 || no rtp_seq_continuous 0 "$(grep 'discontin' "$OUT/fold.report")"
 
 echo; echo "############ T5b: every AU ends on a datagram boundary (MS-S format) ############"
