@@ -26,7 +26,6 @@
 #   sh deliver_ctl.sh handover back     # put the car's nav back, gated on its encoder
 #   sh deliver_ctl.sh oracle start      # start the MS-S live-log capture (the ORACLE)
 #   sh deliver_ctl.sh oracle stop|tail  # stop it / show the last decisions
-# (start_mss_log.sh is a thin wrapper for the same thing, for the day-of card.)
 #
 # SAFETY: on every mutating step a one-line breadcrumb (write + sync) lands on the
 #   STICK at <stick>/PART1/deliver.bc -- a fault here can reset the unit and wipe
@@ -35,8 +34,9 @@
 #   THE LABEL TRAP.)
 # ============================================================================
 set -u
-# All of these are overridable so the controller can be exercised against a MOCK RSI
-# on the desk (harness/run_delivery.sh).  On the unit the defaults are the live values.
+# All of these are overridable (with MIB3_DLV_STICK for the state dir) so the
+# controller can run against a fake RSI and MS-S log on the desk.  On the unit the
+# defaults are the live values.
 RSI="${MIB3_DLV_RSI:-127.0.0.1}"
 DMP="${MIB3_DLV_DMP:-49600}"      # displaymanagement
 LOGPORT="${MIB3_DLV_LOGPORT:-54321}"  # MS-S live log (the oracle)
@@ -471,7 +471,8 @@ handover_park() {
 
 # ----------------------------------------------------------------------------
 # handover back [secs] -- THE DOWN DIRECTION: put the cluster back on the car's own
-# map (ivi 33).  Used by transition_ctl.sh's SHUTDOWN/FALLBACK path.
+# map (ivi 33).  pathb_daemon.sh's release() runs it after every session and on
+# every failure path.
 #
 # It is gated on MS-S's own decisions, and it knows the trap that makes a plain
 # "delete ours, create the nav" leave the cluster on our stale frame:
