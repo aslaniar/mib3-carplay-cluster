@@ -901,7 +901,7 @@ hand_back_to_nav_rollback() {
     _mk3="$(oracle_mark)"
     h POST "http://$RSI:$DMP$_sp" '{"resync":false}' >/dev/null 2>&1; echo; nap_next_second
     h POST "http://$RSI:$DMP$_sp" '{"resync":true}' >/dev/null 2>&1; echo
-    if wait_oracle_ms "share_surface_id = $NAVID" $(( ${MIB3_DLV_ROLLBACK_T:-6} * 1000 )) "$_mk3"; then
+    if wait_oracle_ms "share_surface_id = $NAVID([^0-9]|\$)" $(( ${MIB3_DLV_ROLLBACK_T:-6} * 1000 )) "$_mk3"; then
       say "HANDOVER SWITCH: rollback OK -- the car's map is streaming again"
       return 0
     fi
@@ -1004,7 +1004,7 @@ handover_back() {
   # holder=3 and builds NO encoder), so gating on startShare would report success
   # while the cluster shows nothing.  [STATIC]+[EXEC]
   if [ "$_trap" = "0" ]; then
-    if wait_oracle_ms "share_surface_id = $NAVID" "$_fast" "$_mk"; then
+    if wait_oracle_ms "share_surface_id = $NAVID([^0-9]|\$)" "$_fast" "$_mk"; then
       tstep gate
       # H5 again: last mutation -> MS-S's line visible (see handover_switch)
       FLUSH=$(( $(now_ms) - _t_last_mut )); [ "$FLUSH" -lt 0 ] && FLUSH=0
@@ -1022,7 +1022,7 @@ handover_back() {
   _mk2="$(oracle_mark)"
   back_resync
   _t_resync="$(now_ms)"
-  if wait_oracle_ms "share_surface_id = $NAVID" $(( _to * 1000 )) "$_mk2"; then
+  if wait_oracle_ms "share_surface_id = $NAVID([^0-9]|\$)" $(( _to * 1000 )) "$_mk2"; then
     tstep rescue
     FLUSH2=$(( $(now_ms) - _t_resync )); [ "$FLUSH2" -lt 0 ] && FLUSH2=0
     EXTRA="$EXTRA flush2=${FLUSH2}ms"
