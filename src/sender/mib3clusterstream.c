@@ -867,23 +867,16 @@ static int emit_pump(Mux *m, u64 now)
      * while the same stream runs at 28 per 25 ms when calm and the car's own
      * stream peaks at 61.  The clump IS the artifact.
      *
-     * So keep the RATE and extend the slot instead: recompute the slot from the
-     * bytes still to send, at the same bytes-per-millisecond the AU was armed
-     * with.  A frame then simply takes two or three frame-times to leave -- which
-     * is exactly what the working sender does (the car's own keyframe occupies
-     * ~430 ms of wire against a 100 ms frame interval) -- and the release clock
-     * waits for it rather than flushing it. */
+     * So keep the RATE and extend the slot instead: shift the slot so the next
+     * datagram is due now, and the rest follow at the bytes-per-millisecond the
+     * AU was armed with.  A frame then simply takes two or three frame-times to
+     * leave -- which is exactly what the working sender does (the car's own
+     * keyframe occupies ~430 ms of wire against a 100 ms frame interval) -- and
+     * the release clock waits for it rather than flushing it. */
     if (m->dcursor < m->dndg && m->au_iv_ms &&
         now > m->au_t0_ns + m->au_iv_ms * 1000000ull) {
         if (!m->overrun_seen) { m->spread_overruns++; m->overrun_seen = 1; }
-        { u64 total = m->au_payload ? m->au_payload : 1;
-          u64 done  = (m->dcursor > 0) ? m->dcum[m->dcursor - 1] : 0;
-          u64 rem   = (done < total) ? (total - done) : 0;
-          u64 extra = (rem * m->au_iv_ms) / total;
-          if (!extra) extra = 1;
-          m->au_t0_ns = now;              /* re-anchor: same rate, more time */
-          m->au_iv_ms = extra;
-        }
+        m->au_t0_ns += now - emit_due_ns(m, m->dcursor);
     }
     if (m->dcursor >= m->dndg) {
         m->dndg = m->dcursor = 0;
@@ -925,7 +918,6 @@ static u64 emit_timeout_ns(Mux *m)
     u64 now, due;
     if (m->dcursor >= m->dndg) return cap;
     now = now_ns();
-    if (m->au_iv_ms && now > m->au_t0_ns + m->au_iv_ms * 1000000ull) return 0;
     due = emit_due_ns(m, m->dcursor);
     if (due <= now) return 0;                /* due now: do not block at all */
     return (due - now) < cap ? (due - now) : cap;
