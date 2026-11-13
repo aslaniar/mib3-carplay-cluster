@@ -19,7 +19,9 @@
 #   D6   `pathbctl release` while ACTIVE hands the cluster back
 #   D7   park fails after we bound -> we give the port straight back
 #   D8   the pause marker stops any takeover
-#   D9   a second daemon refuses to run (single instance)
+#   D9   a second daemon refuses to run (single instance), two started together
+#        leave one, `stop` never kills a stranger a stale pidfile names, and a
+#        lock left by a killed daemon does not block the next start
 #   D10  restart with a sender that still holds the port -> reconcile releases
 #   D11  the sender dying while ACTIVE -> release, then a new sender retakes it
 #   D12  the state file carries the fields the CLI needs
@@ -146,6 +148,7 @@ reset_all(){
         "$TMP"/pathb_daemon.pause "$TMP"/pathb_daemon.pid "$TMP"/order.log \
         "$TMP"/port_held "$TMP"/fake_phone "$TMP"/back_fail "$TMP"/no_emit \
         "$TMP"/pathb_nav.parked
+  rmdir "$TMP/pathb_daemon.lock" 2>/dev/null
 }
 dstart(){ nohup sh "$DAEMON" run >"$TMP/daemon.stdout" 2>&1 & sleep 0.8; }
 dstate(){ sed -n 's/^state=\([A-Z]*\).*/\1/p' "$TMP/pathb_daemon.state" 2>/dev/null; }
@@ -249,6 +252,45 @@ sleep 0.8
 kill -9 "$_sec" 2>/dev/null
 chk d9_refuses_second "$( has x 'already running' "$TMP/second.out" )" "the second instance refused"
 chk d9_first_alive "$( kill -0 "$(cat "$TMP/pathb_daemon.pid" 2>/dev/null)" 2>/dev/null && echo 1 || echo 0 )" "first still running"
+reset_all
+# the check-then-write race loses about half the time, so one round proves little
+_lives=""
+for _r in 1 2 3 4 5; do
+  sh "$DAEMON" run >/dev/null 2>&1 &
+  _a=$!
+  sh "$DAEMON" run >/dev/null 2>&1 &
+  _b=$!
+  sleep 1.5
+  _n=0
+  kill -0 "$_a" 2>/dev/null && _n=$((_n+1))
+  kill -0 "$_b" 2>/dev/null && _n=$((_n+1))
+  _lives="$_lives$_n"
+  kill "$_a" "$_b" 2>/dev/null
+  _i=0; while [ "$_i" -lt 100 ] && { kill -0 "$_a" || kill -0 "$_b"; } 2>/dev/null; do sleep 0.05; _i=$((_i+1)); done
+  reset_all
+done
+chk d9_simultaneous_start "$( [ "$_lives" = "11111" ] && echo 1 || echo 0 )" "one daemon per simultaneous start, 5 rounds ($_lives)"
+# A pidfile left by a killed daemon can name a recycled pid.  `stop` runs as root.
+sleep 30 &
+_unrel=$!
+printf '%s\n' "$_unrel" >"$TMP/pathb_daemon.pid"
+sh "$DAEMON" stop >/dev/null 2>&1
+chk d9_daemon_stop_spares_stranger "$( kill -0 "$_unrel" 2>/dev/null && echo 1 || echo 0 )" "pathb_daemon stop left pid $_unrel alone"
+kill "$_unrel" 2>/dev/null
+sleep 30 &
+_unrel=$!
+printf '%s\n' "$_unrel" >"$TMP/pathb_daemon.pid"
+PATHB_RAM="$TMP" sh "$CLI" stop >/dev/null 2>&1
+chk d9_cli_stop_spares_stranger "$( kill -0 "$_unrel" 2>/dev/null && echo 1 || echo 0 )" "pathbctl stop left pid $_unrel alone"
+kill "$_unrel" 2>/dev/null
+sleep 30 &
+_unrel=$!
+mkdir -p "$TMP/pathb_daemon.lock"
+printf '%s\n' "$_unrel" >"$TMP/pathb_daemon.pid"
+dstart
+_np=$(cat "$TMP/pathb_daemon.pid" 2>/dev/null)
+chk d9_stale_lock_recovers "$( [ -n "$_np" ] && [ "$_np" != "$_unrel" ] && kill -0 "$_np" 2>/dev/null && echo 1 || echo 0 )" "started over a stale lock (pid $_np)"
+kill "$_unrel" 2>/dev/null
 reset_all
 
 echo

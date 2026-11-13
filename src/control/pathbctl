@@ -26,6 +26,7 @@ RAM=${PATHB_RAM:-/dev/shm}
 STATE=$RAM/pathb_daemon.state
 LOG=$RAM/pathb_daemon.log
 PIDF=$RAM/pathb_daemon.pid
+LOCKD=$RAM/pathb_daemon.lock
 CMDF=$RAM/pathb_daemon.cmd
 PAUSEF=$RAM/pathb_daemon.pause
 DAEMON=$HERE/pathb_daemon.sh
@@ -60,10 +61,19 @@ dur(){  # ms -> "1.8s" | "2m14s" | "1h02m"
   fi
 }
 
+is_daemon(){  # <pid>: a stale pidfile can name a recycled pid, so check what runs there
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null || return 1
+  if [ -r "/proc/$1/cmdline" ]; then
+    grep -q pathb_daemon "/proc/$1/cmdline" 2>/dev/null
+  else
+    ps -o args= -p "$1" 2>/dev/null | grep -q pathb_daemon
+  fi
+}
+
 alive(){
   _p=$(cat "$PIDF" 2>/dev/null)
-  case "${_p:-}" in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$_p" 2>/dev/null || return 1
+  is_daemon "$_p" || return 1
   printf '%s' "$_p"
   return 0
 }
@@ -126,7 +136,7 @@ case "${1:-status}" in
       fi
     else
       echo "  daemon     not running"
-      [ -f "$PIDF" ] && echo "  note       a stale pidfile exists ($(cat "$PIDF" 2>/dev/null)); it names nothing"
+      [ -f "$PIDF" ] && echo "  note       a stale pidfile exists ($(cat "$PIDF" 2>/dev/null)); it names no daemon"
       [ -r "$STATE" ] && echo "  last state $(cat "$STATE")"
     fi
     ;;
@@ -174,7 +184,7 @@ case "${1:-status}" in
     ;;
 
   stop)
-    if ! _p=$(alive); then echo "pathbctl: not running"; rm -f "$PIDF"; exit 0; fi
+    if ! _p=$(alive); then echo "pathbctl: not running"; rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null; exit 0; fi
     kill "$_p" 2>/dev/null
     _i=0
     while [ "$_i" -lt 60 ]; do
@@ -182,7 +192,7 @@ case "${1:-status}" in
       sleep 0.1 2>/dev/null || sleep 1
       _i=$((_i+1))
     done
-    kill -9 "$_p" 2>/dev/null
+    is_daemon "$_p" && kill -9 "$_p" 2>/dev/null
     echo "pathbctl: killed (it did not stop in 6s) -- run 'pathbctl status'"
     ;;
 

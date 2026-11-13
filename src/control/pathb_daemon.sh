@@ -83,6 +83,7 @@ SOCK=${PATHB_SOCK:-$RAM/mib3cluster.sock}
 STATE=$RAM/pathb_daemon.state
 LOG=$RAM/pathb_daemon.log
 PIDF=$RAM/pathb_daemon.pid
+LOCKD=$RAM/pathb_daemon.lock
 CMDF=$RAM/pathb_daemon.cmd
 PAUSEF=$RAM/pathb_daemon.pause
 PARKF=$RAM/pathb_nav.parked
@@ -194,6 +195,18 @@ set_state(){  # set_state <state> <reason>
 
 paused(){ [ -f "$PAUSEF" ]; }
 me(){ cat "$PIDF" 2>/dev/null; }
+
+# A PIDFILE IS A CLAIM, NOT EVIDENCE.  One left by a killed daemon can name a
+# recycled pid, and `stop` runs as root: only a process running this script is us.
+is_daemon(){  # <pid>
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null || return 1
+  if [ -r "/proc/$1/cmdline" ]; then
+    grep -q pathb_daemon "/proc/$1/cmdline" 2>/dev/null
+  else
+    ps -o args= -p "$1" 2>/dev/null | grep -q pathb_daemon
+  fi
+}
 
 # --------------------------------------------------------------- the sender
 proc_comm(){  # basename of pid $1's executable, truncated like /proc comm
@@ -599,7 +612,7 @@ on_stop(){
   read_sender
   if [ -f "$PARKF" ] || [ "${S_BOUND:-0}" != "0" ]; then release "daemon-stop"; fi
   sender_stop
-  rm -f "$PIDF"
+  rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null
   exit 0
 }
 
@@ -723,10 +736,16 @@ do_tick(){
 
 do_run(){
   _me=$$
-  _old=$(me)
-  if [ -n "${_old:-}" ] && [ "$_old" != "$_me" ] && kill -0 "$_old" 2>/dev/null; then
-    echo "pathb_daemon: already running (pid $_old)"
-    return 0
+  # mkdir is the atomic test-and-set.  The holder writes the pidfile right after
+  # it, so a lock with no pid is a start in progress, not a stale one.
+  if ! mkdir "$LOCKD" 2>/dev/null; then
+    _old=$(me)
+    if [ -z "${_old:-}" ] || is_daemon "$_old"; then
+      echo "pathb_daemon: already running (pid ${_old:-starting})"
+      return 0
+    fi
+    rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null
+    mkdir "$LOCKD" 2>/dev/null || { echo "pathb_daemon: already running"; return 0; }
   fi
   printf '%s\n' "$_me" >"$PIDF"
   STARTED=$(now_ms); ST_SINCE=$STARTED
@@ -758,7 +777,7 @@ do_run(){
 
 do_status(){
   _p=$(me)
-  if [ -n "${_p:-}" ] && kill -0 "$_p" 2>/dev/null; then
+  if is_daemon "$_p"; then
     echo "daemon:   RUNNING pid $_p"
   else
     echo "daemon:   not running"
@@ -776,9 +795,9 @@ do_status(){
 
 do_stop(){
   _p=$(me)
-  if [ -z "${_p:-}" ] || ! kill -0 "$_p" 2>/dev/null; then
+  if ! is_daemon "$_p"; then
     echo "pathb_daemon: not running"
-    rm -f "$PIDF"
+    rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null
     return 0
   fi
   kill "$_p" 2>/dev/null
@@ -787,8 +806,11 @@ do_stop(){
     kill -0 "$_p" 2>/dev/null || break
     nap_ms 100; _i=$((_i+1))
   done
-  kill -9 "$_p" 2>/dev/null
-  rm -f "$PIDF"
+  if is_daemon "$_p"; then
+    # killed past its trap: nothing else will clear its claim
+    kill -9 "$_p" 2>/dev/null
+    rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null
+  fi
   echo "pathb_daemon: stopped"
 }
 
