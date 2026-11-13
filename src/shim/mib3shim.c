@@ -3718,7 +3718,9 @@ static void run_banner(void){
    * plugs, so a resolution cached from a previous plug would silently ignore the
    * change (the 2026-10-16 "banner still reads a stale knob" class of bug).  Reset
    * the breadcrumb fd too so the stick path is re-discovered if it just mounted. */
-  g_sink = -1; bc_fd = -2;
+  g_sink = -1;
+  if (bc_fd >= 0) close(bc_fd);
+  bc_fd = -2;
   bs(&b,"  SINK="); sink_resolve(); bu64(&b,(u64)(u32)g_sink,10,0);
   bs(&b," (0=off 2=helper)");
   /* view-area / command-completion knobs (2026-10-19) */
