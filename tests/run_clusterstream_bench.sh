@@ -188,13 +188,15 @@ echo; echo "############ T10: --probe mode (blind capture of an existing sender)
 "$NAT" --in "$OUT/frames.264" --dst "ff14::2:4%lo0" --port 45888 --fps 60 --loop >/dev/null 2>&1 &
 SP=$!
 sleep 0.6
-"$NAT" --probe --dst "ff14::2:4%lo0" --port 45888 --probe-count 12 --out "file:$OUT/probe.bin" \
-      >/dev/null 2>"$OUT/probe.log"
+# --probe-secs bounds the wait: with nothing arriving on the group (a sandbox
+# that blocks multicast loopback) the probe otherwise never returns.
+"$NAT" --probe --dst "ff14::2:4%lo0" --port 45888 --probe-count 12 --probe-secs 5 \
+      --out "file:$OUT/probe.bin" >/dev/null 2>"$OUT/probe.log"
 kill $SP 2>/dev/null; wait $SP 2>/dev/null
 if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/probe.bin" --quiet --no-psi >/dev/null 2>&1; then
   ok probe_capture verified
 else
-  no probe_capture verified "$(tail -1 "$OUT/probe.log")"
+  no probe_capture verified "$(grep -o 'datagrams=[0-9]*' "$OUT/probe.log" | head -1) of 12 in 5 s on ff14::2:4%lo0 (multicast loopback blocked?)"
 fi
 sed 's/^/  /' "$OUT/probe.log"
 
