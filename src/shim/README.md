@@ -10,7 +10,7 @@ process; no LG binary is modified.
 - the self-contained type-111 receiver with chacha/AES decrypt;
 - the AU-socket hop (`MIB3_SHIM_SINK=helper` → `bin/mib3clusterstream`, the RTP/TS sender);
 - the command channel (showUI / forceKeyFrame / updateViewArea / zoom / appearance);
-- the control inbox + wheel lane, and the librsic crash guard.
+- the control inbox + wheel lane.
 
 `MIB3_SHIM_SINK` is `off` | `helper` only; anything else is refused with a loud log line.
 
