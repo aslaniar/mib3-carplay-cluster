@@ -348,9 +348,9 @@ oracle_start() {
     [ "$(oracle_mark)" -gt "${_s0:-0}" ] && break
     nap 0.1; _i=$((_i+1))
   done
-  if [ "$(oracle_mark)" -gt "${_s0:-0}" ]; then say "oracle live (pid $(cat "$OPID" 2>/dev/null)) -> $MSSLOG"
-  else say "WARN: oracle produced nothing yet (port $LOGPORT closed?)"; fi
-  return 0
+  if [ "$(oracle_mark)" -gt "${_s0:-0}" ]; then say "oracle live (pid $(cat "$OPID" 2>/dev/null)) -> $MSSLOG"; return 0; fi
+  say "WARN: oracle produced nothing yet (port $LOGPORT closed?)"
+  return 1
 }
 oracle_on() {
   P="$(oracle_pid)"
@@ -367,8 +367,7 @@ oracle_ensure() {
     [ -n "${_old:-}" ] && say "oracle: pid '$_old' is gone or is not our curl -- starting a fresh capture"
     rm -f "$OPID" 2>/dev/null
     oracle_rotate
-    oracle_start
-    return 0
+    oracle_start; return $?
   fi
   _sz="$(oracle_mark)"
   _psz=""; _pt=""
@@ -382,8 +381,7 @@ oracle_ensure() {
     say "oracle: capture pid $P has NOT grown in $(( $(now_ms) - _pt ))ms -- restarting it"
     oracle_off
     oracle_rotate
-    oracle_start
-    return 0
+    oracle_start; return $?
   fi
   printf '%s %s\n' "$_sz" "$(now_ms)" > "$OSTATE" 2>/dev/null
   return 0
@@ -1041,8 +1039,9 @@ do_handover() {
   _st="${1:-full}"
   _to="${2:-}"
   bc "handover:start stage=$_st"
-  oracle_ensure          # restart a dead/not-delivering capture before any gate uses it
-  if oracle_live; then NOOR=0; else
+  # restart a dead/not-delivering capture before any gate uses it.  A non-empty
+  # log is not proof: a capture that just failed to restart leaves the old one.
+  if oracle_ensure && oracle_live; then NOOR=0; else
     NOOR=1
     say "HANDOVER WARN: the MS-S oracle is silent (port $LOGPORT closed?) -- gates DEGRADE to"
     say "  fixed waits and the pass/fail verdicts become unverifiable. Read the dash + MS-S fds."
