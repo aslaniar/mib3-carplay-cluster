@@ -33,10 +33,14 @@ LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
 LIBC="$ROOT/lib64/libc.so.6"
 mkdir -p "$OUT"
+# AF_UNIX paths are capped at 104 bytes on macOS, so the socket never lives under $OUT.
+SOCKDIR="$(mktemp -d /tmp/mib3.XXXXXX)"
+trap 'rm -rf "$SOCKDIR"' EXIT INT TERM
 
-P=0; F=0
+P=0; F=0; S=0
 ok(){ echo "PBENCH $1 exp=$2 got=$2 PASS"; P=$((P+1)); }
 no(){ echo "PBENCH $1 exp=$2 got=$3 FAIL"; F=$((F+1)); }
+sk(){ echo "PBENCH $1 SKIP ($2)"; S=$((S+1)); }
 
 echo "############ T1: native build ############"
 if cc -O2 -Wall -Wextra -o "$OUT/mib3clusterstream.native" "$REPO/src/sender/mib3clusterstream.c" 2>"$OUT/native.build.log"; then
@@ -48,8 +52,7 @@ NAT="$OUT/mib3clusterstream.native"
 
 echo; echo "############ T2: unit build (aarch64 + unit glibc) ############"
 if [ ! -d "$ROOT" ]; then
-  echo "  SKIP: R8830L_ROOTFS not present -- the aarch64/unit-glibc leg needs the"
-  echo "        firmware's lib64.  It is not distributed with this repository."
+  sk unit_build "R8830L_ROOTFS not present: the aarch64/unit-glibc leg needs the firmware's lib64, which is not distributed with this repository"
 elif "$CC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
         -fuse-ld="$LLD" -pie -Wl,-e,_start \
         -Wl,--dynamic-linker,/lib64/ld-linux-aarch64.so.1 \
@@ -125,11 +128,11 @@ if [ -x "$TSHARK" ]; then
   "$TSHARK" -r "$OUT/stream.pcap" -d udp.port==42800,rtp -c 1 -T fields -e rtp.ssrc 2>/dev/null \
     | grep -q "0x000186a0" && ok tshark_ssrc_100000 0x000186a0 || no tshark_ssrc_100000 0x000186a0 "absent"
 else
-  echo "  (tshark not found -- skipping; not a failure)"
+  sk tshark_dissection "tshark not found"
 fi
 
 echo; echo "############ T8: unix (helper-protocol) input mode ############"
-python3 - "$OUT/frames.264" "$OUT/fake_shim.sock" <<'PY' &
+python3 - "$OUT/frames.264" "$SOCKDIR/fake_shim.sock" <<'PY' &
 import sys, socket, struct, time, os
 frames=open(sys.argv[1],'rb').read()
 # re-split into AUs the same way (4-byte start codes, SPS+PPS+IDR per AU)
@@ -152,7 +155,7 @@ PY
 PY_PEER=$!
 # The muxer RE-ACCEPTS forever since 2026-10-26 (a shim reconnect must not kill the
 # delivery), so run it in the background and stop it once the peer is done.
-"$NAT" --in "unix:$OUT/fake_shim.sock" --out "file:$OUT/stream_unix.dgrams" >/dev/null 2>"$OUT/unix.log" &
+"$NAT" --in "unix:$SOCKDIR/fake_shim.sock" --out "file:$OUT/stream_unix.dgrams" >/dev/null 2>"$OUT/unix.log" &
 MUXPID=$!
 wait $PY_PEER 2>/dev/null
 sleep 0.6
@@ -183,7 +186,7 @@ if command -v container >/dev/null 2>&1 && [ -x "$OUT/mib3clusterstream.unit" ];
   fi
   tr -d '\r' < "$OUT/container.log" | grep -E 'access units|datagrams|rc=' | sed 's/^/  /'
 else
-  echo "  (container CLI or unit binary unavailable -- skipping T9)"
+  sk unit_binary_runs_under_unit_loader "needs the T2 unit build and Apple's container CLI"
 fi
 
 echo; echo "############ T10: --probe mode (blind capture of an existing sender) ############"
@@ -204,6 +207,6 @@ sed 's/^/  /' "$OUT/probe.log"
 
 echo
 echo "============================================================"
-echo "Path B bench: PASS=$P FAIL=$F   (artifacts in $OUT)"
+echo "Path B bench: PASS=$P FAIL=$F SKIP=$S   (artifacts in $OUT)"
 echo "============================================================"
 [ "$F" -eq 0 ]

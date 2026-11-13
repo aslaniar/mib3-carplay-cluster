@@ -7,7 +7,9 @@
 # runs the old framing on purpose and must not satisfy T3:
 #
 #   T1  native build, -Wall -Wextra clean
-#   T2  unit build (aarch64, unit glibc), runs under the unit's own ld-2.23.so
+#   T2  unit build (aarch64, unit glibc).  Build only, and only with R8830L_ROOTFS;
+#       the run under the unit's own ld-2.23.so is the optional last leg of T12,
+#       which also needs Apple's `container`
 #   T3  FRAMING: shim-style input folds to one PES per frame, params in that PES
 #   T4  ...and the assertion is not vacuous: --no-fold (old behaviour) fails it
 #   T5  ES stays byte-exact through the fold (no byte is rewritten)
@@ -39,18 +41,21 @@ LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
 PY=python3
 mkdir -p "$OUT"
+# AF_UNIX paths are capped at 104 bytes on macOS, so sockets never live under $OUT.
+SOCKDIR="$(mktemp -d /tmp/mib3.XXXXXX)"
 
-P=0; F=0
+P=0; F=0; S=0
 ok(){ echo "PATHB $1 exp=$2 got=$2 PASS"; P=$((P+1)); }
 no(){ echo "PATHB $1 exp=$2 got=$3 FAIL"; F=$((F+1)); }
+sk(){ echo "PATHB $1 SKIP ($2)"; S=$((S+1)); }
 chk(){ if [ "$2" = "1" ]; then ok "$1" "$3"; else no "$1" "$3" "${4:-no}"; fi; }
 
 CLEANUP_PIDS=""
 cleanup(){
   for p in $CLEANUP_PIDS; do kill "$p" 2>/dev/null; done
-  rm -f "$OUT"/sock* 2>/dev/null
+  rm -f "$SOCKDIR"/* 2>/dev/null
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup; rm -rf "$SOCKDIR"' EXIT INT TERM
 track(){ CLEANUP_PIDS="$CLEANUP_PIDS $1"; }
 
 NAT="$OUT/mib3clusterstream.native"
@@ -67,8 +72,7 @@ fi
 
 echo; echo "############ T2: unit build (aarch64 + unit glibc) ############"
 if [ ! -d "$ROOT" ]; then
-  echo "  SKIP: R8830L_ROOTFS not present -- the aarch64/unit-glibc leg needs the"
-  echo "        firmware's lib64.  It is not distributed with this repository."
+  sk unit_build_glibc "R8830L_ROOTFS not present: the aarch64/unit-glibc leg needs the firmware's lib64, which is not distributed with this repository"
 elif "$LLVMCC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
         -fuse-ld="$LLD" -pie -Wl,-e,_start \
         -Wl,--dynamic-linker,/lib64/ld-linux-aarch64.so.1 \
@@ -83,7 +87,7 @@ fi
 # Run the muxer in unix mode against a shim-faithful feeder, then look at PES.
 frame_case(){   # $1=tag  $2=extra muxer args
   local tag="$1"; shift
-  local sock="$OUT/sock.$tag" dg="$OUT/$tag.dgrams"
+  local sock="$SOCKDIR/$tag" dg="$OUT/$tag.dgrams"
   rm -f "$sock" "$dg"
   "$NAT" --in "unix:$sock" --out "file:$dg" "$@" 2>"$OUT/$tag.mux.log" &
   local mp=$!; track $mp
@@ -248,7 +252,7 @@ else
 fi
 
 
-SOCK="$OUT/sock.recon"; DG2="$OUT/recon.dgrams"; rm -f "$SOCK" "$DG2"
+SOCK="$SOCKDIR/recon"; DG2="$OUT/recon.dgrams"; rm -f "$SOCK" "$DG2"
 "$NAT" --in "unix:$SOCK" --out "file:$DG2" 2>"$OUT/recon.mux.log" &
 MP=$!; track $MP
 for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.05; done
@@ -289,7 +293,7 @@ echo; echo "############ T6b: a feed FASTER than the pacer must not lose its tai
 # never reached the wire and nothing said so.  The reconnect test above cannot see
 # that, because at 40 fps the feed is slower than the pacer and the queue never
 # fills.  So feed as fast as the socket allows and require EVERY AU to arrive.
-SOCKF="$OUT/sock.fast"; DGF="$OUT/fast.dgrams"; rm -f "$SOCKF" "$DGF"
+SOCKF="$SOCKDIR/fast"; DGF="$OUT/fast.dgrams"; rm -f "$SOCKF" "$DGF"
 "$NAT" --in "unix:$SOCKF" --out "file:$DGF" --pace-ms 40 2>"$OUT/fast.mux.log" &
 FP=$!; track $FP
 for _ in $(seq 1 40); do [ -S "$SOCKF" ] && break; sleep 0.05; done
@@ -386,7 +390,7 @@ grep -q "window elapsed" "$OUT/dark.log" && ok probe_reports_window yes || no pr
 echo "  elapsed ${EL}s, rc=$RC"
 
 echo; echo "############ T10: AU socket is 0777 ############"
-SOCK3="$OUT/sock.hyg"; rm -f "$SOCK3"
+SOCK3="$SOCKDIR/hyg"; rm -f "$SOCK3"
 "$NAT" --in "unix:$SOCK3" --out "file:$OUT/hyg.dgrams" 2>/dev/null &
 HP=$!; track $HP
 for _ in $(seq 1 40); do [ -S "$SOCK3" ] && break; sleep 0.05; done
@@ -469,7 +473,7 @@ if command -v container >/dev/null 2>&1 && [ -x "$UNIT" ]; then
     no unit_binary_under_unit_loader verified "$(tail -1 "$OUT/unitrun.log")"
   fi
 else
-  echo "  (container CLI unavailable -- skipping the unit-loader run)"
+  sk unit_binary_under_unit_loader "needs the T2 unit build and Apple's container CLI"
 fi
 
 # T13-T16 tested the retired shell controller (live_kit/pathb_ctl.sh).  That
@@ -494,7 +498,7 @@ open(sys.argv[2], "wb").write(d[nals[a-2][0]:nals[a][0]] + d[nals[a+1][0]:])
 PY
 gate_case(){   # $1=tag  $2..=extra muxer args
   local tag="$1"; shift
-  local sock="$OUT/sock.$tag" dg="$OUT/$tag.dgrams"
+  local sock="$SOCKDIR/$tag" dg="$OUT/$tag.dgrams"
   rm -f "$sock" "$dg"
   "$NAT" --in "unix:$sock" --out "file:$dg" "$@" 2>"$OUT/$tag.mux.log" &
   local mp=$!; track $mp
@@ -530,26 +534,27 @@ echo "############ T23-T25: MONITOR mode -- the port is taken on command #######
 # The resident supervisor's whole contract: own the AU socket from boot, take the
 # cluster's UDP port only when told, and give it back on command.  Nothing here
 # needs a phone: the control file is the interface.
-MON="$OUT/mon"
-rm -f "$MON".state "$MON".ctl "$MON".log "$MON".sock
+# The sender caps --ctl and --conn-state at 111 bytes, so they share the short dir.
+MON="$SOCKDIR/mon"; MONLOG="$OUT/mon.log"
+rm -f "$MON".state "$MON".ctl "$MON".sock "$MONLOG"
 "$NAT" --in "unix:$MON.sock" --dst "ff14::2:4%lo0" --port "$GPORT" --sport "$SPORT" \
-       --monitor --conn-state "$MON.state" --ctl "$MON.ctl" >"$MON.log" 2>&1 &
+       --monitor --conn-state "$MON.state" --ctl "$MON.ctl" >"$MONLOG" 2>&1 &
 MONPID=$!; track $MONPID
 sleep 0.6
-chk mon_starts_unbound "$(grep -q 'monitor: AU socket only' "$MON.log" && echo 1 || echo 0)" "no bind at start"
-chk mon_does_not_grab "$(grep -q 'bound source port' "$MON.log" && echo 0 || echo 1)" "port untouched"
+chk mon_starts_unbound "$(grep -q 'monitor: AU socket only' "$MONLOG" && echo 1 || echo 0)" "no bind at start"
+chk mon_does_not_grab "$(grep -q 'bound source port' "$MONLOG" && echo 0 || echo 1)" "port untouched"
 chk mon_state_unbound "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$MON.state" 2>/dev/null | grep -qx 0 && echo 1 || echo 0)" "bound=0"
 
 printf 'bind %s\n' "$SPORT" >"$MON.ctl"
 _i=0; while [ "$_i" -lt 40 ]; do
-  grep -q "PORT OURS" "$MON.log" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
-chk mon_bind_on_command "$(grep -q 'PORT OURS' "$MON.log" && echo 1 || echo 0)" "bound after 'bind'"
+  grep -q "PORT OURS" "$MONLOG" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
+chk mon_bind_on_command "$(grep -q 'PORT OURS' "$MONLOG" && echo 1 || echo 0)" "bound after 'bind'"
 chk mon_state_bound "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$MON.state" 2>/dev/null | grep -qx "$SPORT" && echo 1 || echo 0)" "bound=$SPORT"
 
 printf 'unbind\n' >"$MON.ctl"
 _i=0; while [ "$_i" -lt 40 ]; do
-  grep -q "port released" "$MON.log" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
-chk mon_unbind_on_command "$(grep -q 'port released' "$MON.log" && echo 1 || echo 0)" "released after 'unbind'"
+  grep -q "port released" "$MONLOG" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
+chk mon_unbind_on_command "$(grep -q 'port released' "$MONLOG" && echo 1 || echo 0)" "released after 'unbind'"
 chk mon_state_unbound_again "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$MON.state" 2>/dev/null | grep -qx 0 && echo 1 || echo 0)" "bound=0"
 # PROOF, not a log line: the port is actually free for somebody else.
 $PY - "$SPORT" <<'PYBIND' >/dev/null 2>&1 && ok mon_port_really_free yes || no mon_port_really_free yes "still bound"
@@ -573,6 +578,6 @@ fi
 
 echo
 echo "============================================================"
-echo "Path B bench: PASS=$P FAIL=$F   (artifacts in $OUT)"
+echo "Path B bench: PASS=$P FAIL=$F SKIP=$S   (artifacts in $OUT)"
 echo "============================================================"
 [ "$F" -eq 0 ]
