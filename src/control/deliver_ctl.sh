@@ -127,7 +127,7 @@ nap() {
   nap_probe
   if [ "$NAP_F" = "f" ]; then sleep "$_sec" 2>/dev/null; return 0; fi
   case "$_sec" in
-    ''|0|0.0*) sleep 1 ;;
+    ''|0|0.0|0.00*) sleep 1 ;;
     0.*)       # busybox `sleep` is INTEGER-ONLY on this unit, so `nap 0.1` used to
                # burn a full second -- every gate poll, every retry, the fps join.
                # busybox HAS a usleep applet and it is accurate (measured 110 ms for
