@@ -98,6 +98,10 @@ SPIDF=$RAM/pathb_sender.pid
 SLOG=$RAM/pathb_sender.log
 MUXER=${PATHB_MUXER:-/tmp/kit/mib3clusterstream}
 DELIVER=${PATHB_DELIVER:-$HERE/deliver_ctl.sh}
+# deliver_ctl keeps its lock, oracle pid and MS-S capture in this dir.  Exported
+# before ANY call (reconcile and the first housekeeping run before the first
+# prepare_tick), or a mounted stick becomes that dir and gets an 8 MB/min capture.
+MIB3_DLV_STICK=${MIB3_DLV_STICK:-$RAM}; export MIB3_DLV_STICK
 DELAYLOG=$RAM/pathb_deliver.log
 DST=${PATHB_DST:-ff14::2:4%eth0.5}
 GPORT=${PATHB_GROUP_PORT:-42800}
@@ -599,7 +603,6 @@ prepare_tick(){   # idempotent, cheap; the loop's housekeeping
   if [ "$BENCH" != "1" ]; then
     knobs_once
     if [ "$ORACLE_DONE" = "0" ] && [ -f "$DELIVER" ]; then
-      MIB3_DLV_STICK=/dev/shm; export MIB3_DLV_STICK
       if sh "$DELIVER" oracle start >/dev/null 2>&1; then ORACLE_DONE=1; log "prepare: oracle up"; fi
     fi
     if [ "$WHEEL_DONE" = "0" ]; then
