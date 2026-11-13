@@ -65,9 +65,9 @@ is_daemon(){  # <pid>: a stale pidfile can name a recycled pid, so check what ru
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$1" 2>/dev/null || return 1
   if [ -r "/proc/$1/cmdline" ]; then
-    grep -q pathb_daemon "/proc/$1/cmdline" 2>/dev/null
+    grep -q 'pathb_daemon\.sh' "/proc/$1/cmdline" 2>/dev/null
   else
-    ps -o args= -p "$1" 2>/dev/null | grep -q pathb_daemon
+    ps -o args= -p "$1" 2>/dev/null | grep -q 'pathb_daemon\.sh'
   fi
 }
 

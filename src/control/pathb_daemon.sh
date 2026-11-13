@@ -184,7 +184,8 @@ log(){
 state_write(){
   printf 'state=%s since_ms=%s started_ms=%s reason=%s port=%s bound=%s conn=%s ready=%s au=%s out=%s paused=%s sender=%s\n' \
     "$ST" "$ST_SINCE" "$STARTED" "$ST_REASON" "${PORT:--}" "$S_BOUND" "$S_CONN" "$S_READY" \
-    "$S_AU" "$S_OUT" "$(paused && echo yes || echo no)" "${SENDER_PID:--}" >"$STATE" 2>/dev/null
+    "$S_AU" "$S_OUT" "$(paused && echo yes || echo no)" "${SENDER_PID:--}" >"$STATE.tmp" 2>/dev/null \
+    && mv -f "$STATE.tmp" "$STATE" 2>/dev/null   # a reader never sees the truncated file
 }
 
 set_state(){  # set_state <state> <reason>
@@ -203,9 +204,9 @@ is_daemon(){  # <pid>
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$1" 2>/dev/null || return 1
   if [ -r "/proc/$1/cmdline" ]; then
-    grep -q pathb_daemon "/proc/$1/cmdline" 2>/dev/null
+    grep -q 'pathb_daemon\.sh' "/proc/$1/cmdline" 2>/dev/null
   else
-    ps -o args= -p "$1" 2>/dev/null | grep -q pathb_daemon
+    ps -o args= -p "$1" 2>/dev/null | grep -q 'pathb_daemon\.sh'
   fi
 }
 
