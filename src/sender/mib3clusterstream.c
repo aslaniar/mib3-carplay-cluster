@@ -1618,7 +1618,8 @@ static int alen[MAXAU];
  *   <ctl> :  "bind <port>" | "unbind"
  *
  * Read at most every 100 ms, from the loops, and acted on only when the text
- * CHANGES -- so a stale file cannot re-bind twice.
+ * CHANGES -- so a stale file cannot re-bind twice.  A bind that failed is not
+ * remembered, so it is retried until it succeeds or the text changes.
  * ========================================================================= */
 static char g_host[128];
 static const char *g_ifname = "eth0.5";
@@ -1701,7 +1702,13 @@ static void output_bind(Mux *m)
     if (m->out_fd >= 0) return;
     if (g_ctl_port > 0) g_sport = g_ctl_port;
     fd = udp_open();
-    if (fd < 0) { say("ctl: bind did not happen\n"); return; }
+    if (fd < 0) {
+        /* Forget the command, so the same "bind <port>" is retried on the next
+         * poll: the port usually frees moments after the supervisor asks. */
+        g_ctl_last[0] = 0;
+        say("ctl: bind did not happen -- retrying\n");
+        return;
+    }
     m->out_fd = fd;
     m->dndg = m->dcursor = 0;
     g_bound = g_sport;

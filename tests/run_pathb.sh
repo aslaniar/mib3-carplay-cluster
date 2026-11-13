@@ -27,6 +27,7 @@
 #   T27 fake_shim.py retries a connect that fails with a Python 2 socket.error
 #   T28 a peer that stalls mid-record is dropped within ~500 ms, so 'unbind' works
 #   T29 START GATE: an IDR that arrives before any SPS/PPS does not open the gate
+#   T30 a 'bind' that met a busy port succeeds once the port frees, same ctl line
 #
 # Desk only.  No car, no unit.  Usage: bash run_pathb.sh
 # ============================================================================
@@ -730,6 +731,35 @@ print(sum(1 for x in f if 5 in x['nal'] and not (7 in x['nal'] and 8 in x['nal']
 echo "$SGF" | grep -q '7, 8.*5' && ok gate_waits_for_params "first PES carries SPS+PPS+IDR" \
   || no gate_waits_for_params "first PES carries SPS+PPS+IDR" "${SGF:-no PES}"
 [ "${SGBARE:-x}" = "0" ] && ok gate_no_idr_without_params 0 || no gate_no_idr_without_params 0 "${SGBARE:-?}"
+
+echo; echo "############ T30: a 'bind' that found the port busy is retried ############"
+# The supervisor writes 'bind <port>' once.  If MS-S still holds the port the
+# bind fails; when the port frees, the same line must take it without an
+# intervening 'unbind'.
+BR="$SOCKDIR/rebind"; BRLOG="$OUT/rebind.log"; BRPORT=43013
+rm -f "$BR".state "$BR".ctl "$BR".sock "$BRLOG"
+$PY - "$BRPORT" <<'PY' &
+import socket, sys, time
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("::", int(sys.argv[1])))
+time.sleep(30)
+PY
+BRHOLD=$!; track $BRHOLD
+sleep 0.5
+"$NAT" --in "unix:$BR.sock" --dst "ff14::2:4%lo0" --port 45996 \
+       --monitor --conn-state "$BR.state" --ctl "$BR.ctl" >"$BRLOG" 2>&1 &
+BRPID=$!; track $BRPID
+for _ in $(seq 1 40); do [ -S "$BR.sock" ] && break; sleep 0.05; done
+printf 'bind %s\n' "$BRPORT" >"$BR.ctl"
+_i=0; while [ "$_i" -lt 30 ]; do grep -q "SPORT_BUSY" "$BRLOG" && break; sleep 0.1; _i=$((_i+1)); done
+chk rebind_first_attempt_busy "$(grep -q 'SPORT_BUSY' "$BRLOG" && echo 1 || echo 0)" "SPORT_BUSY while held"
+kill $BRHOLD 2>/dev/null; wait $BRHOLD 2>/dev/null
+_i=0; while [ "$_i" -lt 20 ]; do grep -q "PORT OURS" "$BRLOG" && break; sleep 0.1; _i=$((_i+1)); done
+chk rebind_same_line_succeeds "$(grep -q 'PORT OURS' "$BRLOG" && echo 1 || echo 0)" \
+    "PORT OURS within 2 s of the port freeing"
+chk rebind_state_bound "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$BR.state" 2>/dev/null | grep -qx "$BRPORT" && echo 1 || echo 0)" \
+    "bound=$BRPORT" "$(cat "$BR.state" 2>/dev/null)"
+kill $BRPID 2>/dev/null; wait $BRPID 2>/dev/null
 
 echo
 echo "============================================================"
