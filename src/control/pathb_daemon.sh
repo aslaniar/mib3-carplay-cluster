@@ -25,7 +25,8 @@
 #   IN   /proc/net/udp{,6}   is the port free? THE proof, not a hint
 #   OUT  pathb_sender.ctl    "bind <port>" | "unbind"
 #   OUT  pathb_daemon.state  what the CLI reads
-#   OUT  pathb_daemon.log    one line per decision, monotonic ms
+#   OUT  pathb_daemon.log    one line per decision, monotonic ms; the previous
+#                            run's is pathb_daemon.log.1
 #   OUT  pathb_nav.parked    written before the park, removed only by a hand-back
 #                            that succeeded; a stop or a restart that finds it
 #                            hands the nav back
@@ -786,7 +787,8 @@ do_run(){
   fi
   printf '%s\n' "$_me" >"$PIDF"
   STARTED=$(now_ms); ST_SINCE=$STARTED
-  : >"$LOG" 2>/dev/null
+  # the previous run's last lines are why this one started: keep them
+  mv -f "$LOG" "$LOG.1" 2>/dev/null
   log "daemon start pid=$_me poll=${POLL}ms ready=${READY_STABLE}ms grace=${GRACE}ms"
   if [ "$NAP_FRAC" = "1" ]; then log "clock: fractional sleep"
   elif [ "$NAP_MODE" != "none" ]; then log "clock: usleep ($(( POLL ))ms tick)"

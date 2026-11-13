@@ -39,6 +39,7 @@
 #   D21  `stop` (daemon and CLI) during a slow hand-back that fails once waits
 #        for the trap's retry: the order log ends with back
 #   D22  ACTIVE, frames keep arriving but none is sent -> release, logged as dark
+#   D23  a restart rotates the log to .1 instead of wiping it
 #
 # Usage: sh tests/run_pathb_daemon.sh
 # ============================================================================
@@ -147,7 +148,6 @@ export PATHB_READY_STABLE_MS=600
 export PATHB_GRACE_MS=700
 export PATHB_RETRY_MS=600
 export PATHB_TAKEOVER_MS=4000
-export PATHB_RELEASE_MS=4000
 
 phone_on(){  : >"$TMP/fake_phone"; }
 phone_off(){ rm -f "$TMP/fake_phone"; }
@@ -161,7 +161,7 @@ reset_all(){
         "$TMP"/pathb_daemon.pause "$TMP"/pathb_daemon.pid "$TMP"/order.log \
         "$TMP"/port_held "$TMP"/fake_phone "$TMP"/back_fail "$TMP"/no_emit \
         "$TMP"/pathb_nav.parked "$TMP"/msport "$TMP"/pathb_sport \
-        "$TMP"/back_slow "$TMP"/back_fail_once
+        "$TMP"/back_slow "$TMP"/back_fail_once "$TMP"/pathb_daemon.log.1
   rmdir "$TMP/pathb_daemon.lock" 2>/dev/null
 }
 dstart(){ nohup sh "$DAEMON" run >"$TMP/daemon.stdout" 2>&1 & sleep 0.8; }
@@ -499,6 +499,17 @@ wait_line "^back$" 5000
 _b=$(first_line "^bind " "$TMP/order.log"); _k=$(first_line "^back$" "$TMP/order.log")
 chk d22_dark_handed_back "$( [ -n "$_b" ] && [ -n "$_k" ] && [ "$_b" -lt "$_k" ] && echo 1 || echo 0 )" "bind ($_b) < back ($_k)"
 chk d22_dark_logged "$( has x 'cluster is dark' "$TMP/pathb_daemon.log" )" "logged why"
+reset_all
+
+echo
+echo "############ D23: a restart keeps the previous run's log ############"
+dstart
+_d1=$(cat "$TMP/pathb_daemon.pid" 2>/dev/null)
+sh "$DAEMON" stop >/dev/null 2>&1
+dstart
+_d2=$(cat "$TMP/pathb_daemon.pid" 2>/dev/null)
+chk d23_previous_log_kept "$( grep -q "daemon start pid=$_d1 " "$TMP/pathb_daemon.log.1" 2>/dev/null && grep -q 'daemon stop (signal)' "$TMP/pathb_daemon.log.1" 2>/dev/null && echo 1 || echo 0 )" "run $_d1 start and stop in pathb_daemon.log.1"
+chk d23_new_log_fresh "$( grep -q "daemon start pid=$_d2 " "$TMP/pathb_daemon.log" 2>/dev/null && ! grep -q "pid=$_d1 " "$TMP/pathb_daemon.log" 2>/dev/null && echo 1 || echo 0 )" "pathb_daemon.log starts with run $_d2"
 reset_all
 
 echo
