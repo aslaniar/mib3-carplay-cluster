@@ -97,7 +97,8 @@ DELAYLOG=$RAM/pathb_deliver.log
 DST=${PATHB_DST:-ff14::2:4%eth0.5}
 GPORT=${PATHB_GROUP_PORT:-42800}
 BENCH=${PATHB_BENCH:-0}
-SCOMM=${PATHB_D_SENDER_COMM:-}     # bench seam: expected /proc comm of the sender
+# the sender's /proc comm; computed once because every read_sender checks it
+SCOMM=${PATHB_D_SENDER_COMM:-$(basename "$MUXER" | cut -c1-15)}
 
 POLL=${PATHB_POLL_MS:-200}
 READY_STABLE=${PATHB_READY_STABLE_MS:-400}
@@ -223,10 +224,9 @@ sender_alive(){
   [ -n "$_p" ] || _p=$(cat "$SPIDF" 2>/dev/null)
   case "${_p:-}" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$_p" 2>/dev/null || return 1
-  _want=${SCOMM:-$(basename "$MUXER" | cut -c1-15)}
   _got=$(proc_comm "$_p")
   # a recycled pid is not our sender
-  [ "$_got" = "$_want" ] || return 1
+  [ "$_got" = "$SCOMM" ] || return 1
   SENDER_PID=$_p
   return 0
 }
@@ -283,6 +283,11 @@ sender_stop(){  # bounded ladder: TERM, 1 s, KILL, 2 s
 
 read_sender(){
   S_CONN=0; S_READY=0; S_BOUND=0; S_AU=0; S_OUT=0; S_MS=0
+  # A DEAD SENDER'S STATE FILE IS NOT EVIDENCE.  Its last line still says what
+  # it held, but the kernel freed that port when it died: trusting it sends a
+  # restart's reconcile to wait on an unbind nobody will perform, and a fresh
+  # sender starting at au=0 looks like "no change" instead of a new session.
+  sender_alive || return 0
   [ -r "$SSTATE" ] || return 0
   _l=""; read -r _l <"$SSTATE" 2>/dev/null || true
   for _kv in $_l; do
@@ -595,10 +600,9 @@ prepare_tick(){   # idempotent, cheap; the loop's housekeeping
   return 0
 }
 
-reconcile(){   # run once at startup: never inherit a half-taken cluster
-  read_sender
-  if [ -f "$PARKF" ] || [ "${S_BOUND:-0}" != "0" ]; then
-    log "reconcile: a previous run left the nav parked or udp/$S_BOUND bound -- releasing"
+reconcile(){   # run once at startup, after the old sender is stopped: never inherit a parked nav
+  if [ -f "$PARKF" ]; then
+    log "reconcile: a previous run left the nav parked -- releasing"
     release "reconcile"; _r=$?
     settle "reconcile" "$_r"
   fi
@@ -620,12 +624,6 @@ on_stop(){
 do_tick(){
   _now=$(now_ms)
   read_sender
-  # A DEAD SENDER'S STATE FILE IS NOT EVIDENCE.  Without this the daemon keeps
-  # parsing the last line a killed sender wrote, and a fresh sender starting at
-  # au=0 looks like "no change" instead of a new session.
-  if ! sender_alive; then
-    S_CONN=0; S_READY=0; S_BOUND=0; S_AU=0; S_OUT=0
-  fi
 
   if [ -f "$CMDF" ]; then
     _cmd=""; read -r _cmd <"$CMDF" 2>/dev/null || true

@@ -22,7 +22,8 @@
 #   D9   a second daemon refuses to run (single instance), two started together
 #        leave one, `stop` never kills a stranger a stale pidfile names, and a
 #        lock left by a killed daemon does not block the next start
-#   D10  restart with a sender that still holds the port -> reconcile releases
+#   D10  restart with a sender that still holds the port -> reconcile hands the
+#        nav back once, without passing through DEGRADED
 #   D11  the sender dying while ACTIVE -> release, then a new sender retakes it
 #   D12  the state file carries the fields the CLI needs
 #   D13  the CLI reports the daemon and its state
@@ -297,22 +298,24 @@ echo
 echo "############ D10: restart with a sender still holding the port ############"
 FAKE_BOUND=42989 nohup sh "$TMP/fake_sender.sh" >/dev/null 2>&1 &
 _fpid=$!
+# the crashed daemon parked the nav before it bound, so it left the marker
+: >"$TMP/pathb_nav.parked"
 sleep 0.4
 printf '%s\n' "$_fpid" >"$TMP/pathb_sender.pid"
 dstart
-_i=0
-while [ "$_i" -lt 80 ]; do
-  grep -q "^back$" "$TMP/order.log" 2>/dev/null && break
-  sleep 0.05; _i=$((_i+1))
-done
+wait_line "^back$" 6000
+wait_state IDLE 6000 >/dev/null 2>&1
 # D10 asserts the INVARIANT, not the mechanism.  The supervisor stops the
 # orphaned sender first (a restarted daemon must never leave a pre-fix sender
 # running), and stopping it frees the port, so there is no live process left to
 # receive an "unbind" -- an assertion on that line was asserting a mechanism the
 # code no longer uses.  What must be true: the orphan is gone, the cluster is
-# handed back, and the decision is logged as a reconcile.
+# handed back once, the dead sender's last words do not degrade it, and the
+# decision is logged as a reconcile.
 chk d10_orphan_stopped "$( kill -0 "$_fpid" 2>/dev/null && echo 0 || echo 1 )" "stopped the orphaned sender"
-chk d10_handed_back "$( [ -n "$(first_line "^back$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "handed the cluster back"
+chk d10_one_hand_back "$( [ "$(grep -c '^back$' "$TMP/order.log" 2>/dev/null)" = "1" ] && echo 1 || echo 0 )" "exactly one hand-back ($(grep -c '^back$' "$TMP/order.log" 2>/dev/null))"
+chk d10_never_degraded "$( grep -q -- '-> DEGRADED' "$TMP/pathb_daemon.log" 2>/dev/null && echo 0 || echo 1 )" "no DEGRADED"
+chk d10_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE ($(dstate))"
 chk d10_reconciled "$( has x 'reconcile' "$TMP/pathb_daemon.log" )" "logged as reconcile"
 reset_all
 
