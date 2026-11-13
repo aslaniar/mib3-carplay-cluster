@@ -20,9 +20,13 @@
 # nothing outside /tmp and /dev/shm.  If a pin does not match it stops that step
 # and says so -- it does not deploy a build it cannot identify.
 #
+# The shim only activates while <drive>/mib3shim.enable exists, and while it does
+# the shim appends breadcrumbs to <drive>/mib3shim.bc.  If injection or the
+# supervisor fails, up.sh says NOT READY and exits 1.
+#
 # Undo:  sh /tmp/kit/pathbctl release      (hand the cluster back to the car)
 #        sh /tmp/kit/pathbctl stop         (stop the supervisor)
-# A reboot also clears everything: nothing here is persistent.
+# A reboot clears everything on the unit.
 # ============================================================================
 set -u
 
@@ -39,6 +43,8 @@ now() { date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?'; }
 say() { echo "$1" >&2; echo "[$(now)] $1" >>"$LOG" 2>/dev/null; return 0; }
 step() { say "$*"; }
 warn() { say "WARN: $*"; }
+PROBLEMS=0
+problem() { warn "$*"; PROBLEMS=$((PROBLEMS + 1)); }
 die()  { say "STOP: $*"; exit 1; }
 
 # ============================ 1. stage the kit =============================
@@ -95,10 +101,21 @@ chk mib3shim.so       "$SHIM_PIN"   shim
 chk mib3clusterstream "$SENDER_PIN" sender
 chk mib3wheel         "$WHEEL_PIN"  wheel
 
+# The shim's activation gate: without this file it loads but behaves stock.
+MARKER=""
+for _m in /tmp/USB/*/PART1/mib3shim.enable; do
+  [ -f "$_m" ] && { MARKER=$_m; break; }
+done
+if [ -n "$MARKER" ]; then
+  step "marker: $MARKER"
+else
+  warn "no mib3shim.enable on any USB drive -- the shim will stay stock until you add an empty file with that name to the root of the drive"
+fi
+
 # ================= 3. inject the shim into the LIVE carplay =================
 CP=$(pidof carplay 2>/dev/null)
 if [ -z "$CP" ]; then
-  warn "carplay is not running -- skipping injection (start CarPlay, then re-run)"
+  problem "carplay is not running -- skipping injection (start CarPlay, then re-run)"
 else
   step "inject: carplay pid $CP"
   grep -q mib3shim "/proc/$CP/maps" 2>/dev/null && \
@@ -106,18 +123,22 @@ else
   if sh "$KIT/run_inject.sh" </dev/null >>"$LOG" 2>&1; then
     step "inject: seams installed"
   else
-    warn "inject: run_inject.sh failed -- see $LOG"
+    problem "inject: run_inject.sh failed -- see $LOG"
   fi
 fi
 
 # ============================ 4. start the supervisor =======================
 step "supervisor: starting (it takes the cluster when the phone streams)"
-sh "$KIT/pathbctl" start </dev/null >>"$LOG" 2>&1 || warn "supervisor did not start -- see $LOG"
+sh "$KIT/pathbctl" start </dev/null >>"$LOG" 2>&1 || problem "supervisor did not start -- see $LOG"
 
 step "status:"
 sh "$KIT/pathbctl" status </dev/null 2>&1 | while IFS= read -r l; do say "    $l"; done
 
-step "done. Next: connect the phone and start a route."
 step "watch:  tail -f /tmp/mib3shim.log   /   sh /tmp/kit/pathbctl status"
 step "hand back any time:  sh /tmp/kit/pathbctl release"
+if [ "$PROBLEMS" -gt 0 ]; then
+  say "NOT READY: $PROBLEMS step(s) failed -- see the WARN lines above and $LOG"
+  exit 1
+fi
+step "done. Next: connect the phone and start a route."
 exit 0
