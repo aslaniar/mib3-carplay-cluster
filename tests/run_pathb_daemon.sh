@@ -34,6 +34,8 @@
 #   D17  a second session whose sender binds but never emits fails its takeover
 #   D18  stopped during TAKEOVER: the nav is handed back after the park lands
 #   D19  stopped while DEGRADED: the restart hands the nav back
+#   D20  each takeover binds the port discovery reports now, and PATHB_PORT
+#        still beats discovery
 #
 # Usage: sh tests/run_pathb_daemon.sh
 # ============================================================================
@@ -149,7 +151,7 @@ reset_all(){
         "$TMP"/pathb_daemon.state "$TMP"/pathb_daemon.log "$TMP"/pathb_daemon.cmd \
         "$TMP"/pathb_daemon.pause "$TMP"/pathb_daemon.pid "$TMP"/order.log \
         "$TMP"/port_held "$TMP"/fake_phone "$TMP"/back_fail "$TMP"/no_emit \
-        "$TMP"/pathb_nav.parked
+        "$TMP"/pathb_nav.parked "$TMP"/msport "$TMP"/pathb_sport
   rmdir "$TMP/pathb_daemon.lock" 2>/dev/null
 }
 dstart(){ nohup sh "$DAEMON" run >"$TMP/daemon.stdout" 2>&1 & sleep 0.8; }
@@ -429,6 +431,32 @@ wait_line "^back$" 4000
 wait_state IDLE 4000 >/dev/null 2>&1
 chk d19_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE ($(dstate))"
 chk d19_ends_handed_back "$( [ "$(tail -n 1 "$TMP/order.log" 2>/dev/null)" = "back" ] && echo 1 || echo 0 )" "order.log ends with back"
+reset_all
+
+echo
+echo "############ D20: every takeover binds the port MS-S has NOW ############"
+# MS-S binds a new source port per process, so the port of the last session is
+# not evidence for the next one.
+export PATHB_PORT= PATHB_D_DISCOVER_CMD="cat $TMP/msport"
+printf '43001\n' >"$TMP/msport"
+printf 'mss\n' >"$TMP/port_held"
+dstart; phone_on
+wait_state ACTIVE 5000 >/dev/null 2>&1
+chk d20_first_session_port "$( [ "$(dfield bound)" = "43001" ] && echo 1 || echo 0 )" "bound=43001 ($(dfield bound))"
+phone_off
+wait_state IDLE 6000 >/dev/null 2>&1
+printf '43002\n' >"$TMP/msport"
+sleep 1
+phone_on
+wait_state ACTIVE 5000 >/dev/null 2>&1
+chk d20_second_session_port "$( [ "$(dfield bound)" = "43002" ] && [ "$(grep '^bind ' "$TMP/order.log" | tail -n 1)" = "bind 43002" ] && echo 1 || echo 0 )" "bound=43002 ($(dfield bound), $(grep '^bind ' "$TMP/order.log" | tail -n 1))"
+reset_all
+export PATHB_PORT=42989
+printf '43003\n' >"$TMP/msport"
+dstart; phone_on
+wait_state ACTIVE 5000 >/dev/null 2>&1
+chk d20_override_wins "$( [ "$(dfield bound)" = "42989" ] && echo 1 || echo 0 )" "PATHB_PORT beats discovery ($(dfield bound))"
+unset PATHB_D_DISCOVER_CMD
 reset_all
 
 echo

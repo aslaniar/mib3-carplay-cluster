@@ -75,7 +75,8 @@
 #   (the release has no deadline of its own: deliver_ctl.sh's handover gates are
 #    already bounded by MS-S's own 1 Hz clock.)
 #   PATHB_LOG_MAX           65536  log truncated to its last half beyond this
-#   PATHB_D_PARK_CMD / PATHB_D_BACK_CMD / PATHB_D_PORTFREE_CMD   bench seams
+#   PATHB_D_PARK_CMD / PATHB_D_BACK_CMD / PATHB_D_PORTFREE_CMD /
+#   PATHB_D_DISCOVER_CMD    bench seams
 # ============================================================================
 set -u
 
@@ -112,6 +113,7 @@ LOG_MAX=${PATHB_LOG_MAX:-65536}
 PARK_CMD=${PATHB_D_PARK_CMD:-}
 BACK_CMD=${PATHB_D_BACK_CMD:-}
 FREE_CMD=${PATHB_D_PORTFREE_CMD:-}
+DISC_CMD=${PATHB_D_DISCOVER_CMD:-}
 
 # state (single instance, written by the loop)
 ST=IDLE
@@ -330,12 +332,16 @@ port_free(){
 }
 
 discover_port(){
-  _m=""
-  for c in "$HERE/pathb/msport.py" "$HERE/msport.py" /tmp/kit/msport.py; do
-    [ -f "$c" ] && { _m=$c; break; }
-  done
-  [ -n "$_m" ] || { log "port: msport.py not found"; return 1; }
-  _o=$(${PATHB_MPY:-python} "$_m" 2>/dev/null)
+  if [ -n "$DISC_CMD" ]; then
+    _o=$(sh -c "$DISC_CMD" 2>/dev/null)
+  else
+    _m=""
+    for c in "$HERE/pathb/msport.py" "$HERE/msport.py" /tmp/kit/msport.py; do
+      [ -f "$c" ] && { _m=$c; break; }
+    done
+    [ -n "$_m" ] || { log "port: msport.py not found"; return 1; }
+    _o=$(${PATHB_MPY:-python} "$_m" 2>/dev/null)
+  fi
   case "${_o:-}" in
     ''|*[!0-9]*)
       # MS-S is parked, or has just restarted: it legitimately owns no socket,
@@ -378,10 +384,12 @@ diagnose(){
 # ------------------------------------------------------------------ the lease
 takeover(){  # -> 0 on success; the caller sets ACTIVE
   _t0=$(now_ms)
-  # The port may not exist yet: multi-screen-server creates its socket when it
-  # first has something to stream.  Discover it HERE, at the moment we actually
-  # need it, rather than refusing to arm at boot.
-  if [ -z "${PORT:-}" ]; then
+  # MS-S binds a NEW source port per process, so the port of an earlier session is
+  # not evidence.  Discover it at every takeover, before the park, while MS-S still
+  # owns its socket.
+  if [ -n "${PATHB_PORT:-}" ]; then
+    PORT=$PATHB_PORT
+  else
     discover_port || { log "TAKEOVER: MS-S has no stream yet, so there is no port to take -- not arming"; return 1; }
   fi
   log "TAKEOVER: phone has frames (au=$S_AU); park + bind"
