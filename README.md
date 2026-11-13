@@ -33,8 +33,10 @@ This repository **does not contain, describe, or require any method of obtaining
 
 Tested on VW MIB3 (LG), train `MOI3_EU_VW_R8830L_MU0883`, part `3G8919360AR`. Other trains are CURRENTLY untested.
 
-Nothing is persistent: `/tmp` and `/dev/shm` are all it writes, and a reboot clears
-everything. You will have to rerun up.sh on each boot to use the mod. Persistence is currently being worked on. 
+The injector runs on the unit's own `/usr/bin/python`. Nothing needs installing on the unit.
+
+Nothing on the head unit survives a reboot. `up.sh` writes only to `/tmp` and `/dev/shm`, so you have to rerun it after each boot. Persistence is currently being worked on.
+The one lasting write is on your flash drive. While `mib3shim.enable` is there, the shim appends a breadcrumb log to `mib3shim.bc` beside it, so a reset still leaves evidence of the last step.
 
 ## Layout
 
@@ -47,8 +49,7 @@ src/control/           the resident supervisor, its CLI, and the RSI handover
 src/inject/            ptrace + dlopen loader for the live carplay
 tools/                 analysis: PES/TS extraction, SPS dump, AU boundary checks, reports
 tests/                 the benches, plus the H.264 fixture they replay
-bin/                   the pinned aarch64 builds the tests and up.sh expect
-docs/                  
+bin/                   the pinned aarch64 builds that up.sh deploys (md5-checked)
 ```
 
 ## Build
@@ -56,28 +57,48 @@ docs/
 The head unit runs aarch64 with its own glibc (≤ 2.23) and ships no CRT, so every tool has its
 own `_start` and is linked `-nostdlib` against the unit's libs.
 
-Compiled binaries are located in bin/. Should you want to build src yourself, instructions are below. Clang and lld are required to build. 
+Compiled binaries are located in bin/. Should you want to build src yourself, instructions are below.
+
+Building needs macOS on Apple silicon with Homebrew's LLVM and lld (`brew install llvm lld`). The scripts call `/opt/homebrew/opt/llvm/bin/clang` and `/opt/homebrew/opt/lld/bin/ld.lld` by absolute path. The unit's firmware is optional: put `R8830L_ROOTFS/` beside the repo to link against its libraries, otherwise the scripts link against generated stubs.
 
 ```sh
 sh src/shim/build.sh     # -> bin/mib3shim.so
 sh tools/build.sh        # -> bin/mib3clusterstream, bin/mib3wheel
 ```
 
+Building overwrites `bin/`, and `up.sh` refuses any binary whose md5 differs from its pins. The pinned builds came from Homebrew clang 23.1.2. Clang 23.1.5 produces the same code, but the compiler version string in the `.comment` section differs, so the md5 does too. To deploy your own build, update the pins in all three places: `SHIM_PIN`, `SENDER_PIN` and `WHEEL_PIN` in `up.sh`, `WANT_MD5` in `src/inject/run_inject.sh`, and the `*_WANT` lines in `src/control/push_kit.sh`.
+
 ## Install
 
-```sh
-# copy this tree to a flash drive in your center console, then from a root shell:
-sh up.sh
-```
+1. Copy this folder to a flash drive.
+2. Create an empty file named `mib3shim.enable` in the root of the drive. The shim checks for it at the start of every CarPlay session. Without it, the shim stays loaded but behaves exactly like stock CarPlay. To turn the mod off, remove the drive, and the next session is stock again.
+3. Plug the drive into the USB port in your center console. The unit mounts it at `/tmp/USB/PORT<n>/PART1`, where `<n>` is the physical port.
+4. From a root shell, run `up.sh` from the drive:
+
+   ```sh
+   sh /tmp/USB/PORT<n>/PART1/<folder>/up.sh
+   ```
 
 `up.sh` stages the kit into `/tmp/kit`, checks the md5 of all three pinned binaries,
-injects the shim into the running CarPlay, and starts the supervisor. Re-runnable.
+injects the shim into the running CarPlay, and starts the supervisor. It is safe to run again. If injection or the supervisor fails, it ends with `NOT READY` and exits with status 1. The full log is in `/tmp/kit/up.log`.
 
 ```sh
 sh /tmp/kit/pathbctl status     # what the supervisor is doing, and why
 sh /tmp/kit/pathbctl release    # hand the cluster back to the car
 sh /tmp/kit/pathbctl stop       # stop the supervisor
 ```
+
+## Test on the desk
+
+Three benches run on a Mac, with no car and no head unit:
+
+```sh
+sh tests/run_pathb_daemon.sh            # the supervisor's ordering, against a fake sender and RSI
+bash tests/run_pathb.sh                 # the real sender, fed by a fake shim, checked on the wire
+bash tests/run_clusterstream_bench.sh   # the sender's RTP and MPEG-TS output, parsed independently
+```
+
+They need the same Homebrew LLVM and lld as the build, plus `python3` and `perl`. They send multicast on the `lo0` loopback interface, so they run only on macOS. Some legs run only when `tshark`, Apple's `container` CLI, or `R8830L_ROOTFS/` is present. No bench loads the shim itself, so shim changes still need a test in the car.
 
 ## Acknowledgements
 
