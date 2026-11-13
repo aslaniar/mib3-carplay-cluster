@@ -277,9 +277,10 @@ line_of() { printf '%s' "$1" | sed 's/},{/}\
 {/g' | grep "\"name\":\"$2\"" | head -n1; }
 uri_of()  { line_of "$1" "$2" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p' | de | head -n1; }
 id_of()   { line_of "$1" "$2" | sed -n 's/.*"internalIdentifier":"\([^"]*\)".*/\1/p' | head -n1; }
-uris() { curl -sS --max-time 8 "http://$RSI:$DMP/displaymanagement/renderingSurfaces"; }
-disps(){ curl -sS --max-time 8 "http://$RSI:$DMP/displaymanagement/displays"; }
-sps()  { curl -sS --max-time 8 "http://$RSI:$DMP/displaymanagement/streamParameters"; }
+# -f: an HTTP error must fail the read, or an empty list reads as "element absent"
+uris() { curl -fsS --max-time 8 "http://$RSI:$DMP/displaymanagement/renderingSurfaces"; }
+disps(){ curl -fsS --max-time 8 "http://$RSI:$DMP/displaymanagement/displays"; }
+sps()  { curl -fsS --max-time 8 "http://$RSI:$DMP/displaymanagement/streamParameters"; }
 valid_uri() { case "$1" in /displaymanagement/renderingSurfaces/*|/displaymanagement/streamParameters/*|/displaymanagement/displays/*) return 0;; *) return 1;; esac; }
 
 # The oracle is MS-S's own live log (port 54321) -- the ONLY way to read the share
@@ -582,7 +583,8 @@ handover_check() {
 }
 
 handover_park() {
-  R="$(uris)"; NAVU="$(uri_of "$R" $NAVNAME)"
+  R="$(uris)" || { say "HANDOVER PARK NO-GO: cannot read the RSI element list"; return 1; }
+  NAVU="$(uri_of "$R" $NAVNAME)"
   _mk="$(oracle_mark)"
   if [ -z "$NAVU" ]; then
     say "nav element already absent (parked)"
@@ -933,10 +935,12 @@ handover_back() {
   hb_t0="$(now_ms)"; TIMING=""; T_SUM=0; tmark
   MUTSUB=""; EXTRA=""; REQ=""; FLUSH=""
   sub_reset
-  sub0; R="$(uris)"; D="$(disps)"; S="$(sps)"; sub_add lists
+  sub0; R="$(uris)" && D="$(disps)" && S="$(sps)"; _lr=$?; sub_add lists
+  [ "$_lr" = 0 ] || { say "HANDOVER BACK NO-GO: cannot read the RSI lists"; return 1; }
   DISP="$(uri_of "$D" navi-kombi-display)"; SP="$(uri_of "$S" $SPNAME)"
   OURU="$(uri_of "$R" $OURNAME)"; NAVU="$(uri_of "$R" $NAVNAME)"
   valid_uri "$DISP" || { say "HANDOVER BACK NO-GO: bad display uri '$DISP'"; return 1; }
+  valid_uri "$SP"   || { say "HANDOVER BACK NO-GO: bad sp uri '$SP'"; return 1; }
   sub0; _mk="$(oracle_mark)"; sub_add mark
 
   # ---- TRAP PREDICTION (cheap, and it saves the whole fast gate) -------------
@@ -971,7 +975,6 @@ handover_back() {
     say "HANDOVER BACK: nothing of ours was attached"
   fi
   if [ -z "$NAVU" ]; then
-    [ -n "$SP" ] || { say "HANDOVER BACK NO-GO: no streamParameters uri"; return 1; }
     sub0; bc "handover:back:create-nav"; sub_add sync
     sub0; h POST "http://$RSI:$DMP/displaymanagement/renderingSurfaces" \
       "{\"name\":\"$NAVNAME\",\"display\":\"$DISP\",\"streamParameters\":\"$SP\",\"topLeftX\":0,\"topLeftY\":0,\"width\":1280,\"height\":480}" >/dev/null; sub_add post; echo
