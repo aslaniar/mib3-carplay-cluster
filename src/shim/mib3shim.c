@@ -615,6 +615,7 @@ typedef int  (*fn_ScreenSetChaCha)(void*, void*, s64);
 typedef void (*fn_ScreenSetTS)(void*, void*);
 typedef int  (*fn_DeriveAES)(void*, int, s64, void*, void*);
 typedef int  (*fn_pthreadCreate)(void**, const void*, void*(*)(void*), void*);
+typedef int  (*fn_pthreadDetach)(void*);
 typedef int  (*fn_close)(int);
 typedef int  (*fn_chachaDerive)(void*, s64, int, int, void*); /* returns int status (0=ok) */
 /* wire crypto (unit's own CFLite/ChaCha primitives) -- see stock FUN_00115800 +
@@ -698,6 +699,7 @@ static fn_cx_ver            p_cx_ver;
 static fn_ctr_init          p_ctr_init;
 static fn_ctr_upd           p_ctr_upd;
 static fn_pthreadCreate     p_pthreadCreate;
+static fn_pthreadDetach     p_pthreadDetach;
 static fn_close             p_close;
 typedef long (*fn_syscall)(long, ...);
 static fn_syscall           p_syscall;
@@ -860,6 +862,7 @@ static void resolve(void){
   p_ctr_init          = (fn_ctr_init)         R("AES_CTR_Init");
   p_ctr_upd           = (fn_ctr_upd)          R("AES_CTR_Update");
   p_pthreadCreate     = (fn_pthreadCreate)    R("pthread_create");
+  p_pthreadDetach     = (fn_pthreadDetach)    R("pthread_detach");
   p_close             = (fn_close)            R("close");
   p_malloc            = (void*(*)(unsigned long)) R("malloc");
   p_free              = (void(*)(void*))          R("free");
@@ -3668,6 +3671,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
     if (p_free) p_free(c);
     goto fail_sock;
   }
+  if (p_pthreadDetach) p_pthreadDetach(th);
   return 0;
 
 fail_sock:
