@@ -617,6 +617,9 @@ do_tick(){
         if [ "$S_AU" != "$LAST_AU" ]; then
           if [ "$FLOW_SINCE" = "0" ]; then FLOW_SINCE=$_now; fi
           LAST_AU=$S_AU; LAST_FLOW=$_now
+        elif [ $(( _now - LAST_FLOW )) -gt $(( 2 * POLL )) ]; then
+          # the flow stopped: the next frames start a new debounce, not resume this one
+          FLOW_SINCE=0
         fi
         if paused; then
           FLOW_SINCE=0

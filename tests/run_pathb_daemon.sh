@@ -11,7 +11,8 @@
 #
 #   D0   both scripts are syntactically valid for /bin/sh
 #   D1   no phone -> nothing is touched (no park, no bind)
-#   D2   a 200 ms blip of frames does not trigger a takeover (the debounce)
+#   D2   a 200 ms blip of frames does not trigger a takeover, nor does a second
+#        one after a gap (the debounce restarts when the flow stops)
 #   D3   frames flowing -> TAKEOVER -> ACTIVE, park BEFORE bind
 #   D4   with the car's nav still streaming, bind happens only after park
 #   D5   frames stop -> RELEASE, unbind BEFORE hand back, nav gets the port
@@ -169,6 +170,9 @@ dstart; phone_on; sleep 0.2; phone_off
 sleep 1.2
 chk d2_no_takeover "$( [ -z "$(first_line "^bind " "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind"
 chk d2_still_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE"
+phone_on; sleep 0.2; phone_off
+sleep 1.2
+chk d2_second_blip_no_takeover "$( [ -z "$(first_line "^bind " "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind after a second blip"
 reset_all
 
 echo
