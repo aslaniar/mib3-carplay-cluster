@@ -776,16 +776,28 @@ do_run(){
   _me=$$
   # mkdir is the atomic test-and-set.  The holder writes the pidfile right after
   # it, so a lock with no pid is a start in progress, not a stale one.
-  if ! mkdir "$LOCKD" 2>/dev/null; then
+  if mkdir "$LOCKD" 2>/dev/null; then
+    printf '%s\n' "$_me" >"$PIDF"
+  else
     _old=$(me)
     if [ -z "${_old:-}" ] || is_daemon "$_old"; then
       echo "pathb_daemon: already running (pid ${_old:-starting})"
       return 0
     fi
-    rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null
-    mkdir "$LOCKD" 2>/dev/null || { echo "pathb_daemon: already running"; return 0; }
+    # A STALE LOCK IS CLAIMED IN PLACE, BY ONE STARTER.  Two starts can both find
+    # it stale: the break marker for that pid admits one at a time, and each
+    # re-reads the pidfile under it, since an earlier holder may have claimed it.
+    # The lock dir never disappears, so no third start can mkdir its way in.
+    _brk=$LOCKD.break.$_old
+    mkdir "$_brk" 2>/dev/null || { echo "pathb_daemon: already running (another start is claiming a stale lock)"; return 0; }
+    if [ "$(me)" != "$_old" ]; then
+      rmdir "$_brk"
+      echo "pathb_daemon: already running (pid $(me))"
+      return 0
+    fi
+    printf '%s\n' "$_me" >"$PIDF"
+    rmdir "$_brk"
   fi
-  printf '%s\n' "$_me" >"$PIDF"
   STARTED=$(now_ms); ST_SINCE=$STARTED
   # the previous run's last lines are why this one started: keep them
   mv -f "$LOG" "$LOG.1" 2>/dev/null

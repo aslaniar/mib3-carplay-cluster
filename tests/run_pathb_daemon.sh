@@ -21,8 +21,9 @@
 #   D7   park fails after we bound -> we give the port straight back
 #   D8   the pause marker stops any takeover
 #   D9   a second daemon refuses to run (single instance), two started together
-#        leave one, `stop` never kills a stranger a stale pidfile names, and a
-#        lock left by a killed daemon does not block the next start
+#        leave one, `stop` never kills a stranger a stale pidfile names, a
+#        lock left by a killed daemon does not block the next start, and two
+#        starts that both find it stale leave one
 #   D10  restart with a sender that still holds the port -> reconcile hands the
 #        nav back once, without passing through DEGRADED
 #   D11  the sender dying while ACTIVE -> release, then a new sender retakes it
@@ -134,6 +135,17 @@ exit 0
 BACK
 chmod +x "$TMP/back.sh"
 
+# Off /proc, is_daemon asks `ps`.  This one holds its first caller for 0.5 s, so of
+# two starts that both read a stale pidfile, one acts long after the other.
+_real_ps=$(command -v ps)
+mkdir -p "$TMP/slowps"
+cat >"$TMP/slowps/ps" <<SLOWPS
+#!/bin/sh
+mkdir "\$PATHB_RAM/slow_ps_token" 2>/dev/null && sleep 0.5
+exec $_real_ps "\$@"
+SLOWPS
+chmod +x "$TMP/slowps/ps"
+
 export PATHB_RAM="$TMP"
 export PATHB_BENCH=1
 export PATHB_PORT=42989
@@ -163,7 +175,10 @@ reset_all(){
         "$TMP"/pathb_nav.parked "$TMP"/msport "$TMP"/pathb_sport \
         "$TMP"/back_slow "$TMP"/back_fail_once "$TMP"/pathb_daemon.log.1
   rmdir "$TMP/pathb_daemon.lock" 2>/dev/null
+  rm -rf "$TMP"/pathb_daemon.lock.break.* "$TMP/slow_ps_token"
 }
+# kill -0 succeeds on an unreaped zombie, which is what a refused start becomes
+running(){ case "$(ps -o stat= -p "$1" 2>/dev/null)" in ''|Z*) return 1 ;; esac; return 0; }
 dstart(){ nohup sh "$DAEMON" run >"$TMP/daemon.stdout" 2>&1 & sleep 0.8; }
 dstate(){ sed -n 's/^state=\([A-Z]*\).*/\1/p' "$TMP/pathb_daemon.state" 2>/dev/null; }
 dfield(){ sed -n "s/.*$1=\\([^ ]*\\).*/\\1/p" "$TMP/pathb_daemon.state" 2>/dev/null; }
@@ -284,8 +299,8 @@ for _r in 1 2 3 4 5; do
   _b=$!
   sleep 1.5
   _n=0
-  kill -0 "$_a" 2>/dev/null && _n=$((_n+1))
-  kill -0 "$_b" 2>/dev/null && _n=$((_n+1))
+  running "$_a" && _n=$((_n+1))
+  running "$_b" && _n=$((_n+1))
   _lives="$_lives$_n"
   kill "$_a" "$_b" 2>/dev/null
   _i=0; while [ "$_i" -lt 100 ] && { kill -0 "$_a" || kill -0 "$_b"; } 2>/dev/null; do sleep 0.05; _i=$((_i+1)); done
@@ -314,6 +329,27 @@ _np=$(cat "$TMP/pathb_daemon.pid" 2>/dev/null)
 chk d9_stale_lock_recovers "$( [ -n "$_np" ] && [ "$_np" != "$_unrel" ] && kill -0 "$_np" 2>/dev/null && echo 1 || echo 0 )" "started over a stale lock (pid $_np)"
 kill "$_unrel" 2>/dev/null
 reset_all
+# two starts that both find the stale lock must not both break it
+_lives=""
+for _r in 1 2 3 4 5; do
+  sleep 30 &
+  _unrel=$!
+  mkdir -p "$TMP/pathb_daemon.lock"
+  printf '%s\n' "$_unrel" >"$TMP/pathb_daemon.pid"
+  PATH="$TMP/slowps:$PATH" sh "$DAEMON" run >/dev/null 2>&1 &
+  _a=$!
+  PATH="$TMP/slowps:$PATH" sh "$DAEMON" run >/dev/null 2>&1 &
+  _b=$!
+  sleep 1.5
+  _n=0
+  running "$_a" && _n=$((_n+1))
+  running "$_b" && _n=$((_n+1))
+  _lives="$_lives$_n"
+  kill "$_a" "$_b" "$_unrel" 2>/dev/null
+  _i=0; while [ "$_i" -lt 100 ] && { kill -0 "$_a" || kill -0 "$_b"; } 2>/dev/null; do sleep 0.05; _i=$((_i+1)); done
+  reset_all
+done
+chk d9_stale_lock_race "$( [ "$_lives" = "11111" ] && echo 1 || echo 0 )" "one daemon per double start over a stale lock, 5 rounds ($_lives)"
 
 echo
 echo "############ D10: restart with a sender still holding the port ############"
