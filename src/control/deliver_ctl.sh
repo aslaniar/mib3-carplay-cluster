@@ -214,7 +214,7 @@ rsi_report() { [ -n "${REQ:-}" ] && say "  rsi: ${REQ%,}"; return 0; }
 
 # --- lockfile (busybox has no flock; mkdir is atomic) --------------------------
 acquire() {
-  if mkdir "$LOCK" 2>/dev/null; then echo "$$" > "$LOCK/pid"; trap 'release' EXIT INT TERM; return 0; fi
+  if mkdir "$LOCK" 2>/dev/null; then echo "$$" > "$LOCK/pid"; trap 'release' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; return 0; fi
   _p="$(cat "$LOCK/pid" 2>/dev/null)"
   # A pid is NOT proof of a live deliver_ctl: pids are recycled, so a dead holder's
   # number can belong to an unrelated process and the lock then looks held FOREVER
@@ -240,7 +240,7 @@ acquire() {
     fi
   fi
   say "stale lock (pid '${_p:-?}' gone) -- reclaiming"
-  rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null && { echo "$$" > "$LOCK/pid"; trap 'release' EXIT INT TERM; return 0; }
+  rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null && { echo "$$" > "$LOCK/pid"; trap 'release' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; return 0; }
   say "ABORT: cannot take the lock"; return 1
 }
 release() { [ -n "${LOCK:-}" ] && [ -f "$LOCK/pid" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK" 2>/dev/null; }
