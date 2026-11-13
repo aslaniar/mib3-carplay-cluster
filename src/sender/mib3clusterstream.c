@@ -1251,6 +1251,30 @@ static int mib3_ppoll(pfd_t *p, usize_t n, const tspec_t *ts)
 #define PPOLL_(p, n, ts) mib3_ppoll((p), (n), (ts))
 #endif
 
+/* A RECORD THAT HAS STARTED MUST FINISH.  The AU socket is blocking, so a shim
+ * that stalled after the first bytes of a record used to park the loop in read():
+ * ctl_poll never ran and the supervisor's 'unbind' was ignored.  The rest of a
+ * record therefore has REC_STALL_MS from its first byte.  Silence BETWEEN records
+ * is never timed: a static map sends nothing for as long as it likes. */
+#define REC_STALL_MS 500u
+
+/* Read n bytes before `deadline` (now_ms clock).  Returns the count read; short
+ * means EOF, an error, or the deadline. */
+static usize_t read_by(int fd, u8 *b, usize_t n, u64 deadline)
+{
+    usize_t got = 0;
+    while (got < n) {
+        pfd_t p; u64 now = now_ms(); long r;
+        if (now >= deadline) break;
+        p.fd_ = fd; p.ev_ = 1; p.rev_ = 0;
+        if (poll((void *)&p, 1, (int)(deadline - now)) <= 0) continue;
+        r = read(fd, b + got, n - got);
+        if (r <= 0) break;
+        got += (usize_t)r;
+    }
+    return got;
+}
+
 static int probe(const char *dst, int port, const char *out, int count, int seconds, int video_only)
 {
     char host[128]; const char *ifname = "eth0.5";
@@ -2338,17 +2362,16 @@ int mib3_run(int argc, char **argv)
                 /* LOOP THE 16 HEADER BYTES.  A stream socket may split them
                  * across reads; the old single read() treated any
                  * short read as a dead connection and threw away a healthy
-                 * session (and its reference chain) for nothing.  The body below
-                 * already loops exactly like this. */
-                long r = 0; usize_t gh = 0;
-                while (gh < MIB3_HELP_HDRLEN) {
-                    r = read(uni, hdr + gh, MIB3_HELP_HDRLEN - gh);
-                    if (r > 0) { gh += (usize_t)r; continue; }
-                    break;
-                }
-                if (gh == 0 && r < 0) continue;   /* spurious poll wakeup: re-arm */
-                if (gh != MIB3_HELP_HDRLEN) {     /* EOF, or short with no recovery */
-                    if (gh) say("short header -- connection lost\n");
+                 * session (and its reference chain) for nothing.  Everything
+                 * after the first read is bounded by REC_STALL_MS. */
+                long r = read(uni, hdr, MIB3_HELP_HDRLEN);
+                if (r < 0) continue;              /* spurious poll wakeup: re-arm */
+                if (r == 0) break;                /* EOF */
+                u64 rec_deadline = now_ms() + REC_STALL_MS;
+                usize_t gh = (usize_t)r + read_by(uni, hdr + r, MIB3_HELP_HDRLEN - (usize_t)r,
+                                                  rec_deadline);
+                if (gh != MIB3_HELP_HDRLEN) {
+                    say("short or stalled header -- connection lost\n");
                     break;
                 }
                 u32 magic, len; u64 rseq;
@@ -2375,13 +2398,8 @@ int mib3_run(int argc, char **argv)
                     if (!nb) { say("oom\n"); break; }
                     uo = nb; ucap = len;
                 }
-                usize_t got = 0;
-                while (got < (usize_t)len) {
-                    long rr = read(uni, uo + got, (usize_t)len - got);
-                    if (rr <= 0) break;
-                    got += (usize_t)rr;
-                }
-                if (got != (usize_t)len) { say("short payload -- connection lost\n"); break; }
+                usize_t got = read_by(uni, uo, (usize_t)len, rec_deadline);
+                if (got != (usize_t)len) { say("short or stalled payload -- connection lost\n"); break; }
 
                 /* arrival-gap accounting: this is the evidence the pacer acts on */
                 u64 nar = now_ms();

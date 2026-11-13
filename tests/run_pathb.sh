@@ -23,6 +23,7 @@
 #   T12 FILE MODE unchanged (independent RTP/TS verification still passes)
 #   T26 mib3wheel --selftest, built natively with -DHOST_TEST
 #   T27 fake_shim.py retries a connect that fails with a Python 2 socket.error
+#   T28 a peer that stalls mid-record is dropped within ~500 ms, so 'unbind' works
 #
 # Desk only.  No car, no unit.  Usage: bash run_pathb.sh
 # ============================================================================
@@ -607,6 +608,48 @@ kill $PP 2>/dev/null; wait $PP 2>/dev/null
 grep -q '^sent 50 frames' "$OUT/py2err.feed.log" && [ "$RC" = "0" ] \
   && ok fake_shim_retries_socket_error "rc=0, sent 50 frames" \
   || no fake_shim_retries_socket_error "rc=0, sent 50 frames" "rc=$RC $(tail -1 "$OUT/py2err.feed.log")"
+
+echo; echo "############ T28: a stalled record drops the connection, so 'unbind' still works ############"
+# A peer that sends a header and then stalls used to park the sender in read():
+# ctl_poll never ran, so the supervisor's 'unbind' was ignored and the cluster
+# could not be handed back.  Silence BETWEEN records is legitimate (a static map
+# sends nothing) and must not cost the connection.
+ST="$SOCKDIR/stall"; STLOG="$OUT/stall.log"; STPORT=43011
+rm -f "$ST".state "$ST".ctl "$ST".sock "$ST".sent "$STLOG"
+"$NAT" --in "unix:$ST.sock" --dst "ff14::2:4%lo0" --port 45997 --sport "$STPORT" \
+       --monitor --conn-state "$ST.state" --ctl "$ST.ctl" >"$STLOG" 2>&1 &
+STPID=$!; track $STPID
+for _ in $(seq 1 40); do [ -S "$ST.sock" ] && break; sleep 0.05; done
+printf 'bind %s\n' "$STPORT" >"$ST.ctl"
+_i=0; while [ "$_i" -lt 40 ]; do grep -q "PORT OURS" "$STLOG" && break; sleep 0.1; _i=$((_i+1)); done
+$PY - "$ST.sock" "$ST.sent" <<'PY' &
+import socket, struct, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+time.sleep(1.5)
+s.sendall(struct.pack("<IIQ", 0x4D334331, 1000, 1))
+open(sys.argv[2], "w").close()
+time.sleep(8)
+PY
+PEER=$!; track $PEER
+sleep 1.2
+chk stall_silence_between_records_kept "$(grep -q '^conn=1' "$ST.state" 2>/dev/null && echo 1 || echo 0)" \
+    "conn=1 after 1.2 s of silence" "$(cat "$ST.state" 2>/dev/null)"
+for _ in $(seq 1 40); do [ -e "$ST.sent" ] && break; sleep 0.05; done
+sleep 0.1
+printf 'unbind\n' >"$ST.ctl"
+_i=0; while [ "$_i" -lt 25 ]; do grep -q "port released" "$STLOG" && break; sleep 0.1; _i=$((_i+1)); done
+chk stall_unbind_honoured "$(grep -q 'port released' "$STLOG" && echo 1 || echo 0)" \
+    "released within 2.5 s of 'unbind'"
+chk stall_connection_dropped "$(kill -0 $PEER 2>/dev/null && grep -q '^conn=0' "$ST.state" && echo 1 || echo 0)" \
+    "conn=0 while the peer still holds its end" "$(cat "$ST.state" 2>/dev/null)"
+$PY - "$STPORT" <<'PYBIND' >/dev/null 2>&1 && ok stall_port_really_free yes || no stall_port_really_free yes "still bound"
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("::", int(sys.argv[1])))
+s.close()
+PYBIND
+kill $PEER $STPID 2>/dev/null; wait $STPID 2>/dev/null
 
 echo
 echo "============================================================"
