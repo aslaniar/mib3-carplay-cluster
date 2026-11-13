@@ -568,11 +568,6 @@ wait_oracle_ms() {
 }
 wait_oracle() { wait_oracle_ms "$1" "$(( ${2:-20} * 1000 ))" "${3:-0}"; }
 
-# the last surface id MS-S built an encoder for = what the cluster is (or is not)
-# actually showing.  Empty when the oracle has said nothing yet.
-oracle_last_share() {
-  otail | grep -ao "share_surface_id = [0-9]*" 2>/dev/null | tail -n 1 | sed 's/.*= *//'
-}
 oracle_live() { [ -s "$MSSLOG" ] 2>/dev/null; }
 
 # read-only preconditions; echoes the reason on failure
@@ -970,17 +965,10 @@ handover_back() {
     sub0; bc "handover:back:delete-ours $OURU"; sub_add sync
     sub0; h DELETE "http://$RSI:$DMP$OURU" >/dev/null; sub_add del; echo
   else
-    # NOTHING OF OURS IS ATTACHED.  MS-S can only be pointing at ivi $OURID
-    # through OUR element, so there is nothing to take down -- but that does NOT
-    # mean the car's map is streaming: an element can exist while MS-S shares
-    # nothing (that is exactly the FALLBACK state).  So the cheap exit is gated
-    # on MS-S's OWN last decision, not on the element list.
-    _last="$(oracle_last_share)"
-    if [ "${NOOR:-0}" != "1" ] && [ "$_last" = "$NAVID" ]; then
-      say "HANDOVER BACK OK: nothing of ours was attached and MS-S is already on the car's map ($NAVID)"
-      return 0
-    fi
-    say "HANDOVER BACK: nothing of ours was attached (MS-S last share='${_last:-?}')"
+    # Path B never attaches an element, so this is the normal case.  It says
+    # nothing about the nav: the last `share_surface_id` in the log predates the
+    # park, so only a share logged after _mk below is evidence.
+    say "HANDOVER BACK: nothing of ours was attached"
   fi
   if [ -z "$NAVU" ]; then
     [ -n "$SP" ] || { say "HANDOVER BACK NO-GO: no streamParameters uri"; return 1; }
