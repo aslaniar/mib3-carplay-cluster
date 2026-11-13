@@ -62,7 +62,10 @@ fi
 # see oracle_ensure.  Kept next to the pid so a rotation/restart resets both.
 OSTATE="$OPID.state"
 
-bc() { printf '[%s] %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$*" >> "$BCF" 2>/dev/null; sync 2>/dev/null; \
+# A breadcrumb on the stick must survive a reset, so it is synced.  One in RAM
+# cannot survive anyway, and a global sync there only stalls on the stick.
+bc() { printf '[%s] %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" "$*" >> "$BCF" 2>/dev/null
+       case "$BCF" in /dev/shm/*|/tmp/*) ;; *) sync 2>/dev/null ;; esac
        printf '[bc] %s\n' "$*"; }
 say() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
@@ -310,9 +313,10 @@ oracle_pid() {
 }
 # rotate at the cap.  ATOMIC: the kept tail is written to a sibling and renamed over
 # the log, so a reader (oracle_since / otail) sees the old file or the new one, never
-# a half-written one.  It runs ONLY from oracle_on, i.e. before the invocation has
-# taken a byte mark, and only one deliver_ctl runs at a time (the lock), so no gate
-# can be mid-flight.  A mark taken BEFORE a rotation is larger than the new size, and
+# a half-written one.  It runs from oracle_on and oracle_ensure, before the
+# invocation has taken a byte mark.  `oracle start` and `oracle stop` take no lock;
+# they are safe only because the supervisor runs one deliver_ctl at a time, so no
+# gate can be mid-flight.  A mark taken BEFORE a rotation is larger than the new size, and
 # oracle_since treats that as "rotated: start over" (reads from 0) -- correct, since
 # the retained tail is new history, not a stale hit.
 oracle_rotate() {
@@ -388,7 +392,13 @@ oracle_tail() {
     | sed 's/^.*\]//' | grep -avE "avg time" | tail -n 24
   echo "--- (end) ---"
 }
-msf_fds() { ls -l /proc/"$(pids_of multi-screen-server)"/fd 2>/dev/null | grep -cE 'video|ion|dri'; }
+msf_fds() {  # summed over every multi-screen-server pid
+  _n=0
+  for _p in $(pids_of multi-screen-server); do
+    _c=$(ls -l "/proc/$_p/fd" 2>/dev/null | grep -cE 'video|ion|dri'); _n=$((_n + _c))
+  done
+  echo "$_n"
+}
 
 status() {
   R="$(uris)"; D="$(disps)"; S="$(sps)"
