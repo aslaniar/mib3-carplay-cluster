@@ -290,7 +290,7 @@ valid_uri() { case "$1" in /displaymanagement/renderingSurfaces/*|/displaymanage
 # size/time the previous invocation recorded, so the check is free on the hot path);
 # and the file rotates at a size cap so an all-day drive cannot fill tmpfs.
 ORACLE_KEEP="${MIB3_DLV_ORACLE_KEEP:-4194304}"     # bytes kept when rotating (minutes of log)
-ORACLE_MAX="${MIB3_DLV_ORACLE_MAX:-67108864}"      # rotate above this (64 MB ~ 8 min at 8 MB/min)
+ORACLE_MAX="${MIB3_DLV_ORACLE_MAX:-8388608}"       # rotate above this: pathb_daemon.sh restarts the capture at 8 MB
 ORACLE_STALE_MS="${MIB3_DLV_ORACLE_STALE_MS:-8000}" # no growth for this long = dead capture
 
 cmdline_of() {   # /proc on the unit, ps on the desk (macOS has no /proc)
