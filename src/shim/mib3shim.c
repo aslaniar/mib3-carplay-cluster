@@ -3972,6 +3972,7 @@ int AirPlayReceiverSessionSetup(void *session, void *request, void **responseOut
           kfeat && p_CFGetTypeID(kfeat) == p_CFArrayGetTypeID()){
         CFIndex j, m = p_CFArrayGetCount((CFArrayRef)kfeat);
         char list[320]; unsigned long lw = 0;
+        list[0] = 0;
         for (j = 0; j < m && j < 24; j++){
           void *e = (void*)p_CFArrayGetValueAtIndex((CFArrayRef)kfeat, j);
           char tmp[48]; tmp[0] = 0;
@@ -3981,9 +3982,10 @@ int AirPlayReceiverSessionSetup(void *session, void *request, void **responseOut
             unsigned long tl = 0; while (tmp[tl]) tl++;
             unsigned long pl = 0; while (pp[pl]) pl++;
             unsigned long k;
-            for (k = 0; k < pl && lw + k + tl + 2 < sizeof(list); k++) list[lw+k] = pp[k];
+            if (lw + pl + tl >= sizeof(list)) break;
+            for (k = 0; k < pl; k++) list[lw+k] = pp[k];
             lw += pl;
-            for (k = 0; k < tl && lw + k + 1 < sizeof(list); k++) list[lw+k] = tmp[k];
+            for (k = 0; k < tl; k++) list[lw+k] = tmp[k];
             lw += tl;
             list[lw] = 0;
           }
