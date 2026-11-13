@@ -24,6 +24,7 @@
 #   T26 mib3wheel --selftest, built natively with -DHOST_TEST
 #   T27 fake_shim.py retries a connect that fails with a Python 2 socket.error
 #   T28 a peer that stalls mid-record is dropped within ~500 ms, so 'unbind' works
+#   T29 START GATE: an IDR that arrives before any SPS/PPS does not open the gate
 #
 # Desk only.  No car, no unit.  Usage: bash run_pathb.sh
 # ============================================================================
@@ -650,6 +651,49 @@ s.bind(("::", int(sys.argv[1])))
 s.close()
 PYBIND
 kill $PEER $STPID 2>/dev/null; wait $STPID 2>/dev/null
+
+echo; echo "############ T29: START GATE -- an IDR before any SPS/PPS is not a start ############"
+# A connection starts with no parameter sets held.  An IDR record that arrives
+# before the shim's header record cannot be decoded, so it must not open the gate.
+SG="$SOCKDIR/idrfirst"; DGS="$OUT/idrfirst.dgrams"; rm -f "$SG" "$DGS"
+"$NAT" --in "unix:$SG" --out "file:$DGS" 2>"$OUT/idrfirst.mux.log" &
+SGP=$!; track $SGP
+for _ in $(seq 1 40); do [ -S "$SG" ] && break; sleep 0.05; done
+$PY - "$FIX" "$SG" >"$OUT/idrfirst.feed.log" 2>&1 <<'PY'
+import socket, struct, sys, time
+d = open(sys.argv[1], "rb").read()
+starts = [i for i in range(len(d) - 3) if d[i:i+3] == b"\x00\x00\x01"]
+nals = [d[a:b] for a, b in zip(starts, starts[1:] + [len(d)])]
+cfg, frames = {}, []
+for n in nals:
+    t = n[3] & 0x1F
+    if t in (7, 8):
+        cfg[t] = n
+    elif t in (1, 5):
+        frames.append((cfg.get(7, b"") + cfg.get(8, b""), n))
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[2])
+seq = [0]
+def rec(p):
+    seq[0] += 1
+    s.sendall(struct.pack("<IIQ", 0x4D334331, len(p), seq[0]) + p)
+rec(frames[0][1])                 # the IDR, slices only, before any header
+for c, au in frames:
+    rec(c)
+    rec(au)
+    time.sleep(0.02)
+s.close()
+PY
+sleep 1.0; kill $SGP 2>/dev/null; wait $SGP 2>/dev/null
+$PY "$TOOLS/pes_frames.py" "$DGS" --json >"$OUT/idrfirst.json" 2>/dev/null
+SGF=$($PY -c "import json;print(json.load(open('$OUT/idrfirst.json'))['frames'][0]['nal'])" 2>/dev/null)
+SGBARE=$($PY -c "
+import json
+f = json.load(open('$OUT/idrfirst.json'))['frames']
+print(sum(1 for x in f if 5 in x['nal'] and not (7 in x['nal'] and 8 in x['nal'])))" 2>/dev/null)
+echo "$SGF" | grep -q '7, 8.*5' && ok gate_waits_for_params "first PES carries SPS+PPS+IDR" \
+  || no gate_waits_for_params "first PES carries SPS+PPS+IDR" "${SGF:-no PES}"
+[ "${SGBARE:-x}" = "0" ] && ok gate_no_idr_without_params 0 || no gate_no_idr_without_params 0 "${SGBARE:-?}"
 
 echo
 echo "============================================================"

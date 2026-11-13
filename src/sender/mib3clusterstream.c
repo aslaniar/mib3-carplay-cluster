@@ -2437,14 +2437,14 @@ int mib3_run(int argc, char **argv)
                 }
                 last_arrive = nar;
 
-                /* Fold a VCL-free record into the next frame (see the block above). */
-                if (!nofold) {
-                    int ch = 0;
-                    if (cfg_absorb(&cfg, uo, (usize_t)len, &ch)) {
-                        if (ch) hdr_pending = 1;   /* a real header change rides the next AU */
-                        continue;
-                    }
-                }
+                /* Fold a VCL-free record into the next frame (see the block above).
+                 * --no-fold still records it: the start gate asks whether
+                 * parameter sets are held. */
+                { int ch = 0;
+                  if (cfg_absorb(&cfg, uo, (usize_t)len, &ch)) {
+                      if (ch) hdr_pending = 1;     /* a real header change rides the next AU */
+                      if (!nofold) continue;
+                  } }
 
                 /* COUNT EVERY AU THE SHIM HANDS US, BOUND OR NOT (2026-11-02).
                  * In monitor mode the phone is streaming but the cluster is not
@@ -2468,10 +2468,15 @@ int mib3_run(int argc, char **argv)
                 if (!rt_t0) rt_t0 = nar;
                 rt_n++;
                 if (!noidr && !streaming) {
-                    if (!au_has_idr(uo, (usize_t)len)) {
+                    /* cfg is reset on every connect, so an IDR can arrive with no
+                     * SPS/PPS held; it is a start only if it carries both itself. */
+                    int vcl, sps, pps;
+                    nal_scan(uo, (usize_t)len, &vcl, &sps, &pps);
+                    if (!au_has_idr(uo, (usize_t)len) ||
+                        !((cfg.has_sps && cfg.has_pps) || (sps && pps))) {
                         held++;
                         if ((held & 0x3f) == 1) {
-                            say("gate: waiting for a decodable start (IDR); held ");
+                            say("gate: waiting for a decodable start (IDR + SPS/PPS); held ");
                             say_int("", (long)held);
                         }
                         continue;
