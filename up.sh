@@ -30,11 +30,6 @@
 # ============================================================================
 set -u
 
-# ---- the pinned builds (2026-11-02, field-verified on the car) -------------
-SHIM_PIN=dc723befb0cd4c636ca2aa2a8f2c3743
-SENDER_PIN=a9ab16d0bb8f29ed0ceda3f3ad69472d
-WHEEL_PIN=e689515fc20a701f0e84d62d9dcd6251
-
 KIT=/tmp/kit
 LOG="$KIT/up.log"
 HERE=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || HERE=""
@@ -52,10 +47,17 @@ die()  { say "STOP: $*"; exit 1; }
 step "up.sh: root (uid=0), staging from ${HERE:-?}"
 
 [ -n "$HERE" ] || die "cannot resolve my own directory"
+
+# The pinned builds.  bin/PINS is the one copy; tools/pin.sh writes it.
+pin() { sed -n "s/^$1=//p" "$HERE/bin/PINS" 2>/dev/null | head -n1; }
+SHIM_PIN=$(pin SHIM_PIN); SENDER_PIN=$(pin SENDER_PIN); WHEEL_PIN=$(pin WHEEL_PIN)
+[ -n "$SHIM_PIN" ] && [ -n "$SENDER_PIN" ] && [ -n "$WHEEL_PIN" ] \
+  || die "bin/PINS is missing or incomplete in $HERE"
 mkdir -p "$KIT" || die "cannot create $KIT"
 
 # src path in this tree -> flat name in /tmp/kit (the daemon expects flat)
 STAGE="
+bin/PINS:PINS
 bin/mib3shim.so:mib3shim.so
 bin/mib3clusterstream:mib3clusterstream
 bin/mib3wheel:mib3wheel
@@ -100,6 +102,19 @@ chk() { # chk <file-in-kit> <pin> <name>
 chk mib3shim.so       "$SHIM_PIN"   shim
 chk mib3clusterstream "$SENDER_PIN" sender
 chk mib3wheel         "$WHEEL_PIN"  wheel
+
+# The shim asks for a 4 MB send buffer on its socket to the sender, and the
+# kernel caps that at 2*wmem_max.  At the stock ceiling access units drop there.
+# This lives in RAM: a reboot restores the default.
+WMEM=/proc/sys/net/core/wmem_max
+_w=$(cat "$WMEM" 2>/dev/null || echo 0)
+if [ "${_w:-0}" -ge 8388608 ] 2>/dev/null; then
+  step "wmem_max: $_w (ok)"
+elif [ -w "$WMEM" ] && { echo 8388608 >"$WMEM"; } 2>/dev/null; then
+  step "wmem_max: $_w -> 8388608"
+else
+  warn "could not raise $WMEM (now $_w) -- the shim may drop access units"
+fi
 
 # The shim's activation gate: without this file it loads but behaves stock.
 MARKER=""

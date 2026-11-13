@@ -41,7 +41,5 @@ for _s in AirPlayInfoArrayAddScreenDisplay AirPlayReceiverSessionSetup AirPlayCo
 done
 echo "exported seams: ok"
 
-_g=$(MD5SUM "$BIN/mib3shim.so"); _p="$(sed -n 's/^SHIM_PIN=//p' "$REPO/up.sh" | head -n1)"
-if [ "$_g" = "$_p" ]; then echo "pin: $_g  matches up.sh"; else echo "pin: $_g  up.sh pins $_p"; fi
-
-# The out-of-process decode host belonged to Path A and is not built.
+_g=$(MD5SUM "$BIN/mib3shim.so"); _p="$(sed -n 's/^SHIM_PIN=//p' "$REPO/bin/PINS" | head -n1)"
+if [ "$_g" = "$_p" ]; then echo "pin: $_g  matches bin/PINS"; else echo "pin: $_g  bin/PINS has $_p"; fi

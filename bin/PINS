@@ -1,0 +1,4 @@
+# md5 of each build in bin/. Written by tools/pin.sh.
+SHIM_PIN=dc723befb0cd4c636ca2aa2a8f2c3743
+SENDER_PIN=a9ab16d0bb8f29ed0ceda3f3ad69472d
+WHEEL_PIN=e689515fc20a701f0e84d62d9dcd6251
