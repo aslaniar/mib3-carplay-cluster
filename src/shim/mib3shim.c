@@ -4272,13 +4272,13 @@ static void sink_resolve(void){
     if      (v[0]=='h') g_sink = SINK_HELPER;
     else if (v[0]=='o' || v[0]=='0') g_sink = SINK_OFF;
     else {
-      logline("sink","MIB3_SHIM_SINK=<dry|local|...> REMOVED (Path A, 2026-10-29): only 'off' and 'helper' exist. Staying OFF.");
+      logline("sink","MIB3_SHIM_SINK=<dry|local|...> removed 2026-10-29: only 'off' and 'helper' exist. Staying OFF.");
       g_sink = SINK_OFF;
     }
   } else if (getenv("MIB3_SHIM_SURFACE") || getenv("MIB3_SHIM_BRIDGE") ||
              getenv("MIB3_SHIM_LOCAL") || getenv("MIB3_SHIM_LOCAL_ACK") ||
              getenv("MIB3_SHIM_LOCAL_FALLBACK")){
-    logline("sink","LEGACY SURFACE/BRIDGE/LOCAL KNOBS ARE DEAD (Path A removed 2026-10-29). Use MIB3_SHIM_SINK=helper for Path B. Staying OFF.");
+    logline("sink","LEGACY SURFACE/BRIDGE/LOCAL KNOBS ARE DEAD (removed 2026-10-29). Use MIB3_SHIM_SINK=helper for Path B. Staying OFF.");
   }
   { char m[64]; buf b={m,sizeof(m)-2,0};
     bs(&b,"mode="); bu64(&b,(u64)(u32)g_sink,10,0);
