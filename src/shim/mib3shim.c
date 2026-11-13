@@ -485,20 +485,25 @@ static int helper_connect(void){
    * "blocky flat areas, wrong tints, text stays sharp".
    *
    * So: ask for 4 MB (~28 max-size AUs), READ IT BACK, and say so when the kernel
-   * clamped it -- SO_SNDBUF is clamped to 2*net.core.wmem_max, which the deleted
-   * bring_up.sh used to raise, so an unraised unit silently caps at 208 KB.  Sends stay
+   * clamped it -- SO_SNDBUF is clamped to 2*net.core.wmem_max, which up.sh
+   * raises to 8388608 before injection, so an unraised unit silently caps at 416 KB.  Sends stay
    * non-blocking: no drop policy, timeout or thread changes here. */
   { long want = kn()->hlp_sndbuf;
+    int sb = 0;
     if (want > 0){
-      int sb = (int)(want > (64u<<20) ? (64u<<20) : want);
+      sb = (int)(want > (64u<<20) ? (64u<<20) : want);
       setsockopt(fd, SOL_SOCKET_, SO_SNDBUF_, &sb, sizeof(sb));
     }
     { int got = 0; unsigned int gl = (unsigned int)sizeof(got);
       if (getsockopt(fd, SOL_SOCKET_, SO_SNDBUF_, &got, &gl) == 0){
         hlp_sndbuf = got;
         logkv("sink","helper sndbuf granted",(u64)(u32)got,0);
-        if (got < 425984) /* 2*208KB: the pre-bring_up ceiling */
-          logline("sink","helper sndbuf CLAMPED -- raise net.core.wmem_max (echo 8388608 > /proc/sys/net/core/wmem_max) or AUs will drop here");
+        /* the kernel stores and reports TWICE what was set, so a full grant reads 2*sb */
+        if (sb > 0 && (long)got < 2L * sb){
+          logkv("sink","helper sndbuf requested x2",(u64)(2L * sb),0);
+          logline("sink","helper sndbuf CLAMPED below the request by /proc/sys/net/core/wmem_max "
+                         "(up.sh raises it to 8388608 before injection) -- AUs will drop here");
+        }
       } }
   }
   hlp_fd = fd; hlp_conns++;
