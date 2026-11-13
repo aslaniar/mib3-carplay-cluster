@@ -53,8 +53,7 @@ appended dict** with `type=111`, `initialURL` and a `viewAreas[]` (+`initialView
 field-level schema the phone expects. LG's own call passes `config[0x13]` as `primaryInputDevice`.
 
 **`AirPlayReceiverSessionSetup`** — LG's handler for the iPhone's stream request. The shim logs it,
-injects `enabledFeatures = [altScreen, viewAreas]` into the SETUP response (if absent; `uiContext`
-only with `MIB3_SHIM_EF_UICONTEXT=1`), and — the important part — **handles the type-111 stream
+injects `enabledFeatures = [altScreen, viewAreas]` into the SETUP response (if absent), and — the important part — **handles the type-111 stream
 itself**. The unit's dispatcher inside this function only handles types 100/101/102/110 and drops
 111; and the session holds exactly **one** screen, so a second 110 is impossible. The shim therefore
 owns a *second* screen object and reproduces the unit's `_ScreenSetup` + `_ScreenThread` for it via
@@ -86,7 +85,7 @@ unit's own firewall allowlist `ncm0 tcp 5000:5001`, observed free) →
 is not part of this repository) → ephemeral ·
 **`MIB3_SHIM_CMDS=0/1`** (default 1) send `forceKeyFrame`/`showUI`/`setNightMode` to the phone once the
 111 stream connects (the post-connect sequence — without them the phone connects but sends no
-video) · **`MIB3_SHIM_EF_IAPCHANNEL=1`** / **`MIB3_SHIM_EF_UICONTEXT=1`** = also claim that feature in
+video) · **`MIB3_SHIM_EF_IAPCHANNEL=1`** = also claim `iAPChannel` in
 `enabledFeatures` (default OFF — never claim a feature the stock does not implement) ·
 **`MIB3_SHIM_CONNID=1`** = echo the request's `streamConnectionID` in the 111 response descriptor
 (a belt knob for paired mode; the stock 110 descriptor proves it is not required) ·
@@ -97,9 +96,9 @@ video) · **`MIB3_SHIM_EF_IAPCHANNEL=1`** / **`MIB3_SHIM_EF_UICONTEXT=1`** = als
 **`MIB3_SHIM_ENABLEDFEAT=0/1`** (default 1) inject `enabledFeatures` into the **control SETUP**
 response only (the request carries the `features` proposal key) ·
 **`MIB3_SHIM_INFO=0/1`** (default 1) complete the modern `/info` schema (the `AirPlayCopyServerInfo`
-seam) · **`MIB3_SHIM_NIGHT=0/1`** force the cluster/main `nightMode` (default: copy the main entry) ·
-`MIB3_SHIM_FRAMEDBG=1` = log CarPlay output-surface changes · `MIB3_SHIM_DBG=1` verbose. Logs to
-**`/tmp/mib3shim.log`**.
+seam) · `MIB3_SHIM_NIGHT=0/1` = debug only, force the `setNightMode` command (unset: `/info`
+mirrors the main display's mode) · `MIB3_SHIM_GATE=0/1` = test hook, force the activation gate
+(unset: scan for `<stick>/PART1/mib3shim.enable`). Logs to **`/tmp/mib3shim.log`**.
 
 The view-area, zoom, appearance and telemetry knobs are documented at their use sites in
 `mib3shim.c` (`VIEW AREAS`, `ZOOM`, `APPEARANCE` blocks).
@@ -158,10 +157,9 @@ from the unit's own `CinemoMediaEngineUtils::screenSetup` (proven on the unit).
 > decode/render is hardware, so **acceptance is live-only**. The bridge was therefore defensive: every
 > step checked, any failure falling back to the surface path.
 
-## Half-2 (cluster delivery) diagnostic
-The shim also interposed `CarPlayAppFrameworkSetSurface(fw, surface, id)` and, with
-`MIB3_SHIM_FRAMEDBG=1`, logs which surface the CarPlay process paints into
-(`SetSurface: ... surfaceId=`). It is a pure forwarder when the log is off. Delivery of decoded frames
+## Half-2 (cluster delivery) diagnostic (not built)
+An earlier shim interposed `CarPlayAppFrameworkSetSurface(fw, surface, id)` to log which surface the
+CarPlay process paints into. The shipping shim does not. Delivery of decoded frames
 to the cluster is **external** (the RSI/display-management config + a cluster surface) — see
 `src/control/deliver_ctl.sh`.
 
@@ -174,13 +172,14 @@ to the cluster is **external** (the RSI/display-management config + a cluster su
 An adversarial pass over every module (memory safety, edge cases, threading, resources, error paths,
 ABI, main-screen isolation) found and fixed **two crash paths** — the chacha (HomeKit) key-derive
 argument and the RGBA fallback's out-of-bounds read — plus a reconnect state-corruption bug (now a
-per-thread context + a cluster-stream registry) and several robustness defects.
+per-thread context + generation tokens) and several robustness defects.
 
 ## Desk verification
 
-`tests/run_pathb.sh` and `tests/run_pathb_daemon.sh` exercise the live chain (shim AU socket →
-sender → RTP/TS → capture); `tests/run_clusterstream_bench.sh` pins the emitted container against the
-fixture. The older container harnesses loaded the unit's **real** libAirPlay/FW under the unit's own
+No bench loads the shim. `tests/run_pathb.sh` drives the real sender from a fake shim
+(`src/control/pathb/fake_shim.py`) and verifies the RTP/TS on the wire.
+`tests/run_pathb_daemon.sh` checks the supervisor's ordering against fake sender and RSI seams.
+`tests/run_clusterstream_bench.sh` pins the emitted container against the fixture. The older container harnesses loaded the unit's **real** libAirPlay/FW under the unit's own
 glibc 2.23 with the shim preloaded and proved the seam is reached (direct call **and** the framework's
 real `setDisplays`); the route-B stub bench proved second-surface creation, the dynamic swap
 (discover→apply→restore) and the type-111→surface→frame wiring. Both were desk-only and have been
@@ -211,7 +210,8 @@ that already hold the real function addresses and repoints them at the shim (it 
 three GOT slots). A failed patch leaves the shim mapped-but-inert — when a seam is never reached it
 forwards, never the reverse.
 
-Nothing is persisted outside `/dev/shm` and `/tmp`, so **a reboot is the full undo**.
+Nothing is persisted outside `/dev/shm`, `/tmp` and the breadcrumb file `<stick>/PART1/mib3shim.bc`,
+so **a reboot plus pulling the stick is the full undo**.
 
 ## Success looks like
 `/tmp/mib3shim.log` shows `AddScreenDisplay: CALL` with the real args, then
