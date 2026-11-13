@@ -72,10 +72,11 @@
  * the decode path.  It is reset when we detect we have fallen behind (see
  * MAX_PENDING below), because then the reference chain is genuinely broken.
  *
- * BACKLOG GUARD.  If more than MAX_PENDING bytes are queued on the AU socket when
- * we finish an AU, we are behind: drain forward and wait for the next IDR instead
- * of dumping stale frames at the ECU.  A burst is *measured* to knock the cluster
- * into its placeholder, so flooding is never the lesser evil.
+ * BACKLOG GUARD.  If more than MAX_PENDING bytes are queued on the AU socket, or
+ * more than QMAXDRAIN AUs in our own queue, when we finish an AU, we are behind:
+ * drop forward and wait for the next IDR instead of dumping stale frames at the
+ * ECU.  A burst is *measured* to knock the cluster into its placeholder, so
+ * flooding is never the lesser evil.
  *
  * BUILD (desk, native):
  *     cc -O2 -o mib3clusterstream mib3clusterstream.c
@@ -1387,8 +1388,8 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
  * for a pass-through pacer; it is not a buffer.  A jitter buffer has to hold
  * the phone's worst measured hole (486 ms, ~9 AUs at 17 fps) plus its bursts,
  * and --jit-ms converts that to entries at run time.  64 is a generous ceiling
- * (~3 MB worst case at 48 KB/frame) and the maxq drain below keeps the depth
- * near the target rather than letting it walk up to the ceiling. */
+ * (~3 MB worst case at 48 KB/frame).  A queue deeper than QMAXDRAIN is behind
+ * for good and is dropped to the next IDR (see the BACKLOG GUARD). */
 #define QCAP 64
 #define QMAXDRAIN 40
 /* OUTPUT RATE CEILING (2026-10-30).  Used ONLY when draining a backlog.  The
@@ -1463,7 +1464,7 @@ static void cad_pct(const u64 *ring, int cnt, u64 *p50, u64 *p95, u64 *mx)
 static void pace_emit(Pace *p, const u8 *au, usize_t len)
 {
     {   /* emit-rhythm sample: this is called once per access unit, from every
-         * path (clock, catch-up, depth drain), so it sees what actually left. */
+         * path (clock, catch-up, teardown drain), so it sees what actually left. */
         u64 nowe = now_ms();
         if (cad_last_emi_ms && nowe >= cad_last_emi_ms && nowe - cad_last_emi_ms <= 1000)
             cad_push(cad_emi, &cad_emi_i, &cad_emi_n, nowe - cad_last_emi_ms);
@@ -1577,8 +1578,9 @@ static void pace_emit(Pace *p, const u8 *au, usize_t len)
     if (p->iv_ms && p->m->au_iv_ms < 1) p->m->au_iv_ms = 1;
     /* RATE CEILING: a frame may never leave faster than OUT_RATE_B_PER_MS, no
      * matter how urgently the release clock wants it gone.  This is what makes a
-     * late frame SPREAD instead of CLUMP. */
-    { u64 floor_ms = (u64)len / (u64)OUT_RATE_B_PER_MS;
+     * late frame SPREAD instead of CLUMP.  Rounded UP: truncating let a 9,952 B
+     * frame leave in 4 ms, i.e. 2,488 B/ms. */
+    { u64 floor_ms = ((u64)len + OUT_RATE_B_PER_MS - 1) / (u64)OUT_RATE_B_PER_MS;
       if (floor_ms < 1) floor_ms = 1;
       if (p->m->au_iv_ms < floor_ms) p->m->au_iv_ms = floor_ms; }
     p->m->au_payload = (u64)len;
@@ -2004,7 +2006,7 @@ int mib3_run(int argc, char **argv)
             u64 cad_prev_ov = 0, cad_prev_sk = 0, cad_prev_df = 0;
             u64 cad_prev_in = 0, cad_prev_out = 0;
             /* isochronous clock state (see the block in the poll loop) */
-            u64 jit_started = 0, conn_t0 = 0, underruns = 0, overflow_drains = 0;
+            u64 jit_started = 0, conn_t0 = 0, underruns = 0;
             int jit_tgt = 0;                     /* target depth, frames -- ADAPTIVE */
             int jit_min = 2, jit_max = 10;
             u64 rt_t0 = 0, rt_n = 0, iv_out = 0; /* arrival rate meter                */
@@ -2333,20 +2335,6 @@ int mib3_run(int argc, char **argv)
                       say(" AU(s) after 4 s without starvation\n");
                   }
 
-                  /* DEPTH BOUND: drain ahead of the clock rather than let the
-                   * buffer walk up towards QCAP (which would be seconds of
-                   * latency).  It still SPREADS at the faster interval -- a deep
-                   * queue is not a reason to clump. */
-                  if (qn > QMAXDRAIN) {
-                      pc.iv_ms = !jit_ms ? 0 : (iv > 2 ? iv / 2 : iv);
-                      while (qn > QMAXDRAIN) {
-                          pace_emit(&pc, qb[qh], ql[qh]);
-                          qh = (qh + 1) % QCAP;
-                          qn--;
-                          overflow_drains++;
-                      }
-                      pc.iv_ms = 0;
-                  }
                 }
 
                 /* ================= LOOP-DRIVEN EMISSION ======================
@@ -2519,23 +2507,26 @@ int mib3_run(int argc, char **argv)
                 memcpy(qb[qi], fo, tot);
                 ql[qi] = tot; qarr[qi] = nar; qn++;
 
-                /* pending bytes on the socket are the real backlog signal */
+                /* BEHIND: bytes pending on the socket, or a queue deeper than
+                 * the clock can drain.  The old depth bound emitted the excess
+                 * through pace_emit, which flushed each in-flight AU in one burst
+                 * (75-298 datagrams in 25 ms, run_pathb T6c).  Drop to the next IDR. */
                 if (!noidr && qn > 3) {
                     long pend = pending_bytes(uni);
-                    if (pend > (long)MAX_PENDING) {
+                    if (pend > (long)MAX_PENDING || qn > QMAXDRAIN) {
                         /* COUNT WHAT WE DISCARD: resetting the queue used
                          * to drop up to QCAP access units with no counter
                          * anywhere -- a high-drain session could masquerade as
                          * lossless.  The AUs are the number that reconciles
                          * against the shim's `helper AUs total`. */
+                        say("gate: behind (queue "); say_num((long)qn);
+                        say(" AUs, socket "); say_num(pend);
+                        say(" bytes) -- dropped them, waiting for the next IDR\n");
                         backlog_aus += (u64)qn;
                         qh = 0; qn = 0;
                         streaming = 0;
                         g_ready = 0; state_maybe(1);
                         backlog++;
-                        say("gate: backlog "); say_int("", pend);
-                        say(" bytes -- drained "); say_int("", (long)backlog_aus);
-                        say(" AUs forward to the next IDR\n");
                     }
                 }
                 }   /* end: a record was ready */
@@ -2584,11 +2575,10 @@ int mib3_run(int argc, char **argv)
             }
             say("  arrival-gaps>250ms="); say_int("", (long)gaps);
             /* The numbers that say whether the emulation is working.  starved
-             * ticks and depth-drains measure the isochronous clock; spread-
+             * ticks measure the isochronous clock; spread-
              * overruns is the new one -- a spread that ran past its slot and had
              * to be collapsed.  All should be ~0 on a healthy session. */
             say("  jit: starved-ticks="); say_int("", (long)underruns);
-            say("  depth-drains="); say_int("", (long)overflow_drains);
             say("  spread-overruns="); say_int("", (long)m.spread_overruns);
             say("  spread-skipped="); say_int("", (long)m.spread_skipped);
             say("  spread-overruns="); say_int("", (long)m.spread_overruns);

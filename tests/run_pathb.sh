@@ -15,6 +15,8 @@
 #   T5  ES stays byte-exact through the fold (no byte is rewritten)
 #   T6  RECONNECT: one process survives 2 connections; RTP seq continuous across
 #       the boundary; PSI re-emitted for the new connection
+#   T6c a queue deeper than QMAXDRAIN is dropped; no 25 ms holds more than the
+#       rate ceiling allows
 #   T7  SPORT: --sport binds, and the datagrams really leave from that port
 #   T8  SPORT taken -> loud failure (exit 3), never a silent shared group
 #   T9  --sport auto refuses rather than guessing
@@ -291,16 +293,23 @@ FR=$($PY "$TOOLS/pes_frames.py" "$DG2" --json | $PY -c "import json,sys;print(js
 echo "  $(grep -E 'conn open|conn close' "$OUT/recon.mux.log" | tr '\n' ' ')"
 
 echo; echo "############ T6b: a feed FASTER than the pacer must not lose its tail ############"
-# The pacer holds up to 8 access units.  Closing the connection with them queued
-# used to discard them silently -- measured on a real phone capture: 7 of 2077 AUs
-# never reached the wire and nothing said so.  The reconnect test above cannot see
-# that, because at 40 fps the feed is slower than the pacer and the queue never
-# fills.  So feed as fast as the socket allows and require EVERY AU to arrive.
+# Closing the connection with access units queued used to discard them silently --
+# measured on a real phone capture: 7 of 2077 AUs never reached the wire and
+# nothing said so.  The reconnect test above cannot see that, because at 40 fps
+# the feed is slower than the pacer and the queue never fills.  So feed as fast
+# as the socket allows and require EVERY AU to arrive.  Three GOPs (30 AUs) keep
+# the queue under QMAXDRAIN (40); a deeper queue is dropped on purpose (T6c).
+$PY - "$FIX" "$OUT/gop3.264" <<'PY'
+import sys
+d = open(sys.argv[1], "rb").read()
+sps = [i for i in range(len(d) - 4) if d[i:i+4] == b"\x00\x00\x00\x01" and d[i+4] & 0x1F == 7]
+open(sys.argv[2], "wb").write(d[:sps[3]])
+PY
 SOCKF="$SOCKDIR/fast"; DGF="$OUT/fast.dgrams"; rm -f "$SOCKF" "$DGF"
 "$NAT" --in "unix:$SOCKF" --out "file:$DGF" --pace-ms 40 2>"$OUT/fast.mux.log" &
 FP=$!; track $FP
 for _ in $(seq 1 40); do [ -S "$SOCKF" ] && break; sleep 0.05; done
-$PY "$KIT/pathb/fake_shim.py" "$FIX" 5000 "$SOCKF" >"$OUT/fast.feed.log" 2>&1
+$PY "$KIT/pathb/fake_shim.py" "$OUT/gop3.264" 5000 "$SOCKF" >"$OUT/fast.feed.log" 2>&1
 FEDN=$(sed -n 's/.*frames \([0-9]*\)$/\1/p' "$OUT/fast.feed.log" | head -1)
 sleep 2.0
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
@@ -309,6 +318,33 @@ WIREN=$($PY "$TOOLS/pes_extract.py" "$DGF" --brief 2>/dev/null | sed -n 's/.*pes
   && ok pacer_drains_on_close "${FEDN:-?} AUs" || no pacer_drains_on_close "${FEDN:-?} AUs" "${WIREN:-0}"
 grep -q "drained-at-close=" "$OUT/fast.mux.log" && ok pacer_reports_drain yes || no pacer_reports_drain yes no
 echo "  fed=$FEDN  on-wire=$WIREN  $(grep -o 'drained-at-close=[0-9]*' "$OUT/fast.mux.log" | head -1)"
+
+echo; echo "############ T6c: a deep queue is dropped to the next IDR, never burst out ############"
+# A sustained feed faster than the release clock pushes the queue past QMAXDRAIN.
+# The old depth bound emitted the excess through pace_emit, which flushed each
+# in-flight AU at once: 75-298 datagrams in 25 ms on this feed.  The rate ceiling
+# is OUT_RATE_B_PER_MS = 2000 B/ms, 50,000 B per 25 ms, which fills 46 datagrams
+# of 6 x 184 = 1104 B.  On top of that each AU ends in one part-filled datagram
+# (the smallest AU here, 9,952 B, takes 5 ms at the ceiling, so at most 5 end in
+# a window), and a late wake on a busy desk releases up to one EMIT_BURST (8) of
+# overdue datagrams together: 46 + 5 + 8 = 59.  The teardown drain is excluded
+# by --stats-timing itself.
+cat "$FIX" "$FIX" "$FIX" >"$OUT/x3.264"
+SOCKD="$SOCKDIR/deep"; DGD="$OUT/deep.dgrams"; rm -f "$SOCKD" "$DGD"
+"$NAT" --in "unix:$SOCKD" --out "file:$DGD" --stats-timing 2>"$OUT/deep.mux.log" &
+DP=$!; track $DP
+for _ in $(seq 1 40); do [ -S "$SOCKD" ] && break; sleep 0.05; done
+$PY "$KIT/pathb/fake_shim.py" "$OUT/x3.264" 300 "$SOCKD" >"$OUT/deep.feed.log" 2>&1
+sleep 1.5; kill $DP 2>/dev/null; wait $DP 2>/dev/null
+PEAK=$(sed -n 's/.*peak-dg\/25ms=\([0-9]*\).*/\1/p' "$OUT/deep.mux.log" | head -1)
+WRITES=$(sed -n 's/^timing: writes=\([0-9]*\).*/\1/p' "$OUT/deep.mux.log" | head -1)
+grep -q "gate: behind (queue" "$OUT/deep.mux.log" && ok deep_queue_dropped yes \
+  || no deep_queue_dropped yes "no drop logged"
+[ "${WRITES:-0}" -ge 200 ] && ok deep_queue_streamed ">=200 datagrams" \
+  || no deep_queue_streamed ">=200 datagrams" "${WRITES:-0}"
+[ -n "${PEAK:-}" ] && [ "$PEAK" -le 59 ] && ok deep_queue_under_rate_ceiling "<=59 per 25 ms" \
+  || no deep_queue_under_rate_ceiling "<=59 per 25 ms" "${PEAK:-none}"
+echo "  writes=$WRITES peak-dg/25ms=$PEAK  $(grep -c 'gate: behind' "$OUT/deep.mux.log") drop(s)"
 
 cat > "$OUT/mcaster.py" <<'PY'
 import socket, struct, sys
