@@ -373,7 +373,7 @@ takeover(){  # -> 0 on success; the caller sets ACTIVE
       _w=$(now_ms)
       while [ $(( $(now_ms) - _w )) -lt 800 ]; do
         read_sender
-        [ "$S_BOUND" = "$PORT" ] && { _bound=1; break; }
+        [ "$S_BOUND" = "$PORT" ] && { _bound=1; _out0=$S_OUT; break; }
         nap_ms 50
       done
       [ "$_bound" = "1" ] && break
@@ -398,9 +398,11 @@ takeover(){  # -> 0 on success; the caller sets ACTIVE
   fi
 
   # FIRST EMIT is the proof the wire is ours and decodable -- not "bound".
+  # `out` counts for the sender's whole life, so only an advance since the bind
+  # is this session's emit.
   while :; do
     read_sender
-    [ "$S_OUT" -gt 0 ] && break
+    [ "$S_OUT" -gt "$_out0" ] && break
     if [ $(( $(now_ms) - _t0 )) -ge "$TAKEOVER_MS" ]; then
       log "TAKEOVER FAIL: bound but nothing was emitted within ${TAKEOVER_MS}ms"
       return 1

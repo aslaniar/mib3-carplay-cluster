@@ -27,6 +27,7 @@
 #   D14  a hand-back that fails must NOT report IDLE (it degrades, then recovers)
 #   D15  a takeover that fails before we bind leaves IDLE with the nav restored
 #   D16  a one-shot tick starts from clean state (no inherited sender pid)
+#   D17  a second session whose sender binds but never emits fails its takeover
 #
 # Usage: sh tests/run_pathb_daemon.sh
 # ============================================================================
@@ -80,7 +81,7 @@ while :; do
   fi
   if [ -f "$P" ]; then
     au=$((au+1)); ready=1
-    [ "$bound" != "0" ] && out=$((out+1))
+    [ "$bound" != "0" ] && [ ! -f "$RAM/no_emit" ] && out=$((out+1))
   else
     ready=0
   fi
@@ -141,7 +142,7 @@ reset_all(){
   rm -f "$TMP"/pathb_sender.pid "$TMP"/pathb_conn.state "$TMP"/pathb_sender.ctl \
         "$TMP"/pathb_daemon.state "$TMP"/pathb_daemon.log "$TMP"/pathb_daemon.cmd \
         "$TMP"/pathb_daemon.pause "$TMP"/pathb_daemon.pid "$TMP"/order.log \
-        "$TMP"/port_held "$TMP"/fake_phone "$TMP"/back_fail
+        "$TMP"/port_held "$TMP"/fake_phone "$TMP"/back_fail "$TMP"/no_emit
 }
 dstart(){ nohup sh "$DAEMON" run >"$TMP/daemon.stdout" 2>&1 & sleep 0.8; }
 dstate(){ sed -n 's/^state=\([A-Z]*\).*/\1/p' "$TMP/pathb_daemon.state" 2>/dev/null; }
@@ -318,6 +319,23 @@ chk d15_never_bound "$( [ -z "$(first_line "^bind " "$TMP/order.log")" ] && echo
 chk d15_stays_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE ($(dstate))"
 chk d15_handed_back "$( [ -n "$(first_line "^back$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "nav restored anyway"
 unset PARK_RC PARK_KEEP_PORT
+reset_all
+
+echo
+echo "############ D17: a later session whose sender never emits ############"
+# `out` counts for the whole life of the sender, so a second session must see it
+# ADVANCE after the bind; a sender that binds and sends nothing is not a takeover.
+dstart; phone_on
+wait_state ACTIVE 5000 >/dev/null 2>&1
+phone_off
+wait_state IDLE 6000 >/dev/null 2>&1
+: >"$TMP/no_emit"
+phone_on
+chk d17_not_active "$( wait_state ACTIVE 6000 && echo 0 || echo 1 )" "never ACTIVE ($(dstate))"
+phone_off
+wait_state IDLE 8000 >/dev/null 2>&1
+chk d17_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE ($(dstate))"
+chk d17_ends_handed_back "$( [ "$(tail -n 1 "$TMP/order.log" 2>/dev/null)" = "back" ] && echo 1 || echo 0 )" "order.log ends with back"
 reset_all
 
 echo
