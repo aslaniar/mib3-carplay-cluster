@@ -3224,6 +3224,9 @@ static void *cluster_thread(void *arg){
     { u64 now0 = mono_ms(); (void)now0;
       g_kf_seen_ms = 0; g_kf_req_ms = 0; g_showui_retry_ms = 0; g_au_last_ms = 0;
       g_night_applied = -2; }
+    /* Inbox requests queued while no stream existed belong to no session:
+     * drop them here, on the consumer side, so they do not replay into this one. */
+    g_zoom_qr = g_zoom_qw; g_va_qr = g_va_qw; g_ap_qr = g_ap_qw;
     /* ...and only THEN arm the one delayed re-activation (see cluster_showui_retry) */
     { long d = (long)env_num("MIB3_SHIM_SHOWUI_MS", 1800);
       g_showui_retry_ms = (d > 0) ? (mono_ms() + (u64)d) : 0;
