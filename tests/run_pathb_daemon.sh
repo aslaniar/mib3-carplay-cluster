@@ -25,6 +25,7 @@
 #   D13  the CLI reports the daemon and its state
 #   D14  a hand-back that fails must NOT report IDLE (it degrades, then recovers)
 #   D15  a takeover that fails before we bind leaves IDLE with the nav restored
+#   D16  a one-shot tick starts from clean state (no inherited sender pid)
 #
 # Usage: sh tests/run_pathb_daemon.sh
 # ============================================================================
@@ -307,6 +308,13 @@ chk d15_never_bound "$( [ -z "$(first_line bind "$TMP/order.log")" ] && echo 1 |
 chk d15_stays_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE ($(dstate))"
 chk d15_handed_back "$( [ -n "$(first_line back "$TMP/order.log")" ] && echo 1 || echo 0 )" "nav restored anyway"
 unset PARK_RC PARK_KEEP_PORT
+reset_all
+
+echo
+echo "############ D16: a one-shot tick starts from clean state ############"
+SENDER_PID=$$ sh "$DAEMON" tick >/dev/null 2>&1
+chk d16_started_ms "$( [ "$(dfield started_ms)" = "0" ] && echo 1 || echo 0 )" "started_ms=0 ($(dfield started_ms))"
+chk d16_no_inherited_sender "$( [ "$(dfield sender)" = "-" ] && echo 1 || echo 0 )" "sender=- ($(dfield sender))"
 reset_all
 
 echo
