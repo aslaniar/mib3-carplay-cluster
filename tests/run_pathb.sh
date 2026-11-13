@@ -22,6 +22,7 @@
 #   T11 msport.py: single / absent / changed / ambiguous fake /proc fixtures
 #   T12 FILE MODE unchanged (independent RTP/TS verification still passes)
 #   T26 mib3wheel --selftest, built natively with -DHOST_TEST
+#   T27 fake_shim.py retries a connect that fails with a Python 2 socket.error
 #
 # Desk only.  No car, no unit.  Usage: bash run_pathb.sh
 # ============================================================================
@@ -575,6 +576,37 @@ if "$CC" -DHOST_TEST -O2 -Wall -Wextra -o "$OUT/mib3wheel.host" "$REPO/src/wheel
 else
   no wheel_selftest "rc=0" "$(tail -1 "$OUT/wheel.build.log")"
 fi
+
+echo; echo "############ T27: fake_shim.py retries a Python 2 socket.error ############"
+# The unit runs fake_shim.py on Python 2.7, where a refused connect raises
+# socket.error, which is not an OSError.  Python 3 cannot raise one, so model it:
+# the first two connects raise a socket.error outside the OSError tree.
+SOCKP="$SOCKDIR/py2err"; DGP="$OUT/py2err.dgrams"; rm -f "$SOCKP" "$DGP"
+"$NAT" --in "unix:$SOCKP" --out "file:$DGP" 2>"$OUT/py2err.mux.log" &
+PP=$!; track $PP
+for _ in $(seq 1 40); do [ -S "$SOCKP" ] && break; sleep 0.05; done
+$PY - "$KIT/pathb/fake_shim.py" "$FIX" 200 "$SOCKP" >"$OUT/py2err.feed.log" 2>&1 <<'PY'
+import runpy, socket, sys
+class Py2SocketError(Exception):
+    pass
+real = socket.socket
+class Refusing(real):
+    fails = 2
+    def connect(self, addr):
+        if Refusing.fails:
+            Refusing.fails -= 1
+            raise Py2SocketError(111, "Connection refused")
+        return real.connect(self, addr)
+socket.error = Py2SocketError
+socket.socket = Refusing
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+PY
+RC=$?
+kill $PP 2>/dev/null; wait $PP 2>/dev/null
+grep -q '^sent 50 frames' "$OUT/py2err.feed.log" && [ "$RC" = "0" ] \
+  && ok fake_shim_retries_socket_error "rc=0, sent 50 frames" \
+  || no fake_shim_retries_socket_error "rc=0, sent 50 frames" "rc=$RC $(tail -1 "$OUT/py2err.feed.log")"
 
 echo
 echo "============================================================"
