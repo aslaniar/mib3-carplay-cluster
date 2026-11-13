@@ -3786,6 +3786,7 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
                                      int heightPhysical)
 {
   hit("ADD\n", 4);                       /* prove entry, independent of everything */
+  g_cluster_advertised = 0;              /* re-decided for THIS display list below */
   run_banner();                          /* ==== RUN n / knobs ==== : per-plug discriminator */
   logline("AddScreenDisplay","ENTERED");  /* before resolve(): resolve() may fail */
   resolve();
