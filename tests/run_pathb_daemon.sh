@@ -20,7 +20,7 @@
 #   D8   the pause marker stops any takeover
 #   D9   a second daemon refuses to run (single instance)
 #   D10  restart with a sender that still holds the port -> reconcile releases
-#   D11  the sender dying while ACTIVE -> release, then a new sender
+#   D11  the sender dying while ACTIVE -> release, then a new sender retakes it
 #   D12  the state file carries the fields the CLI needs
 #   D13  the CLI reports the daemon and its state
 #   D14  a hand-back that fails must NOT report IDLE (it degrades, then recovers)
@@ -147,6 +147,8 @@ dstate(){ sed -n 's/^state=\([A-Z]*\).*/\1/p' "$TMP/pathb_daemon.state" 2>/dev/n
 dfield(){ sed -n "s/.*$1=\\([^ ]*\\).*/\\1/p" "$TMP/pathb_daemon.state" 2>/dev/null; }
 wait_state(){ _n=$(( $2 / 50 )); while [ "$_n" -gt 0 ]; do
     [ "$(dstate)" = "$1" ] && return 0; sleep 0.05; _n=$((_n-1)); done; return 1; }
+wait_line(){ _n=$(( $2 / 50 )); while [ "$_n" -gt 0 ]; do
+    [ -n "$(first_line "$1" "$TMP/order.log")" ] && return 0; sleep 0.05; _n=$((_n-1)); done; return 1; }
 
 echo "############ D0: syntax ############"
 sh -n "$DAEMON" 2>/dev/null && chk d0_daemon_syntax 1 "sh -n" || chk d0_daemon_syntax 0 "sh -n failed"
@@ -157,15 +159,15 @@ echo "############ D1: no phone, no action ############"
 reset_all; dstart
 sleep 1.2
 chk d1_stays_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE"
-chk d1_no_park "$( [ -z "$(first_line park "$TMP/order.log")" ] && echo 1 || echo 0 )" "no park"
-chk d1_no_bind "$( [ -z "$(first_line bind "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind"
+chk d1_no_park "$( [ -z "$(first_line "^park$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "no park"
+chk d1_no_bind "$( [ -z "$(first_line "^bind " "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind"
 reset_all
 
 echo
 echo "############ D2: a blip is not a session (debounce) ############"
 dstart; phone_on; sleep 0.2; phone_off
 sleep 1.2
-chk d2_no_takeover "$( [ -z "$(first_line bind "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind"
+chk d2_no_takeover "$( [ -z "$(first_line "^bind " "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind"
 chk d2_still_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE"
 reset_all
 
@@ -174,7 +176,7 @@ echo "############ D3/D4: takeover, park BEFORE bind ############"
 printf 'mss\n' >"$TMP/port_held"        # the car's nav owns the port
 dstart; phone_on
 if wait_state ACTIVE 5000; then chk d3_reaches_active 1 "ACTIVE"; else chk d3_reaches_active 0 "$(dstate)"; fi
-_p=$(first_line park "$TMP/order.log"); _b=$(first_line bind "$TMP/order.log")
+_p=$(first_line "^park$" "$TMP/order.log"); _b=$(first_line "^bind " "$TMP/order.log")
 chk d3_park_happened "$( [ -n "$_p" ] && echo 1 || echo 0 )" "park in the order log"
 chk d3_bind_happened "$( [ -n "$_b" ] && echo 1 || echo 0 )" "bind in the order log"
 chk d4_park_before_bind "$( [ -n "$_p" ] && [ -n "$_b" ] && [ "$_p" -lt "$_b" ] && echo 1 || echo 0 )" "park ($_p) < bind ($_b)"
@@ -186,7 +188,7 @@ echo "############ D5: frames stop -> release, unbind BEFORE hand back #########
 phone_off
 sleep 0.3
 if wait_state IDLE 6000; then chk d5_back_to_idle 1 "IDLE"; else chk d5_back_to_idle 0 "$(dstate)"; fi
-_u=$(first_line unbind "$TMP/order.log"); _k=$(first_line back "$TMP/order.log")
+_u=$(first_line "^unbind$" "$TMP/order.log"); _k=$(first_line "^back$" "$TMP/order.log")
 chk d5_unbind_before_back "$( [ -n "$_u" ] && [ -n "$_k" ] && [ "$_u" -lt "$_k" ] && echo 1 || echo 0 )" "unbind ($_u) < back ($_k)"
 chk d5_nav_has_the_port "$( [ "$(cat "$TMP/port_held" 2>/dev/null)" = "mss" ] && echo 1 || echo 0 )" "port back to MS-S"
 reset_all
@@ -197,7 +199,7 @@ dstart; phone_on
 wait_state ACTIVE 5000 >/dev/null 2>&1
 PATHB_RAM="$TMP" sh "$CLI" release >/dev/null 2>&1
 if wait_state IDLE 6000; then chk d6_operator_release 1 "IDLE after release"; else chk d6_operator_release 0 "$(dstate)"; fi
-chk d6_back_called "$( [ -n "$(first_line back "$TMP/order.log")" ] && echo 1 || echo 0 )" "hand-back ran"
+chk d6_back_called "$( [ -n "$(first_line "^back$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "hand-back ran"
 chk d6_reason_logged "$( has x 'operator' "$TMP/pathb_daemon.log" )" "logged as operator"
 reset_all
 
@@ -205,11 +207,13 @@ echo
 echo "############ D7: park fails after we bound -> give the port back ############"
 export PARK_RC=1
 dstart; phone_on
-sleep 3
-chk d7_bind_happened "$( [ -n "$(first_line bind "$TMP/order.log")" ] && echo 1 || echo 0 )" "bound first"
-chk d7_unbound_again "$( [ -n "$(first_line unbind "$TMP/order.log")" ] && echo 1 || echo 0 )" "released the port"
-chk d7_handed_back "$( [ -n "$(first_line back "$TMP/order.log")" ] && echo 1 || echo 0 )" "handed the cluster back"
-chk d7_not_active "$( [ "$(dstate)" != "ACTIVE" ] && echo 1 || echo 0 )" "not ACTIVE ($(dstate))"
+wait_line "^back$" 6000
+phone_off
+sleep 2
+chk d7_bind_happened "$( [ -n "$(first_line "^bind " "$TMP/order.log")" ] && echo 1 || echo 0 )" "bound first"
+chk d7_unbound_again "$( [ -n "$(first_line "^unbind$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "released the port"
+chk d7_handed_back "$( [ -n "$(first_line "^back$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "handed the cluster back"
+chk d7_idle "$( wait_state IDLE 3000 && echo 1 || echo 0 )" "IDLE ($(dstate))"
 unset PARK_RC
 reset_all
 
@@ -218,7 +222,7 @@ echo "############ D8: the pause marker ############"
 : >"$TMP/pathb_daemon.pause"
 dstart; phone_on
 sleep 2
-chk d8_no_takeover "$( [ -z "$(first_line bind "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind"
+chk d8_no_takeover "$( [ -z "$(first_line "^bind " "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind"
 chk d8_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE"
 # THE DAEMON MUST STILL BE ALIVE.  An early version left the tick with `break`,
 # which exits the loop this function is called from: pausing would silently kill
@@ -248,7 +252,7 @@ printf '%s\n' "$_fpid" >"$TMP/pathb_sender.pid"
 dstart
 _i=0
 while [ "$_i" -lt 80 ]; do
-  grep -q back "$TMP/order.log" 2>/dev/null && break
+  grep -q "^back$" "$TMP/order.log" 2>/dev/null && break
   sleep 0.05; _i=$((_i+1))
 done
 # D10 asserts the INVARIANT, not the mechanism.  The supervisor stops the
@@ -258,7 +262,7 @@ done
 # code no longer uses.  What must be true: the orphan is gone, the cluster is
 # handed back, and the decision is logged as a reconcile.
 chk d10_orphan_stopped "$( kill -0 "$_fpid" 2>/dev/null && echo 0 || echo 1 )" "stopped the orphaned sender"
-chk d10_handed_back "$( [ -n "$(first_line back "$TMP/order.log")" ] && echo 1 || echo 0 )" "handed the cluster back"
+chk d10_handed_back "$( [ -n "$(first_line "^back$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "handed the cluster back"
 chk d10_reconciled "$( has x 'reconcile' "$TMP/pathb_daemon.log" )" "logged as reconcile"
 reset_all
 
@@ -268,9 +272,11 @@ dstart; phone_on
 wait_state ACTIVE 5000 >/dev/null 2>&1
 _spid=$(cat "$TMP/pathb_sender.pid" 2>/dev/null)
 kill -9 "$_spid" 2>/dev/null
-sleep 2
-chk d11_not_active "$( [ "$(dstate)" != "ACTIVE" ] && echo 1 || echo 0 )" "left ACTIVE ($(dstate))"
-chk d11_handed_back "$( [ -n "$(first_line back "$TMP/order.log")" ] && echo 1 || echo 0 )" "handed the cluster back"
+wait_line "^back$" 6000
+chk d11_handed_back "$( [ -n "$(first_line "^back$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "handed the cluster back"
+chk d11_idle_after_release "$( wait_state IDLE 3000 && echo 1 || echo 0 )" "IDLE after the hand-back ($(dstate))"
+# the phone is still streaming, so the new sender takes the cluster again
+chk d11_retaken "$( wait_state ACTIVE 6000 && echo 1 || echo 0 )" "ACTIVE again ($(dstate))"
 _s2=$(cat "$TMP/pathb_sender.pid" 2>/dev/null)
 chk d11_sender_restarted "$( [ -n "$_s2" ] && [ "$_s2" != "$_spid" ] && kill -0 "$_s2" 2>/dev/null && echo 1 || echo 0 )" "a new sender ($_s2)"
 reset_all
@@ -301,12 +307,12 @@ export PARK_RC=1 PARK_KEEP_PORT=1
 printf 'mss\n' >"$TMP/port_held"
 dstart; phone_on
 _i=0; while [ "$_i" -lt 200 ]; do
-  [ "$(dstate)" = "IDLE" ] && [ -n "$(first_line park "$TMP/order.log")" ] && break
+  [ "$(dstate)" = "IDLE" ] && [ -n "$(first_line "^park$" "$TMP/order.log")" ] && break
   sleep 0.05; _i=$((_i+1))
 done
-chk d15_never_bound "$( [ -z "$(first_line bind "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind"
+chk d15_never_bound "$( [ -z "$(first_line "^bind " "$TMP/order.log")" ] && echo 1 || echo 0 )" "no bind"
 chk d15_stays_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE ($(dstate))"
-chk d15_handed_back "$( [ -n "$(first_line back "$TMP/order.log")" ] && echo 1 || echo 0 )" "nav restored anyway"
+chk d15_handed_back "$( [ -n "$(first_line "^back$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "nav restored anyway"
 unset PARK_RC PARK_KEEP_PORT
 reset_all
 
