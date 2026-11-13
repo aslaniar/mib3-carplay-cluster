@@ -15,7 +15,7 @@
 #   pathbctl release           hand the cluster back NOW and stay off for the rest
 #                              of this phone session; the next session is taken
 #                              as usual (use pause to stay off indefinitely)
-#   pathbctl start | stop      the daemon itself (boot starts it for you)
+#   pathbctl start | stop      the daemon itself (up.sh starts it; nothing survives a reboot)
 #
 # There is deliberately no `up`: taking the cluster is the daemon's decision,
 # triggered by the phone actually streaming pictures, and there is no operator
