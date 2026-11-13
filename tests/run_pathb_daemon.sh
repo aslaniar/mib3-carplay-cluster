@@ -28,6 +28,8 @@
 #   D15  a takeover that fails before we bind leaves IDLE with the nav restored
 #   D16  a one-shot tick starts from clean state (no inherited sender pid)
 #   D17  a second session whose sender binds but never emits fails its takeover
+#   D18  stopped during TAKEOVER: the nav is handed back after the park lands
+#   D19  stopped while DEGRADED: the restart hands the nav back
 #
 # Usage: sh tests/run_pathb_daemon.sh
 # ============================================================================
@@ -142,7 +144,8 @@ reset_all(){
   rm -f "$TMP"/pathb_sender.pid "$TMP"/pathb_conn.state "$TMP"/pathb_sender.ctl \
         "$TMP"/pathb_daemon.state "$TMP"/pathb_daemon.log "$TMP"/pathb_daemon.cmd \
         "$TMP"/pathb_daemon.pause "$TMP"/pathb_daemon.pid "$TMP"/order.log \
-        "$TMP"/port_held "$TMP"/fake_phone "$TMP"/back_fail "$TMP"/no_emit
+        "$TMP"/port_held "$TMP"/fake_phone "$TMP"/back_fail "$TMP"/no_emit \
+        "$TMP"/pathb_nav.parked
 }
 dstart(){ nohup sh "$DAEMON" run >"$TMP/daemon.stdout" 2>&1 & sleep 0.8; }
 dstate(){ sed -n 's/^state=\([A-Z]*\).*/\1/p' "$TMP/pathb_daemon.state" 2>/dev/null; }
@@ -336,6 +339,42 @@ phone_off
 wait_state IDLE 8000 >/dev/null 2>&1
 chk d17_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE ($(dstate))"
 chk d17_ends_handed_back "$( [ "$(tail -n 1 "$TMP/order.log" 2>/dev/null)" = "back" ] && echo 1 || echo 0 )" "order.log ends with back"
+reset_all
+
+echo
+echo "############ D18: stopped during TAKEOVER, a restart ends with the nav back ############"
+export PARK_MS=1.5
+printf 'mss\n' >"$TMP/port_held"
+dstart; phone_on
+wait_state TAKEOVER 5000 >/dev/null 2>&1
+sleep 0.2
+sh "$DAEMON" stop >/dev/null 2>&1
+unset PARK_MS
+phone_off
+wait_line "^park$" 3000
+dstart
+wait_state IDLE 4000 >/dev/null 2>&1
+_p=$(grep -n '^park$' "$TMP/order.log" | tail -n 1 | cut -d: -f1)
+_k=$(grep -n '^back$' "$TMP/order.log" | tail -n 1 | cut -d: -f1)
+chk d18_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE ($(dstate))"
+chk d18_ends_handed_back "$( [ "$(tail -n 1 "$TMP/order.log" 2>/dev/null)" = "back" ] && echo 1 || echo 0 )" "order.log ends with back"
+chk d18_back_after_park "$( [ -n "$_p" ] && [ -n "$_k" ] && [ "$_p" -lt "$_k" ] && echo 1 || echo 0 )" "park ($_p) < back ($_k)"
+reset_all
+
+echo
+echo "############ D19: stopped while DEGRADED, a restart ends with the nav back ############"
+: >"$TMP/back_fail"
+dstart; phone_on
+wait_state ACTIVE 5000 >/dev/null 2>&1
+phone_off
+wait_state DEGRADED 6000 >/dev/null 2>&1
+sh "$DAEMON" stop >/dev/null 2>&1
+rm -f "$TMP/back_fail"
+dstart
+wait_line "^back$" 4000
+wait_state IDLE 4000 >/dev/null 2>&1
+chk d19_idle "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE ($(dstate))"
+chk d19_ends_handed_back "$( [ "$(tail -n 1 "$TMP/order.log" 2>/dev/null)" = "back" ] && echo 1 || echo 0 )" "order.log ends with back"
 reset_all
 
 echo

@@ -24,6 +24,9 @@
 #   OUT  pathb_sender.ctl    "bind <port>" | "unbind"
 #   OUT  pathb_daemon.state  what the CLI reads
 #   OUT  pathb_daemon.log    one line per decision, monotonic ms
+#   OUT  pathb_nav.parked    written before the park, removed only by a hand-back
+#                            that succeeded; a stop or a restart that finds it
+#                            hands the nav back
 #
 # THE STATES (`owner` is the one resource everybody wants):
 #   IDLE      owner=nav.  Watching `au`; once frames have arrived for READY_STABLE
@@ -82,6 +85,7 @@ LOG=$RAM/pathb_daemon.log
 PIDF=$RAM/pathb_daemon.pid
 CMDF=$RAM/pathb_daemon.cmd
 PAUSEF=$RAM/pathb_daemon.pause
+PARKF=$RAM/pathb_nav.parked
 SSTATE=${PATHB_SENDER_STATE:-$RAM/pathb_conn.state}
 SCTL=${PATHB_SENDER_CTL:-$RAM/pathb_sender.ctl}
 SPIDF=$RAM/pathb_sender.pid
@@ -112,6 +116,7 @@ ST_REASON=-
 PORT=""
 STARTED=0
 SENDER_PID=""
+PARK_PID=""   # a park still in flight; cleared once reaped so a recycled pid is never waited on
 KNOBS_PID=""
 ORACLE_DONE=0
 WHEEL_DONE=0
@@ -358,13 +363,14 @@ takeover(){  # -> 0 on success; the caller sets ACTIVE
     discover_port || { log "TAKEOVER: MS-S has no stream yet, so there is no port to take -- not arming"; return 1; }
   fi
   log "TAKEOVER: phone has frames (au=$S_AU); park + bind"
-  park & _parkpid=$!
+  : >"$PARKF"
+  park & PARK_PID=$!
   _bound=0; _tk_done=0; _tk_done_at=0
   while :; do
     [ $(( $(now_ms) - _t0 )) -lt "$TAKEOVER_MS" ] || break
     # If the park has already RETURNED and failed, waiting out the full deadline
     # buys nothing: stop early (bounded grace for the socket to close).
-    if ! kill -0 "$_parkpid" 2>/dev/null; then
+    if ! kill -0 "$PARK_PID" 2>/dev/null; then
       if [ "$_tk_done" = "0" ]; then _tk_done=1; _tk_done_at=$(now_ms); fi
       [ $(( $(now_ms) - _tk_done_at )) -gt 1500 ] && break
     fi
@@ -383,7 +389,7 @@ takeover(){  # -> 0 on success; the caller sets ACTIVE
   done
   if [ "$_bound" != "1" ]; then
     log "TAKEOVER FAIL: the port never became ours within ${TAKEOVER_MS}ms"
-    wait "$_parkpid" 2>/dev/null
+    wait "$PARK_PID" 2>/dev/null; PARK_PID=""
     return 1
   fi
   log "TAKEOVER: port $PORT is ours after $(( $(now_ms) - _t0 ))ms"
@@ -391,7 +397,7 @@ takeover(){  # -> 0 on success; the caller sets ACTIVE
   # The park must ALSO have succeeded: a nav element left in place means MS-S
   # would rebuild its stream on a port we are holding, fail to bind, and send
   # from an ephemeral port the ECU drops.
-  wait "$_parkpid" 2>/dev/null; _prc=$?
+  wait "$PARK_PID" 2>/dev/null; _prc=$?; PARK_PID=""
   if [ "$_prc" != "0" ]; then
     log "TAKEOVER FAIL: park rc=$_prc -- giving the port back"
     return 1
@@ -436,7 +442,7 @@ release(){  # <reason> -> 0 only when the cluster is genuinely back with the nav
   fi
   _i=0; _rc=1
   while [ "$_i" -lt 2 ]; do
-    if back; then _rc=0; break; fi
+    if back; then _rc=0; rm -f "$PARKF"; break; fi
     _i=$((_i+1)); nap_ms 500
   done
   if [ "$_rc" != "0" ]; then
@@ -578,12 +584,23 @@ prepare_tick(){   # idempotent, cheap; the loop's housekeeping
 
 reconcile(){   # run once at startup: never inherit a half-taken cluster
   read_sender
-  if [ "${S_BOUND:-0}" != "0" ]; then
-    log "reconcile: a previous sender still holds udp/$S_BOUND -- releasing"
+  if [ -f "$PARKF" ] || [ "${S_BOUND:-0}" != "0" ]; then
+    log "reconcile: a previous run left the nav parked or udp/$S_BOUND bound -- releasing"
     release "reconcile"; _r=$?
     settle "reconcile" "$_r"
   fi
   rm -f "$CMDF"
+}
+
+on_stop(){
+  log "daemon stop (signal)"
+  # a park still in flight would delete the nav AFTER our hand-back
+  [ -n "$PARK_PID" ] && wait "$PARK_PID" 2>/dev/null
+  read_sender
+  if [ -f "$PARKF" ] || [ "${S_BOUND:-0}" != "0" ]; then release "daemon-stop"; fi
+  sender_stop
+  rm -f "$PIDF"
+  exit 0
 }
 
 # ---------------------------------------------------------------------- loop
@@ -718,11 +735,7 @@ do_run(){
   if [ "$NAP_FRAC" = "1" ]; then log "clock: fractional sleep"
   elif [ "$NAP_MODE" != "none" ]; then log "clock: usleep ($(( POLL ))ms tick)"
   else log "WARN no fractional sleep and no usleep -- every wait degrades to 1s"; fi
-  if [ "$BENCH" != "1" ]; then
-    trap 'log "daemon stop (signal)"; read_sender; [ "${S_BOUND:-0}" != "0" ] && release "daemon-stop"; sender_stop; rm -f "$PIDF"; exit 0' INT TERM HUP
-  else
-    trap 'rm -f "$PIDF"; exit 0' INT TERM HUP
-  fi
+  trap on_stop INT TERM HUP
   # ONE SENDER, AND IT IS OURS.  A previous daemon's sender survives (it is nohup'd
   # and orphaned) and an OLDER BINARY then keeps running with the old behaviour
   # while every counter looks right -- measured on the car 2026-11-02: a restarted
