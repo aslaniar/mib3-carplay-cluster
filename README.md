@@ -23,6 +23,15 @@ Upcoming features:
 | **Supervisor** | One resident process/daemon. When the phone starts streaming it takes the cluster's UDP port; when the session ends it hands the port back to the car.  |
 
 
+## Terms
+
+The logs and `pathbctl` use these names:
+
+- **Path B** is the current design. The shim hands the phone's video to a separate sender, which writes it onto the cluster's own video stream. Path A, which decoded and re-rendered the frames before sending them, was removed.
+- **AU** is an access unit: one encoded H.264 frame.
+- **MS-S** is the car's multi-screen-server, the process that normally streams the nav map to the cluster.
+- **RSI** is the car's internal service interface. The supervisor uses it to park the car's nav stream and to hand it back.
+
 ## Requirements
 
 **Root on the head unit.** The shim is loaded into a live `carplay` with `ptrace` +
@@ -66,7 +75,9 @@ sh src/shim/build.sh     # -> bin/mib3shim.so
 sh tools/build.sh        # -> bin/mib3clusterstream, bin/mib3wheel
 ```
 
-Building overwrites `bin/`, and `up.sh` refuses any binary whose md5 differs from its pins. The pinned builds came from Homebrew clang 23.1.2. Clang 23.1.5 produces the same code, but the compiler version string in the `.comment` section differs, so the md5 does too. To deploy your own build, update the pins in all three places: `SHIM_PIN`, `SENDER_PIN` and `WHEEL_PIN` in `up.sh`, `WANT_MD5` in `src/inject/run_inject.sh`, and the `*_WANT` lines in `src/control/push_kit.sh`.
+Building overwrites `bin/`. `up.sh` refuses any binary whose md5 differs from the one in `bin/PINS`, and so do `src/inject/run_inject.sh` and `src/control/push_kit.sh`. To deploy your own build, run `sh tools/pin.sh` to rewrite `bin/PINS`, and commit it together with the binaries.
+
+The md5 also depends on the compiler version, because clang writes its version string into the `.comment` section. Two clang releases can produce identical code with different md5s.
 
 ## Install
 
@@ -80,6 +91,7 @@ Building overwrites `bin/`, and `up.sh` refuses any binary whose md5 differs fro
    ```
 
 `up.sh` stages the kit into `/tmp/kit`, checks the md5 of all three pinned binaries,
+raises `net.core.wmem_max` so the shim's socket to the sender gets its 4 MB buffer,
 injects the shim into the running CarPlay, and starts the supervisor. It is safe to run again. If injection or the supervisor fails, it ends with `NOT READY` and exits with status 1. The full log is in `/tmp/kit/up.log`.
 
 ```sh
