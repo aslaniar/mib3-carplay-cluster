@@ -40,7 +40,7 @@
  *                             "-i ncm0 -p tcp --dport 5000:5001"); 6031 and any
  *                             ephemeral port are FIREWALL-DROPPED on ncm0/wlap
  *                             -- the phone's SYN never reaches us -- and need
- *                             live_kit/cluster_port_fw.sh first.
+ *                             a firewall rule this repo does not ship.
  *   MIB3_SHIM_CMDS=0/1        send forceKeyFrame/showUI/setNightMode to the
  *                             phone once the 111 stream connects (default 1)
  *   MIB3_SHIM_SINK=off|helper where cluster frames go (default off; `helper`
@@ -119,6 +119,7 @@ static void *R(const char *name)
 #define O_WRONLY 1
 #define O_CREAT  0100
 #define O_APPEND 02000
+#define O_TRUNC  01000
 
 /* ---- minimal string/format helpers (no libc stdio) ----------------------- */
 
@@ -137,11 +138,65 @@ static void bu64(buf *b, u64 v, int base, int minw){
 }
 static void bhex(buf *b, u64 v){ bs(b,"0x"); bu64(b,v,16,0); }
 
-/* ---- logging ------------------------------------------------------------- */
+/* ---- logging -------------------------------------------------------------
+ * /tmp is RAM, so the log rotates to /tmp/mib3shim.log.1 at LOG_ROTATE_BYTES.
+ * Rotation never closes the fd other threads write through: dup2() swaps the new
+ * file in under the same fd number, so a concurrent write lands in one file or
+ * the other, never in an fd number something else has reused. */
+#define LOG_PATH "/tmp/mib3shim.log"
+#define LOG_ROTATE_BYTES (4UL << 20)
+extern int rename(const char *from, const char *to);
 static int logfd = -1;
+static unsigned long log_bytes;          /* size of the current file */
+static int log_rotating;
+static int (*p_dup2)(int, int);
 static void log_open(void){
-  if (logfd < 0) logfd = open("/tmp/mib3shim.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+  if (logfd < 0){
+    long (*lsk)(int, long, int) = (long (*)(int, long, int))R("lseek");
+    p_dup2 = (int (*)(int, int))R("dup2");
+    logfd = open(LOG_PATH, O_WRONLY|O_CREAT|O_APPEND, 0644);
+    if (logfd >= 0 && lsk){ long sz = lsk(logfd, 0, 2 /*SEEK_END*/); if (sz > 0) log_bytes = (unsigned long)sz; }
+  }
 }
+static void log_rotate(void){
+  int nfd;
+  if (__atomic_exchange_n(&log_rotating, 1, __ATOMIC_ACQUIRE)) return;
+  /* re-check: another thread may have rotated between our add and here */
+  if (__atomic_load_n(&log_bytes, __ATOMIC_RELAXED) >= LOG_ROTATE_BYTES && p_dup2){
+    /* no rename (the log was deleted, say): truncate instead, so the bound holds */
+    int moved = rename(LOG_PATH, LOG_PATH ".1") == 0;
+    nfd = open(LOG_PATH, O_WRONLY|O_CREAT|O_APPEND|(moved ? 0 : O_TRUNC), 0644);
+    if ((nfd < 0 || p_dup2(nfd, logfd) < 0) && moved)
+      rename(LOG_PATH ".1", LOG_PATH);         /* keep writing where readers look */
+    if (nfd >= 0) close(nfd);
+    __atomic_store_n(&log_bytes, 0, __ATOMIC_RELAXED);
+  }
+  __atomic_store_n(&log_rotating, 0, __ATOMIC_RELEASE);
+}
+static void log_write(const char *mem, unsigned long n){
+  log_open();
+  if (logfd < 0) return;
+  write(logfd, mem, n);
+  if (__atomic_add_fetch(&log_bytes, n, __ATOMIC_RELAXED) >= LOG_ROTATE_BYTES) log_rotate();
+}
+/* ---- KNOB SNAPSHOT --------------------------------------------------------
+ * The supervisor can setenv() into carplay while it runs, and glibc's setenv may
+ * realloc environ under a concurrent getenv.  So every knob the receiver loop
+ * consults is read ONCE, at stream connect (knobs_load, from cluster_thread), and
+ * the loop reads this struct instead.  Names and defaults: see knobs_load.  A
+ * harness entry point that runs with no stream loads it on first use. */
+typedef struct {
+  int ready;
+  int cmds, cmdgen, cmdalive, cmdack, idr_ms, night_forced;
+  int viewareas, va_cmd, va_count;
+  int appearance, app_map, app_mode, app_setting;
+  long hlp_eagain, hlp_sndbuf;
+  unsigned long ctl5_max;
+  char helper[108];
+} knobs;
+static knobs g_kn;
+static void knobs_load(void);           /* defined after va_count */
+static const knobs *kn(void){ if (!g_kn.ready) knobs_load(); return &g_kn; }
 /* ---- opcode-5: the SENDER'S OWN TELEMETRY, not a keepalive (2026-10-20) -----
  * The body is a binary plist of the PHONE's counters -- encoderCurrentFPS,
  * sinkOverflowDropFPS, rttAvg, txUsageAvg -- the only in-band answer to "why does
@@ -181,7 +236,7 @@ static void ctl5_resolve(void)
 
 static void ctl5_dump(const unsigned char *body, unsigned long n)
 {
-  unsigned long cap = 8388608UL;
+  unsigned long cap = kn()->ctl5_max;
   ctl5_resolve();
   if (n == 0 || n > (64UL << 10)) return;          /* sanity: a plist is small */
   if (ctl5_want <= 0){
@@ -201,10 +256,6 @@ static void ctl5_dump(const unsigned char *body, unsigned long n)
       return; }
   }
   if (ctl5_fd < 0) return;
-  { const char *ms = getenv("MIB3_SHIM_CTL5_MAX");
-    if (ms && ms[0]){ unsigned long v = 0; int i = 0;
-      while (ms[i] >= '0' && ms[i] <= '9'){ v = v*10 + (unsigned long)(ms[i]-'0'); i++; }
-      if (v) cap = v; } }
   if (ctl5_written >= cap){ close(ctl5_fd); ctl5_fd = -1;
     logkv("cluster/ctl5","dump complete bytes",(u64)ctl5_written,0); return; }
   { unsigned char hdr[4];
@@ -220,8 +271,7 @@ static void logline(const char *tag, const char *msg){
   char mem[2048]; buf b = { mem, sizeof(mem)-2, 0 };
   bs(&b,"[mib3shim] "); bs(&b,tag); bs(&b,": "); bs(&b,msg); bch(&b,'\n');
   mem[b.n]=0;                       /* b.n <= cap = sizeof-2 -> always in-bounds */
-  log_open();
-  if (logfd >= 0) write(logfd, mem, b.n);
+  log_write(mem, b.n);
 }
 
 /* ---------------------------------------------------------------------------
@@ -229,11 +279,10 @@ static void logline(const char *tag, const char *msg){
  * not the /tmp log path, not any env.  If /dev/shm/mib3shim_hit never appears,
  * the shim was never entered at all and the call never reached us.
  * ------------------------------------------------------------------------- */
-#define O_TRUNC 01000
 static void hit(const char *tag, unsigned long n)
 {
   int f = open("/dev/shm/mib3shim_hit", O_WRONLY|O_CREAT|O_TRUNC, 0666);
-  if (f >= 0) write(f, tag, n);
+  if (f >= 0){ write(f, tag, n); close(f); }
 }
 static void logkv(const char *tag, const char *key, u64 v, int hex){
   char mem[256]; buf b={mem,sizeof(mem)-2,0};
@@ -333,6 +382,11 @@ static u64 env_num(const char *name, u64 dflt); /* defined after the CF section 
 #define SOL_SOCKET_ 1
 #define SO_SNDTIMEO_ 21
 #define SO_SNDBUF_  7
+#define SO_KEEPALIVE_  9
+#define SOL_TCP_       6
+#define TCP_KEEPIDLE_  4
+#define TCP_KEEPINTVL_ 5
+#define TCP_KEEPCNT_   6
 static int hlp_fd = -1;
 static unsigned long hlp_seq = 0, hlp_sent = 0, hlp_drop = 0, hlp_conns = 0;
 /* the granted SO_SNDBUF of the live helper socket (0 = unknown).  The send-side
@@ -371,7 +425,7 @@ static void helper_close(void){
   hlp_sndbuf = 0;
 }
 static const char *helper_path(void){
-  char *v = getenv("MIB3_SHIM_HELPER"); return (v && v[0]) ? v : MIB3_HELP_SOCK_DEFAULT;
+  return kn()->helper;
 }
 /* LAZY REATTACH IS A DEFECT ON A STATIC MAP.
  * helper_connect() used to run only from helper_feed(), so when the sender
@@ -379,11 +433,17 @@ static const char *helper_path(void){
  * a time, and can idle for minutes -- nothing called connect() and the cluster
  * stayed dark until the picture moved.  The attempt now rides the 100 ms clock
  * tick that already exists (cluster_wait_frame's poll), gated to 1/s. */
+/* SINK dispatch modes: see THE SINK DISPATCHER at the bottom of this file.
+ * MIB3_SHIM_SINK = off (default) | helper (the Path B sender on the AU socket). */
+#define SINK_OFF 0
+#define SINK_HELPER 2
+static int g_sink = -1;          /* -1 = unresolved */
 static int helper_connect(void);          /* forward: the pump hands the attempt to it */
 static void helper_reattach_pump(void)
 {
   static long last_try = -1;
   long now = time(0);
+  if (g_sink != SINK_HELPER) return;        /* sink off: no helper to reattach to */
   if (hlp_fd >= 0) return;
   if (now == last_try) return;
   last_try = now;
@@ -400,8 +460,17 @@ static int helper_connect(void){
   fd = socket(1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
   if (fd < 0){ logkv("sink","helper socket() errno",(u64)(unsigned)SHIM_ERRNO,0); return -1; }
   if (connect(fd, &sa, sizeof(sa)) != 0){
-    logline("sink/helper-path", helper_path());
-    logkv("sink","helper connect() errno",(u64)(unsigned)SHIM_ERRNO,0);
+    /* retried every second while the sender is down: log at most every 10 s */
+    static long last_log = -1;
+    static unsigned long quiet = 0;
+    int e = SHIM_ERRNO;
+    long now = time(0);
+    if (last_log < 0 || now - last_log >= 10){
+      logline("sink/helper-path", helper_path());
+      logkv("sink","helper connect() errno",(u64)(unsigned)e,0);
+      if (quiet) logkv("sink","helper connect() failures not logged (10 s limit)",(u64)quiet,0);
+      last_log = now; quiet = 0;
+    } else quiet++;
     close(fd); return -1;
   }
   { struct { long s; long us; } tv; tv.s = 0; tv.us = 200000;
@@ -416,20 +485,25 @@ static int helper_connect(void){
    * "blocky flat areas, wrong tints, text stays sharp".
    *
    * So: ask for 4 MB (~28 max-size AUs), READ IT BACK, and say so when the kernel
-   * clamped it -- SO_SNDBUF is clamped to 2*net.core.wmem_max, which bring_up.sh
-   * raises, so an unraised unit silently caps at 208 KB.  Sends stay
+   * clamped it -- SO_SNDBUF is clamped to 2*net.core.wmem_max, which up.sh
+   * raises to 8388608 before injection, so an unraised unit silently caps at 416 KB.  Sends stay
    * non-blocking: no drop policy, timeout or thread changes here. */
-  { long want = (long)env_num("MIB3_SHIM_HLP_SNDBUF", (u64)(4u<<20));
+  { long want = kn()->hlp_sndbuf;
+    int sb = 0;
     if (want > 0){
-      int sb = (int)(want > (64u<<20) ? (64u<<20) : want);
+      sb = (int)(want > (64u<<20) ? (64u<<20) : want);
       setsockopt(fd, SOL_SOCKET_, SO_SNDBUF_, &sb, sizeof(sb));
     }
     { int got = 0; unsigned int gl = (unsigned int)sizeof(got);
       if (getsockopt(fd, SOL_SOCKET_, SO_SNDBUF_, &got, &gl) == 0){
         hlp_sndbuf = got;
         logkv("sink","helper sndbuf granted",(u64)(u32)got,0);
-        if (got < 425984) /* 2*208KB: the pre-bring_up ceiling */
-          logline("sink","helper sndbuf CLAMPED -- raise net.core.wmem_max (bring_up.sh does it) or AUs will drop here");
+        /* the kernel stores and reports TWICE what was set, so a full grant reads 2*sb */
+        if (sb > 0 && (long)got < 2L * sb){
+          logkv("sink","helper sndbuf requested x2",(u64)(2L * sb),0);
+          logline("sink","helper sndbuf CLAMPED below the request by /proc/sys/net/core/wmem_max "
+                         "(up.sh raises it to 8388608 before injection) -- AUs will drop here");
+        }
       } }
   }
   hlp_fd = fd; hlp_conns++;
@@ -549,7 +623,7 @@ static int helper_feed(const void *data, unsigned long len, unsigned long ts){
        * 2026-10-19: "helper connected" while the decoder never saw one). */
       if (r < 0 && SHIM_ERRNO == 11 /*EAGAIN*/){
         u64 now2 = mono_ms();
-        long emax = (long)env_num("MIB3_SHIM_HLP_EAGAIN", 32);
+        long emax = kn()->hlp_eagain;
         hlp_eagain++;
         hlp_drop_log("hdr send EAGAIN (decoder not reading / sndbuf full)");
         if (hlp_eagain >= emax ||
@@ -615,6 +689,7 @@ typedef int  (*fn_ScreenSetChaCha)(void*, void*, s64);
 typedef void (*fn_ScreenSetTS)(void*, void*);
 typedef int  (*fn_DeriveAES)(void*, int, s64, void*, void*);
 typedef int  (*fn_pthreadCreate)(void**, const void*, void*(*)(void*), void*);
+typedef int  (*fn_pthreadDetach)(void*);
 typedef int  (*fn_close)(int);
 typedef int  (*fn_chachaDerive)(void*, s64, int, int, void*); /* returns int status (0=ok) */
 /* wire crypto (unit's own CFLite/ChaCha primitives) -- see stock FUN_00115800 +
@@ -698,6 +773,7 @@ static fn_cx_ver            p_cx_ver;
 static fn_ctr_init          p_ctr_init;
 static fn_ctr_upd           p_ctr_upd;
 static fn_pthreadCreate     p_pthreadCreate;
+static fn_pthreadDetach     p_pthreadDetach;
 static fn_close             p_close;
 typedef long (*fn_syscall)(long, ...);
 static fn_syscall           p_syscall;
@@ -829,8 +905,7 @@ static char g_cluster_url[160];            /* showUI url (== the advertised init
 #define K128 (0x08000100)   /* kCFStringEncodingUTF8 */
 
 static void resolve(void){
-  if (resolved) return;
-  resolved = 1;
+  if (__atomic_load_n(&resolved, __ATOMIC_ACQUIRE)) return;
   p_CFStringCreateWithCString = (fn_CFStringCreateWithCString)R("CFStringCreateWithCString");
   p_CFStringGetCString        = (fn_CFStringGetCString)       R("CFStringGetCString");
   p_CFArrayGetCount           = (fn_CFArrayGetCount)          R("CFArrayGetCount");
@@ -861,6 +936,7 @@ static void resolve(void){
   p_ctr_init          = (fn_ctr_init)         R("AES_CTR_Init");
   p_ctr_upd           = (fn_ctr_upd)          R("AES_CTR_Update");
   p_pthreadCreate     = (fn_pthreadCreate)    R("pthread_create");
+  p_pthreadDetach     = (fn_pthreadDetach)    R("pthread_detach");
   p_close             = (fn_close)            R("close");
   p_malloc            = (void*(*)(unsigned long)) R("malloc");
   p_free              = (void(*)(void*))          R("free");
@@ -888,6 +964,7 @@ static void resolve(void){
   /* libAirPlay load base, for the few UNEXPORTED internal helpers we must call
    * by RVA (chacha key derive, screen time-sync callbacks).  R8830L-specific. */
   if (real_AddScreenDisplay) g_libap_base = (char*)real_AddScreenDisplay - 0x1f670;
+  __atomic_store_n(&resolved, 1, __ATOMIC_RELEASE);
 
   logline("init","resolved");
   logkv("init","p_CFArrayAppendValue",(u64)p_CFArrayAppendValue,1);
@@ -1170,6 +1247,39 @@ static int va_count(void)
   if (n < 1) n = 1;
   if (n > 8) n = 8;
   return (int)n;
+}
+static void knobs_load(void)
+{
+  knobs k;
+  const char *s;
+  unsigned long i;
+  u64 cap;
+  k.cmds        = env_on("MIB3_SHIM_CMDS", 1);
+  k.cmdgen      = env_on("MIB3_SHIM_CMDGEN", 1);
+  k.cmdalive    = env_on("MIB3_SHIM_CMDALIVE", 1);
+  k.cmdack      = env_on("MIB3_SHIM_CMDACK", 1);
+  k.idr_ms      = (int)env_num("MIB3_SHIM_IDR_MS", 500);
+  k.night_forced = getenv("MIB3_SHIM_NIGHT") != 0;
+  k.viewareas   = env_on("MIB3_SHIM_VIEWAREAS", 0);
+  k.va_cmd      = env_on("MIB3_SHIM_VA_CMD", 1);
+  k.va_count    = va_count();
+  k.appearance  = env_on("MIB3_SHIM_APPEARANCE", 0);
+  s = getenv("MIB3_SHIM_APPTARGET");
+  k.app_map     = (s && (s[0]=='m' || s[0]=='M')) ? 1 : 0;
+  k.app_mode    = (int)env_num("MIB3_SHIM_APPMODE", 0);
+  k.app_setting = (int)env_num("MIB3_SHIM_APPSETTING", 0);
+  k.hlp_eagain  = (long)env_num("MIB3_SHIM_HLP_EAGAIN", 32);
+  k.hlp_sndbuf  = (long)env_num("MIB3_SHIM_HLP_SNDBUF", (u64)(4u<<20));
+  cap = env_num("MIB3_SHIM_CTL5_MAX", 0);
+  k.ctl5_max    = cap ? (unsigned long)cap : 8388608UL;
+  s = getenv("MIB3_SHIM_HELPER");
+  if (!s || !s[0]) s = MIB3_HELP_SOCK_DEFAULT;
+  for (i = 0; i < sizeof(k.helper) - 1 && s[i]; i++) k.helper[i] = s[i];
+  k.helper[i] = 0;
+  /* these three cache for the process on first use; make that use happen here */
+  (void)hlp_wait_ms(); (void)hlp_stall_ms(); ctl5_resolve();
+  k.ready = 1;
+  g_kn = k;
 }
 /* ==========================================================================
  * THE CLASSIFIER CarPlay applies to our safe box (reconstructed from
@@ -1878,7 +1988,7 @@ static void panels_build(CFMutableDictionaryRef info){
     ub[0] = 0;
     if (!p_CFStringGetCString(uuid, ub, sizeof(ub), K128)) continue;
     while (ub[k] && k < 60){ pb[k] = ub[k]; k++; }
-    while (j < 8 && k < 79){ pb[k++] = "-panel"[j++]; }  /* uid = uuid + "-panel" */
+    while (j < sizeof("-panel") - 1 && k < 79){ pb[k++] = "-panel"[j++]; }  /* uid = uuid + "-panel" */
     pb[k] = 0;
     panel = p_CFDictionaryCreateMutable(0,0,p_kCFLDictKeyCB,p_kCFLDictValCB);
     if (!panel) continue;
@@ -2171,11 +2281,6 @@ static int info_check(CFMutableDictionaryRef info)
  * (chacha key derive; the two screen time-sync callbacks): those are called by RVA
  * off the libAirPlay base (train-specific, logged as such).
  * ========================================================================*/
-/* SINK dispatch modes: see THE SINK DISPATCHER at the bottom of this file.
- * MIB3_SHIM_SINK = off (default) | helper (the Path B sender on the AU socket). */
-#define SINK_OFF 0
-#define SINK_HELPER 2
-static int g_sink = -1;          /* -1 = unresolved */
 static void sink_resolve(void);
 static int  sink_start(void);                    /* deferred to cluster_thread */
 static int  sink_feed(const void *data, unsigned long len, unsigned long ts);
@@ -2306,7 +2411,7 @@ static int ship_cmd_i(void *session, const char *type, CFMutableDictionaryRef pa
    * Only the CURRENT setup generation may command (g_cmd_session is
    * written by cluster_setup on every type-111 SETUP), and stock's own liveness
    * byte must be set (below).  MIB3_SHIM_CMDGEN=0 restores the old behaviour. */
-  if (env_on("MIB3_SHIM_CMDGEN",1)){
+  if (kn()->cmdgen){
     if (session != g_cmd_session){
       logline("cluster/cmd/skipped-superseded", type);
       return -2;
@@ -2320,7 +2425,7 @@ static int ship_cmd_i(void *session, const char *type, CFMutableDictionaryRef pa
      *   MIB3_SHIM_CMDALIVE=0  -> skip the byte check (the generation check above
      *                            still applies; that one is sound by construction).
      * Every trip should grep the log for these two skip lines. */
-    if (env_on("MIB3_SHIM_CMDALIVE",1) &&
+    if (kn()->cmdalive &&
         *(volatile signed char*)((char*)session + 0x446) == 0){
       logline("cluster/cmd/skipped-session-not-started", type);
       return -3;
@@ -2342,7 +2447,7 @@ static int ship_cmd_i(void *session, const char *type, CFMutableDictionaryRef pa
       /* COMPLETION: MIB3_SHIM_CMDACK=1 (default) passes a real callback so the
        * phone's verdict is visible in the log; =0 is the old call,
        * SendCommand(session, cmd, 0, 0). */
-      if (env_on("MIB3_SHIM_CMDACK",1)){
+      if (kn()->cmdack){
         cmd_ack_slot *slot = cmd_ack_take(type, va_idx);
         rc = p_SendCommand(session, cmd, (void*)cmd_completion, slot);
       } else {
@@ -2372,7 +2477,7 @@ static CFMutableDictionaryRef cmd_params_uuid(void)
 }
 static void cluster_send_showui(void *session, const char *why)
 {
-  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!kn()->cmds || !session) return;
   if (!g_cluster_uuid_str[0]){ logline("cluster/cmd","showUI skipped (no cluster uuid)"); return; }
   CFMutableDictionaryRef p = cmd_params_uuid();
   if (!p) return;
@@ -2387,7 +2492,7 @@ static void cluster_send_showui(void *session, const char *why)
 }
 static void cluster_send_forcekeyframe(void *session, const char *why)
 {
-  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!kn()->cmds || !session) return;
   if (!g_cluster_uuid_str[0]){ logline("cluster/cmd","forceKeyFrame skipped (no cluster uuid)"); return; }
   CFMutableDictionaryRef p = cmd_params_uuid();
   if (!p) return;
@@ -2488,7 +2593,7 @@ static void cluster_showui_retry(void *session)
 
 static void cluster_idr_pump(void *session)
 {
-  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!kn()->cmds || !session) return;
   /* before every gate below: a paused phone must not swallow the re-activation */
   cluster_showui_retry(session);
   if (!g_kf_seen_ms) return;                       /* the start sequence owns the first one */
@@ -2501,7 +2606,7 @@ static void cluster_idr_pump(void *session)
    * every ~5 access units.  Keep 500 ms.  The real cost of this pump is the
    * phone's 65 KB IDRs -- a phone-side encoder property to investigate separately,
    * not a reason to starve the receiver of the only signal it presents on. */
-  int iv = (int)env_num("MIB3_SHIM_IDR_MS", 500);
+  int iv = kn()->idr_ms;
   if (iv <= 0) return;
   u64 now = mono_ms();
   /* the phone is quiet when the map is static: asking then is pointless (there
@@ -2532,7 +2637,7 @@ static int cluster_wait_frame(int fd, void *session, int wait_ms)
 
 static void cluster_send_nightmode(void *session)
 {
-  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!kn()->cmds || !session) return;
   /* PASS-THROUGH NIGHT.  DEFAULT: this function does NOTHING.  Night is not
    * ours to decide and not ours to command: the phone renders the map pixels in
    * its own mode, and /info is filled-only (never overwritten).  The only way a
@@ -2540,7 +2645,7 @@ static void cluster_send_nightmode(void *session)
    * MIB3_SHIM_NIGHT=0|1 -- there is no in-band phone signal today (the opcode-1
    * flags byte chatters 2,484x per session and is NOT a mode signal; wiring it
    * caused 198 sync commands and the worst lag measured). */
-  if (!getenv("MIB3_SHIM_NIGHT")) return;
+  if (!kn()->night_forced) return;
   if (!g_cluster_uuid_str[0]) return;
   CFMutableDictionaryRef p = cmd_params_uuid();
   if (!p) return;
@@ -2602,17 +2707,17 @@ static int cluster_send_viewarea(void *session, int index, int dur_ms, const cha
   fn_CFArrayCreateMutable mka;
   CFMutableArrayRef adj;
   int rc;
-  if (!session || !env_on("MIB3_SHIM_CMDS",1)) return -1;
-  if (!env_on("MIB3_SHIM_VIEWAREAS",0)){
+  if (!session || !kn()->cmds) return -1;
+  if (!kn()->viewareas){
     logline("cluster/va/cmd","skipped (MIB3_SHIM_VIEWAREAS=0)");
     return -1;
   }
-  if (!env_on("MIB3_SHIM_VA_CMD",1)){
+  if (!kn()->va_cmd){
     logline("cluster/va/cmd","skipped (MIB3_SHIM_VA_CMD=0)");
     return -1;
   }
-  if (index < 0 || index >= va_count()){
-    logkv("cluster/va/cmd","index out of range (declared count)",(u64)(u32)va_count(),0);
+  if (index < 0 || index >= kn()->va_count){
+    logkv("cluster/va/cmd","index out of range (declared count)",(u64)(u32)kn()->va_count,0);
     logline("cluster/va/cmd","refused locally -- no command sent");
     return -1;
   }
@@ -2667,7 +2772,7 @@ static void cluster_send_appearance(void *session, int is_map, int mode, int set
 {
   CFMutableDictionaryRef p;
   int rc;
-  if (!session || !env_on("MIB3_SHIM_CMDS",1)) return;
+  if (!session || !kn()->cmds) return;
   if (!g_cluster_uuid_str[0]){ logline("cluster/appear","skipped (no cluster uuid)"); return; }
   p = cmd_params_uuid();
   if (!p) return;
@@ -2683,12 +2788,8 @@ static void cluster_send_appearance(void *session, int is_map, int mode, int set
 /* One-shot, at first IDR, when armed. */
 static void cluster_send_appearance_armed(void *session)
 {
-  if (!env_on("MIB3_SHIM_APPEARANCE",0)) return;
-  { const char *t = getenv("MIB3_SHIM_APPTARGET");
-    int is_map = (t && (t[0]=='m'||t[0]=='M')) ? 1 : 0;
-    int mode = (int)env_num("MIB3_SHIM_APPMODE", 0);
-    int set  = (int)env_num("MIB3_SHIM_APPSETTING", 0);
-    cluster_send_appearance(session, is_map, mode, set); }
+  if (!kn()->appearance) return;
+  cluster_send_appearance(session, kn()->app_map, kn()->app_mode, kn()->app_setting);
 }
 
 /* ==========================================================================
@@ -2741,7 +2842,7 @@ static int zoom_pop(void)
  * DashBoard wire form: 0 = in, anything else = out. */
 static void cluster_send_zoom(void *session, int dir_in)
 {
-  if (!env_on("MIB3_SHIM_CMDS",1) || !session) return;
+  if (!kn()->cmds || !session) return;
   if (!g_cluster_uuid_str[0]){ logline("cluster/zoom","skipped (no cluster uuid)"); return; }
   CFMutableDictionaryRef p = cmd_params_uuid();
   if (!p) return;
@@ -3036,8 +3137,8 @@ int mib3shim_viewarea_pump(void *session, int max)
     int r = va_pop();
     int idx;
     if (r == -9999) break;
-    if (r == VA_REQ_NEXT)      idx = (g_va_current + 1) % va_count();
-    else if (r == VA_REQ_PREV) idx = (g_va_current + va_count() - 1) % va_count();
+    if (r == VA_REQ_NEXT)      idx = (g_va_current + 1) % kn()->va_count;
+    else if (r == VA_REQ_PREV) idx = (g_va_current + kn()->va_count - 1) % kn()->va_count;
     else                       idx = r;
     if (cluster_send_viewarea(s, idx, 250, "inbox") == 0) sent++;
   }
@@ -3140,6 +3241,7 @@ typedef struct {
   void *screen; int lsock; int lsockgen; void *session; int flags; void *stream;
   unsigned char key[32]; int keylen; int cipher; long counter;   /* B: stream crypto */
   long night; int aes_inited;
+  unsigned cmdgen;                 /* g_cmd_gen when this setup became the command target */
 } cl_ctx;
 
 /* The type-111 listener we currently own, plus a GENERATION token.  A newer
@@ -3147,9 +3249,14 @@ typedef struct {
  * The token, not the fd number, is the ownership test: own_listen closes the old
  * fd and immediately socket()s a new one, which the kernel hands back with the
  * SAME number -- so an fd comparison would let a stale receiver thread accept on
- * the NEW listener and service the new phone stream with an OLD key/session. */
+ * the NEW listener and service the new phone stream with an OLD key/session.
+ * CLOSE OWNERSHIP: the party that moves g_lsock_gen from G to G+1 by CAS closes
+ * generation G's fd, and nobody else does -- either the receiver thread after its
+ * accept, or own_listen superseding it.  g_lsock and g_lsock_fdgen are written
+ * only by the SETUP side. */
 static volatile int g_lsock = -1;
 static volatile int g_lsock_gen = 0;
+static int g_lsock_fdgen = 0;              /* the generation g_lsock was published under */
 
 /* Which cluster thread owns the helper (AU) socket.  One phone session gets one
  * cluster setup and therefore one thread, but the unit measured 8 connects / 7
@@ -3195,10 +3302,22 @@ static void *cluster_thread(void *arg){
   }
   logkv("cluster/thread","conn fd",(u64)(u32)connfd,0);
   if (connfd >= 0){
-    if (p_close){ p_close(c->lsock); }
-    if (g_lsock_gen == c->lsockgen){ g_lsock = -1; g_lsock_gen++; }
+    { int g = c->lsockgen;
+      if (__atomic_compare_exchange_n(&g_lsock_gen, &g, g + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) && p_close)
+        p_close(c->lsock); }
     c->lsock = -1;
     logline("cluster/thread","stream connected");
+    knobs_load();                    /* the loop below reads no environment */
+    /* `c->session` is borrowed, not retained, so this thread must not outlive
+     * the phone.  A vanished peer (cable pulled) never sends EOF; keepalive turns
+     * it into a read error after ~8 s.  No idle timeout: a static map is
+     * legitimately silent, and the phone's kernel answers the probes. */
+    { int on = 1, idle = 5, intvl = 1, cnt = 3;
+      if (setsockopt(connfd, SOL_SOCKET_, SO_KEEPALIVE_, &on, sizeof(on)) != 0 ||
+          setsockopt(connfd, SOL_TCP_, TCP_KEEPIDLE_, &idle, sizeof(idle)) != 0 ||
+          setsockopt(connfd, SOL_TCP_, TCP_KEEPINTVL_, &intvl, sizeof(intvl)) != 0 ||
+          setsockopt(connfd, SOL_TCP_, TCP_KEEPCNT_, &cnt, sizeof(cnt)) != 0)
+        logkv("cluster/thread","keepalive setsockopt failed errno",(u64)(unsigned)SHIM_ERRNO,0); }
     /* THE SINK STANDS UP HERE -- on this thread, NOT in the SETUP seam.  A
      * failing/blocking sink can no longer stall CarPlay session setup.  In the
      * default (off) mode this touches nothing at all; in helper mode it is one
@@ -3221,6 +3340,9 @@ static void *cluster_thread(void *arg){
     { u64 now0 = mono_ms(); (void)now0;
       g_kf_seen_ms = 0; g_kf_req_ms = 0; g_showui_retry_ms = 0; g_au_last_ms = 0;
       g_night_applied = -2; }
+    /* Inbox requests queued while no stream existed belong to no session:
+     * drop them here, on the consumer side, so they do not replay into this one. */
+    g_zoom_qr = g_zoom_qw; g_va_qr = g_va_qw; g_ap_qr = g_ap_qw;
     /* ...and only THEN arm the one delayed re-activation (see cluster_showui_retry) */
     { long d = (long)env_num("MIB3_SHIM_SHOWUI_MS", 1800);
       g_showui_retry_ms = (d > 0) ? (mono_ms() + (u64)d) : 0;
@@ -3422,7 +3544,7 @@ static void *cluster_thread(void *arg){
                          * screen opcode at all -- it is an RTSP /command type.)
                          * Logged anyway: navigation start drops the whole session
                          * and control traffic is the prime suspect. */
-            { const char *H = "0123456789abcdef"; int k; char hs[96]; char bh[192];
+            { const char *H = "0123456789abcdef"; int k; char hs[97]; char bh[192];
               unsigned lim = 48, bl = (bs < 64u) ? (unsigned)bs : 64u;
               for (k = 0; k < (int)lim; k++){ unsigned char cc = hdr[k]; hs[k*2] = H[cc>>4]; hs[k*2+1] = H[cc&15]; }
               hs[lim*2] = 0;
@@ -3467,6 +3589,12 @@ static void *cluster_thread(void *arg){
   } else {
     logline("cluster/thread","accept failed or none");
   }
+  /* Stop naming a session that may be freed once we are gone, unless a newer
+   * SETUP already took the command target (generation moved). */
+  { void *mine = c->session;
+    if (g_cmd_gen == c->cmdgen &&
+        __atomic_compare_exchange_n(&g_cmd_session, &mine, (void*)0, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+      logline("cluster/thread","command target cleared"); }
   logline("cluster/thread","exit");
   if (p_free) p_free(c);
   return 0;
@@ -3481,7 +3609,7 @@ static void *cluster_thread(void *arg){
  * event listener owns 5001 and the stock screen owns 6030, so 5000 is the only
  * firewall-legal free port.  6031 (the MHI3-native alt port) and any ephemeral
  * port are DROPPED -- the phone's SYN never arrives -- so they are fallbacks that
- * need live_kit/cluster_port_fw.sh first. */
+ * need a firewall rule this repo does not ship. */
 static int own_listen(int *out_port, int *out_gen){
   extern int socket(int, int, int);
   extern int setsockopt(int, int, int, const void*, unsigned int);
@@ -3494,8 +3622,8 @@ static int own_listen(int *out_port, int *out_gen){
   int fd, one = 1;
   struct sa6 sa, got; unsigned int glen = sizeof(got);
   /* port chain: explicit knob -> 5000 (fw-allowlisted, stock-observed free) ->
-   * 6031 (MHI3-native alt; fw-DROPPED, needs cluster_port_fw.sh) -> ephemeral
-   * (fw-DROPPED, needs cluster_port_fw.sh).  Log every attempt so the log
+   * 6031 (MHI3-native alt; fw-DROPPED, needs a firewall rule) -> ephemeral
+   * (fw-DROPPED, needs a firewall rule).  Log every attempt so the log
    * shows exactly which link of the chain won. */
   unsigned long chain[4]; int nc = 0;
   { char *pe = getenv("MIB3_SHIM_PORT");
@@ -3510,9 +3638,13 @@ static int own_listen(int *out_port, int *out_gen){
    * listener, and the bind would fall through to the firewall-dropped 6031.
    * Closing it here also unsticks the old thread's poll. */
   if (g_lsock >= 0){
-    int old = g_lsock; g_lsock = -1; g_lsock_gen++; close(old);
-    logkv("cluster/listen","superseded old listener fd",(u64)(u32)old,0);
-    logkv("cluster/listen","new listener generation",(u64)(u32)g_lsock_gen,0);
+    int old = g_lsock, g = g_lsock_fdgen;
+    g_lsock = -1;
+    if (__atomic_compare_exchange_n(&g_lsock_gen, &g, g + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)){
+      close(old);
+      logkv("cluster/listen","superseded old listener fd",(u64)(u32)old,0);
+      logkv("cluster/listen","new listener generation",(u64)(u32)g_lsock_gen,0);
+    }
   }
   fd = socket(10 /*AF_INET6*/, 1 /*SOCK_STREAM*/, 0);
   if (fd < 0) return -1;
@@ -3534,8 +3666,8 @@ static int own_listen(int *out_port, int *out_gen){
   }
   if (listen(fd, 8) != 0){ close(fd); return -1; }
   g_lsock = fd;                 /* we own it until a newer SETUP supersedes it */
-  g_lsock_gen++;
-  if (out_gen) *out_gen = g_lsock_gen;
+  g_lsock_fdgen = __atomic_add_fetch(&g_lsock_gen, 1, __ATOMIC_SEQ_CST);
+  if (out_gen) *out_gen = g_lsock_fdgen;
   *out_port = 0;
   if (getsockname(fd, &got, &glen) == 0){
     *out_port = (int)(((got.port & 0xff) << 8) | (got.port >> 8));   /* ntohs */
@@ -3543,7 +3675,7 @@ static int own_listen(int *out_port, int *out_gen){
     logkv("cluster/listen","bound port",(u64)(u32)(*out_port),0);
     { const char *fw = (*out_port == 5000 || *out_port == 5001) ? "FW-ALLOWED (ncm0 5000:5001)"
                       : (*out_port == 6030 || *out_port == 7000) ? "FW-ALLOWED but stock-owned"
-                      : "FW-DROPPED (needs live_kit/cluster_port_fw.sh)";
+                      : "FW-DROPPED (needs a firewall rule this repo does not ship)";
       logline("cluster/listen/fw", fw); }
   }
   return fd;
@@ -3653,6 +3785,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   c->night = g_night_mode; c->aes_inited = 0;
   g_cmd_session = session;   /* the command target once the stream connects */
   g_cmd_gen++;               /* invalidate completions from the previous SETUP */
+  c->cmdgen = g_cmd_gen;
   /* the wheel->CarPlay zoom path: one listener per process, started here so it
    * outlives per-connection cluster threads.
    * It only QUEUES steps; the cluster thread ships them (no session lifetime
@@ -3668,6 +3801,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
     if (p_free) p_free(c);
     goto fail_sock;
   }
+  if (p_pthreadDetach) p_pthreadDetach(th);
   return 0;
 
 fail_sock:
@@ -3718,7 +3852,9 @@ static void run_banner(void){
    * plugs, so a resolution cached from a previous plug would silently ignore the
    * change (the 2026-10-16 "banner still reads a stale knob" class of bug).  Reset
    * the breadcrumb fd too so the stick path is re-discovered if it just mounted. */
-  g_sink = -1; bc_fd = -2;
+  g_sink = -1;
+  if (bc_fd >= 0) close(bc_fd);
+  bc_fd = -2;
   bs(&b,"  SINK="); sink_resolve(); bu64(&b,(u64)(u32)g_sink,10,0);
   bs(&b," (0=off 2=helper)");
   /* view-area / command-completion knobs (2026-10-19) */
@@ -3762,8 +3898,7 @@ static void run_banner(void){
   bs(&b," ======\n");
   bs(&b,"[mib3shim] ================================================================\n");
   mem[b.n]=0;
-  log_open();
-  if (logfd >= 0) write(logfd, mem, b.n);
+  log_write(mem, b.n);
 }
 
 int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
@@ -3777,6 +3912,7 @@ int AirPlayInfoArrayAddScreenDisplay(CFMutableArrayRef *inArray,
                                      int heightPhysical)
 {
   hit("ADD\n", 4);                       /* prove entry, independent of everything */
+  g_cluster_advertised = 0;              /* re-decided for THIS display list below */
   run_banner();                          /* ==== RUN n / knobs ==== : per-plug discriminator */
   logline("AddScreenDisplay","ENTERED");  /* before resolve(): resolve() may fail */
   resolve();
@@ -3972,6 +4108,7 @@ int AirPlayReceiverSessionSetup(void *session, void *request, void **responseOut
           kfeat && p_CFGetTypeID(kfeat) == p_CFArrayGetTypeID()){
         CFIndex j, m = p_CFArrayGetCount((CFArrayRef)kfeat);
         char list[320]; unsigned long lw = 0;
+        list[0] = 0;
         for (j = 0; j < m && j < 24; j++){
           void *e = (void*)p_CFArrayGetValueAtIndex((CFArrayRef)kfeat, j);
           char tmp[48]; tmp[0] = 0;
@@ -3981,9 +4118,10 @@ int AirPlayReceiverSessionSetup(void *session, void *request, void **responseOut
             unsigned long tl = 0; while (tmp[tl]) tl++;
             unsigned long pl = 0; while (pp[pl]) pl++;
             unsigned long k;
-            for (k = 0; k < pl && lw + k + tl + 2 < sizeof(list); k++) list[lw+k] = pp[k];
+            if (lw + pl + tl >= sizeof(list)) break;
+            for (k = 0; k < pl; k++) list[lw+k] = pp[k];
             lw += pl;
-            for (k = 0; k < tl && lw + k + 1 < sizeof(list); k++) list[lw+k] = tmp[k];
+            for (k = 0; k < tl; k++) list[lw+k] = tmp[k];
             lw += tl;
             list[lw] = 0;
           }
@@ -4134,13 +4272,13 @@ static void sink_resolve(void){
     if      (v[0]=='h') g_sink = SINK_HELPER;
     else if (v[0]=='o' || v[0]=='0') g_sink = SINK_OFF;
     else {
-      logline("sink","MIB3_SHIM_SINK=<dry|local|...> REMOVED (Path A, 2026-10-29): only 'off' and 'helper' exist. Staying OFF.");
+      logline("sink","MIB3_SHIM_SINK=<dry|local|...> removed 2026-10-29: only 'off' and 'helper' exist. Staying OFF.");
       g_sink = SINK_OFF;
     }
   } else if (getenv("MIB3_SHIM_SURFACE") || getenv("MIB3_SHIM_BRIDGE") ||
              getenv("MIB3_SHIM_LOCAL") || getenv("MIB3_SHIM_LOCAL_ACK") ||
              getenv("MIB3_SHIM_LOCAL_FALLBACK")){
-    logline("sink","LEGACY SURFACE/BRIDGE/LOCAL KNOBS ARE DEAD (Path A removed 2026-10-29). Use MIB3_SHIM_SINK=helper for Path B. Staying OFF.");
+    logline("sink","LEGACY SURFACE/BRIDGE/LOCAL KNOBS ARE DEAD (removed 2026-10-29). Use MIB3_SHIM_SINK=helper for Path B. Staying OFF.");
   }
   { char m[64]; buf b={m,sizeof(m)-2,0};
     bs(&b,"mode="); bu64(&b,(u64)(u32)g_sink,10,0);
@@ -4164,7 +4302,8 @@ static int sink_start(void){
 }
 
 static int sink_feed(const void *data, unsigned long len, unsigned long ts){
-  sink_resolve();
+  /* no sink_resolve() here: cluster_setup and sink_start resolved it before the
+   * loop, and the loop must not reach getenv (see KNOB SNAPSHOT) */
   if (g_sink == SINK_HELPER) return helper_feed(data, len, ts);
   return 0;   /* off: dropped, counted by the caller */
 }
@@ -4172,155 +4311,10 @@ static int sink_feed(const void *data, unsigned long len, unsigned long ts){
 /* ---- harness hooks (sink dispatcher + out-of-process helper) ------------ */
 int  mib3shim_sink_mode(void){ sink_resolve(); return g_sink; }
 int  mib3shim_sink_start(void){ sink_resolve(); return sink_start(); }
-int  mib3shim_sink_feed(const void *d,unsigned long n,unsigned long ts){ return sink_feed(d,n,ts); }
+int  mib3shim_sink_feed(const void *d,unsigned long n,unsigned long ts){ sink_resolve(); return sink_feed(d,n,ts); }
 int  mib3shim_helper_connect(void){ return helper_connect(); }
 int  mib3shim_helper_feed(const void *d,unsigned long n,unsigned long ts){ return helper_feed(d,n,ts); }
 int  mib3shim_helper_connected(void){ return hlp_fd >= 0; }
 unsigned long mib3shim_helper_sent(void){ return hlp_sent; }
 unsigned long mib3shim_helper_dropped(void){ return hlp_drop; }
 const char *mib3shim_bc_path(void){ if (bc_fd == -2){ bc_pick_path(); } return bc_path; }
-
-/* ==========================================================================
- * THE CRASH-GUARD SEAM.
- *
- * The unit's stock fault: on teardown (systemctl stop/restart carplay) the
- * CCarSSWRsiClient destructor frees the wrapped RSI client and sends its
- * unsubscribes; the `{type:"unsubscribe"}` ack comes back through librsic's
- * dispatch (WsClientImpl::broadcastOnMessage -> WsSubscribeClient::onMessage ->
- * WsSubscribeClient::broadcastMessage) and is delivered to the FREED callback --
- * FUN_00392778 dereferences NULL+0x10 (si_addr 0x10), SIGSEGV, and LG's
- * app-crash reset reboots the whole unit.
- *
- * VERIFIED: all these librsic symbols are EXPORTED and every relevant internal
- * call goes through the PLT (inside-librsic calls at e.g. 0x3533c, 0x62e98), and
- * carplay's own teardown calls them cross-DSO -- so interposition reaches all of
- * it.
- *
- * THE GUARD: a process-global flag set by ANY unsubscribe call; while set,
- * broadcastOnMessage / broadcastMessage drop message dispatches (return
- * silently), so no message reaches the freed callback.  A process restart resets
- * the flag trivially.  Armed only when the stick marker is present, same as every
- * other seam; MIB3_SHIM_GUARD=0 overrides.
- *
- * KNOWN LIMIT (deliberate, benign): the flag is all-or-nothing for the rest of the
- * process lifetime, so one mid-session unsubscribe would mute all later
- * dispatches.  On this build unsubscribes happen only at teardown, so the window
- * is exactly the dangerous one.
- * ======================================================================== */
-static int g_guard_teardown = 0;         /* 0 = normal dispatch, 1 = dropping */
-static unsigned long g_guard_set_count = 0, g_guard_drop_count = 0;
-
-/* gate discipline: the guard only arms while the stick marker is present --
- * same contract as every other seam (pull the stick => next sessions inert). */
-static int guard_armed(void){
-  if (!env_on("MIB3_SHIM_GUARD", 1)) return 0;
-  resolve();
-  return gate_active();
-}
-
-typedef void (*fn_guard_v2)(void*, void*);                  /* (this, msg&) */
-typedef void (*fn_guard_unsub_str_b)(void*, void*, u8);     /* (this, const string&, bool) */
-typedef void (*fn_guard_unsub_cond_b)(void*, void*, u8);    /* (this, const WsSubscribeCondition&, bool) */
-typedef void (*fn_guard_unsub_all)(void*);                  /* (this) */
-typedef void (*fn_guard_unsub_str)(void*, void*);           /* WsClientImpl::unsubscribe(string) */
-
-static void *guard_real(const char *mangled){
-  /* RTLD_NEXT ONLY -- deliberately NOT the two-tier R().  These seams only ever
-   * sit BEFORE librsic in the search order (the shim is injected first), so
-   * RTLD_NEXT is the correct "next object after us" lookup.  RTLD_DEFAULT is
-   * POISON here: when the real symbol is absent (the desk bench has no librsic)
-   * it finds THIS shim's own interposer, and the seam delegates to itself and
-   * recurses/hangs -- measured 2026-10-15, it hung driver_guard for all three
-   * builds.  RTLD_NEXT returns NULL instead, which is exactly "no real function
-   * to forward to". */
-  return dlsym(RTLD_NEXT, mangled);
-}
-
-/* The exported wrappers. Names are the EXACT mangled identity of the librsic
- * symbols (verified via nm -D); the asm-alias carries the name, the C ABI
- * carries the argument registers. Return type: all are void-returning per the
- * callers' disassembly (no x0 use after the call at any call site window). */
-
-static void guard_note_set(const char *what){
-  if (!g_guard_teardown) logline("guard","teardown detected -- dropping dispatches");
-  g_guard_teardown = 1;
-  g_guard_set_count++;
-  logkv("guard",what,(u64)g_guard_set_count,0);
-}
-
-static void guard_maybe_drop(void){
-  if (g_guard_teardown){
-    g_guard_drop_count++;
-    logkv("guard","dropped dispatch",(u64)g_guard_drop_count,0);
-  }
-}
-/* pass-through when the guard is not armed: delegate ONLY (no flag side-effects) */
-static int guard_passthrough(void){ return !guard_armed(); }
-
-/* --- WsSubscribeClient::broadcastMessage(const WsClientMessage&) -----------
- * The fatal seam: called via PLT from WsSubscribeClient::onMessage (0x62e98). */
-void _ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE(void *self, void *msg)
-  __asm__("_ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE");
-void _ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE(void *self, void *msg){
-  static void *real; static int tried;
-  if (!tried){ real = guard_real("_ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE"); tried = 1; }
-  if (guard_passthrough()){ if (real) ((fn_guard_v2)real)(self, msg); return; }
-  guard_maybe_drop();
-  if (g_guard_teardown) return;               /* the freed callback never sees this */
-  if (real) ((fn_guard_v2)real)(self, msg);
-}
-
-/* --- WsClientImpl::broadcastOnMessage(const WsClientMessage&) --------------
- * The parent seam; dropping here also suffices (called via PLT at 0x3533c). */
-void _ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE(void *self, void *msg)
-  __asm__("_ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE");
-void _ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE(void *self, void *msg){
-  static void *real; static int tried;
-  if (!tried){ real = guard_real("_ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE"); tried = 1; }
-  if (guard_passthrough()){ if (real) ((fn_guard_v2)real)(self, msg); return; }
-  guard_maybe_drop();
-  if (g_guard_teardown) return;
-  if (real) ((fn_guard_v2)real)(self, msg);
-}
-
-/* --- the unsubscribe family: flag setters --------------------------------- */
-void _ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb(void *self, void *a, u8 b)
-  __asm__("_ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb");
-void _ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb(void *self, void *a, u8 b){
-  static void *real; static int tried;
-  if (!tried){ real = guard_real("_ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb"); tried = 1; }
-  if (!guard_passthrough()) guard_note_set("WsSubscribeClient::unsubscribe(string,bool)");
-  if (real) ((fn_guard_unsub_str_b)real)(self, a, b);
-}
-
-void _ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb(void *self, void *a, u8 b)
-  __asm__("_ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb");
-void _ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb(void *self, void *a, u8 b){
-  static void *real; static int tried;
-  if (!tried){ real = guard_real("_ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb"); tried = 1; }
-  if (!guard_passthrough()) guard_note_set("WsSubscribeClient::unsubscribe(cond,bool)");
-  if (real) ((fn_guard_unsub_cond_b)real)(self, a, b);
-}
-
-void _ZN3SAI17WsSubscribeClient14unsubscribeAllEv(void *self)
-  __asm__("_ZN3SAI17WsSubscribeClient14unsubscribeAllEv");
-void _ZN3SAI17WsSubscribeClient14unsubscribeAllEv(void *self){
-  static void *real; static int tried;
-  if (!tried){ real = guard_real("_ZN3SAI17WsSubscribeClient14unsubscribeAllEv"); tried = 1; }
-  if (!guard_passthrough()) guard_note_set("WsSubscribeClient::unsubscribeAll()");
-  if (real) ((fn_guard_unsub_all)real)(self);
-}
-
-void _ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE(void *self, void *a)
-  __asm__("_ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE");
-void _ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE(void *self, void *a){
-  static void *real; static int tried;
-  if (!tried){ real = guard_real("_ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE"); tried = 1; }
-  if (!guard_passthrough()) guard_note_set("WsClientImpl::unsubscribe(string)");
-  if (real) ((fn_guard_unsub_str)real)(self, a);
-}
-
-/* --- guard status probes for the harness/kit ------------------------------ */
-int  mib3shim_guard_teardown(void){ return g_guard_teardown; }
-unsigned long mib3shim_guard_sets(void){ return g_guard_set_count; }
-unsigned long mib3shim_guard_drops(void){ return g_guard_drop_count; }

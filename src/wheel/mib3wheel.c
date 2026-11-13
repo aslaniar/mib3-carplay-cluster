@@ -26,7 +26,7 @@
  * TWO READ-ONLY TAPS (both RSI/VIWI over localhost, no writes, no state)
  * --------------------------------------------------------------------
  *  A. /maprenderer/discreteInputs  (AUTHORITATIVE) -- an element event when
- *     navsd posts relativeSteps.  `relativeSteps: -1|+1` is the step.
+ *     navsd posts relativeSteps.  `relativeSteps: N` is |N| steps (at most 8).
  *  B. /maprenderer/renderers       (BACKSTOP)      -- the renderer's own
  *     `distancePerPixel` changes when its map zooms.  Used only when `zoomMode`
  *     is NOT "auto", because auto-zoom moves the scale with vehicle speed.
@@ -67,6 +67,11 @@ extern void   _exit(int);
 extern int    socket(int, int, int);
 extern int    connect(int, const void *, unsigned int);
 extern int    setsockopt(int, int, int, const void *, unsigned int);
+extern long   send(int, const void *, unsigned long, int);
+extern int    bind(int, const void *, unsigned int);
+extern int    listen(int, int);
+extern int    accept(int, void *, void *);
+extern int    unlink(const char *);
 
 extern int    usleep(unsigned int);
 extern long   time(long *);
@@ -138,9 +143,16 @@ static int tcp_connect(const char *host, int port){
   if (connect(fd, &sa, (unsigned int)sizeof(sa)) != 0){ close(fd); return -1; }
   return fd;
 }
+/* Every wfull target is a socket.  A peer that has closed (the shim inbox, RSI)
+ * must cost a failed write, not a SIGPIPE that kills the watcher. */
+#ifdef HOST_TEST
+#define MSG_NOSIGNAL 0x80000
+#else
+#define MSG_NOSIGNAL 0x4000
+#endif
 static int wfull(int fd, const void *buf, usize n){
   usize o = 0;
-  while (o < n){ long r = write(fd, (const char*)buf + o, n - o); if (r <= 0) return 0; o += (usize)r; }
+  while (o < n){ long r = send(fd, (const char*)buf + o, n - o, MSG_NOSIGNAL); if (r <= 0) return 0; o += (usize)r; }
   return 1;
 }
 /* GET path; returns HTTP status (0 = transport error), body in out (NUL-terminated).
@@ -298,9 +310,12 @@ static long ws_read(int fd, char *out, usize cap){
  *      parity and the scanner then reads punctuation as keys -- it silently found
  *      only the FIRST renderer of a two-renderer array.
  *  (2) so the multi-object walk below enumerates the array's objects by brace
- *      depth and scans each object from ITS OWN START. */
+ *      depth and scans each object from ITS OWN START.
+ *  (3) a scan ENDS where the object (or array) it started in closes.  The
+ *      array walk hands over a pointer into the whole body, so an unbounded
+ *      scan of a renderer lacking a key took the NEXT renderer's value. */
 static const char *find_key(const char *j, const char *key){
-  usize kl = slen(key);
+  usize kl = slen(key); int depth = 0;
   while (*j){
     if (*j == '"'){
       const char *k = j + 1; usize n = 0;
@@ -317,6 +332,8 @@ static const char *find_key(const char *j, const char *key){
       j = k + n + 1;
       continue;
     }
+    if (*j == '{' || *j == '[') depth++;
+    else if ((*j == '}' || *j == ']') && --depth <= 0) return 0;
     j++;
   }
   return 0;
@@ -463,18 +480,27 @@ static int flush_pending(void){
   g_last_emit_ms = now_ms();
   return sent;
 }
-/* Accept a signed step; emit immediately if the pacing gap allows, else keep
- * the pending tail.  A REVERSAL DROPS the unsent tail in the old direction:
- * the user's latest intent wins, and a stale direction is never replayed at the
- * phone. */
-static int step(int dir){
+/* Accept n steps in direction dir; emit immediately if the pacing gap allows,
+ * else keep the pending tail.  A REVERSAL DROPS the unsent tail in the old
+ * direction: the user's latest intent wins, and a stale direction is never
+ * replayed at the phone. */
+static int step(int dir, int n){
   s64 t = now_ms();
-  if (!dir) return 0;
+  if (!dir || n <= 0) return 0;
   if (g_pending_n && (g_pending_dir != dir)) g_pending_n = 0;   /* drop unsent tail */
   g_pending_dir = dir;
-  if (g_pending_n < 8) g_pending_n++;                            /* bounded intent */
+  g_pending_n += n;
+  if (g_pending_n > 8) g_pending_n = 8;                          /* bounded intent */
   if (t - g_last_emit_ms >= g_min_gap_ms) return flush_pending();
   return 0;
+}
+
+/* Tap A: navsd posted relativeSteps = rs.  Returns the steps emitted now. */
+static int relative_steps(s64 rs, int invert){
+  int dir = rs > 0 ? 1 : -1;
+  s64 n = rs > 0 ? rs : -rs;
+  if (invert) dir = -dir;
+  return step(dir, n > 8 ? 8 : (int)n);
 }
 
 /* ---- renderers tap state ---------------------------------------------- */
@@ -519,11 +545,30 @@ static int renderer_slot(const char *name, const char *uri){
 }
 
 /* ---- selftest: the parsers over fixtures that mirror the shipped spec --- */
-static int g_fail;
+static int g_fail, g_pass;
 static void ck(const char *name, int got, int exp){
-  P(2, "WHEEL selftest exp="); PN(2, exp); P(2, " got="); PN(2, got);
+  P(2, "WHEEL "); P(2, name); P(2, " exp="); PN(2, exp); P(2, " got="); PN(2, got);
   P(2, got == exp ? " PASS\n" : " FAIL\n");
-  if (got != exp) g_fail++;
+  if (got != exp) g_fail++; else g_pass++;
+}
+
+/* Feed relativeSteps = rs through tap A into a real inbox socket and return the
+ * signed count of "+1"/"-1" lines the inbox received (-100 on any other byte). */
+static int inbox_lines_for(int ls, s64 rs){
+  char buf[64]; long n, got = 0, k; int lines = 0, cs;
+  g_pending_n = 0; g_last_emit_ms = 1;
+  relative_steps(rs, 0);
+  emit_close();
+  cs = accept(ls, NULL, NULL);
+  if (cs < 0) return -100;
+  while (got < (long)sizeof(buf) && (n = read(cs, buf + got, sizeof(buf) - (usize)got)) > 0) got += n;
+  close(cs);
+  if (got % 3) return -100;
+  for (k = 0; k < got; k += 3){
+    if (buf[k + 1] != '1' || buf[k + 2] != '\n') return -100;
+    if (buf[k] == '+') lines++; else if (buf[k] == '-') lines--; else return -100;
+  }
+  return lines;
 }
 static int selftest(void){
   s64 v = 0;
@@ -573,6 +618,13 @@ static int selftest(void){
     ck("selftest.obj1", (o1 && get_str(o1, "name", nm, sizeof(nm)) && streq(nm, "kombi")) ? 1 : 0, 1);
     ck("selftest.obj1_len", (int)l1, 27); }
 
+  /* a key missing from one object must not be read from the NEXT object */
+  { const char *two = "{\"data\":[{\"name\":\"mainunit\",\"zoomMode\":\"manual\"},"
+                      "{\"name\":\"kombi\",\"distancePerPixel\":26.312}]}";
+    s64 mm = 0; usize l0 = 0;
+    const char *o0 = json_array_object(find_key(two, "data"), 0, &l0);
+    ck("selftest.missing_key_stays_in_object", get_float_milli(o0, "distancePerPixel", &mm), 0); }
+
   /* the poll-path decision (added 2026-10-19): the car's kombi renderer flipped
    * auto -> manual with a 6.9x jump when the wheel was first rolled, so the EDGE
    * must be adopted silently, and only manual-mode deltas are steps. */
@@ -584,7 +636,27 @@ static int selftest(void){
     ck("selftest.decide_below_threshold", dpp_decide(26312, 0, 27000, 0, &d), 0);
     ck("selftest.decide_auto_ignored", dpp_decide(3000, 1, 6000, 1, &d), 0); }
 
-  if (!g_fail) P(2, "TOTAL: PASS=19 FAIL=0\n");
+  /* relativeSteps carries a COUNT: navsd posts 2 for a fast roll.  Each step is
+   * one inbox line, and the pending intent is capped at 8. */
+  { const char *path = "/tmp/mib3wheel.selftest.sock";
+    sun_t sa; int ls = socket(1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0);
+    const char *saved = g_sockpath;
+    unlink(path);
+    sun_fill(&sa, path);
+    if (ls < 0 || bind(ls, &sa, (unsigned int)sizeof(sa)) != 0 || listen(ls, 4) != 0){
+      ck("selftest.inbox_listener", 0, 1);
+    } else {
+      g_sockpath = path;
+      ck("selftest.relativeSteps_1_lines", inbox_lines_for(ls, 1), 1);
+      ck("selftest.relativeSteps_2_lines", inbox_lines_for(ls, 2), 2);
+      ck("selftest.relativeSteps_minus3_lines", inbox_lines_for(ls, -3), -3);
+      ck("selftest.relativeSteps_20_capped", inbox_lines_for(ls, 20), 8);
+      g_sockpath = saved;
+    }
+    if (ls >= 0) close(ls);
+    unlink(path); }
+
+  P(2, "TOTAL: PASS="); PN(2, g_pass); P(2, " FAIL="); PN(2, g_fail); P(2, "\n");
   return g_fail ? 1 : 0;
 }
 
@@ -619,7 +691,7 @@ static int tapb_element(const char *obj, int invert, int *accepted, int *steps){
     P(2, "[wheel] tapB renderer="); P(2, g_r[slot].name); LV(" dpp_milli", dpp);
     if (accepted) (*accepted)++;
     g_r[slot].dpp = dpp;
-    s = step(dir);
+    s = step(dir, 1);
     if (steps) *steps += s;
     return 1;
   }
@@ -763,11 +835,9 @@ static int main_watch(const char *host, int port, int use_renderers, int dump, i
       if (w[i].kind == 0){
         s64 rs = 0;
         if (get_int(payload, "relativeSteps", &rs) && rs != 0){
-          int dir = rs > 0 ? 1 : -1;
-          if (invert) dir = -dir;
           LV("tapA.relativeSteps", rs);
           accepted++;
-          steps += step(dir);
+          steps += relative_steps(rs, invert);
           if (once && accepted >= once) goto done;
         }
       } else {

@@ -18,12 +18,18 @@
 #                            CarPlay the phone's TCP connection stays ESTABLISHED
 #                            after the phone leaves, so "connected" outlives the
 #                            session by hours.
-#   IN   pathb_daemon.cmd    one-shot operator command ("release")
+#   IN   pathb_daemon.cmd    one-shot operator command ("release": hand back now and
+#                            take nothing until frames stop for GRACE, i.e. until
+#                            this phone session is over)
 #   IN   pathb_daemon.pause  present = never take over
 #   IN   /proc/net/udp{,6}   is the port free? THE proof, not a hint
 #   OUT  pathb_sender.ctl    "bind <port>" | "unbind"
 #   OUT  pathb_daemon.state  what the CLI reads
-#   OUT  pathb_daemon.log    one line per decision, monotonic ms
+#   OUT  pathb_daemon.log    one line per decision, monotonic ms; the previous
+#                            run's is pathb_daemon.log.1
+#   OUT  pathb_nav.parked    written before the park, removed only by a hand-back
+#                            that succeeded; a stop or a restart that finds it
+#                            hands the nav back
 #
 # THE STATES (`owner` is the one resource everybody wants):
 #   IDLE      owner=nav.  Watching `au`; once frames have arrived for READY_STABLE
@@ -31,7 +37,8 @@
 #   TAKEOVER  owner=nobody (transient): park the nav element, bind the port the
 #             instant the kernel says it is free, wait for one emitted AU.
 #   ACTIVE    owner=us.  When `au` stops advancing for GRACE the session is over,
-#             however healthy the socket still looks.
+#             however healthy the socket still looks.  When `au` advances but
+#             `out` does not for GRACE, the cluster is dark: release.
 #   RELEASE   owner=nobody (transient): unbind (which frees the port), prove it in
 #             the kernel, hand the nav element back, confirm.
 #   DEGRADED  a step did not complete: retry the release on a backoff, never arm.
@@ -70,7 +77,8 @@
 #   (the release has no deadline of its own: deliver_ctl.sh's handover gates are
 #    already bounded by MS-S's own 1 Hz clock.)
 #   PATHB_LOG_MAX           65536  log truncated to its last half beyond this
-#   PATHB_D_PARK_CMD / PATHB_D_BACK_CMD / PATHB_D_PORTFREE_CMD   bench seams
+#   PATHB_D_PARK_CMD / PATHB_D_BACK_CMD / PATHB_D_PORTFREE_CMD /
+#   PATHB_D_DISCOVER_CMD    bench seams
 # ============================================================================
 set -u
 
@@ -80,19 +88,26 @@ SOCK=${PATHB_SOCK:-$RAM/mib3cluster.sock}
 STATE=$RAM/pathb_daemon.state
 LOG=$RAM/pathb_daemon.log
 PIDF=$RAM/pathb_daemon.pid
+LOCKD=$RAM/pathb_daemon.lock
 CMDF=$RAM/pathb_daemon.cmd
 PAUSEF=$RAM/pathb_daemon.pause
+PARKF=$RAM/pathb_nav.parked
 SSTATE=${PATHB_SENDER_STATE:-$RAM/pathb_conn.state}
 SCTL=${PATHB_SENDER_CTL:-$RAM/pathb_sender.ctl}
 SPIDF=$RAM/pathb_sender.pid
 SLOG=$RAM/pathb_sender.log
 MUXER=${PATHB_MUXER:-/tmp/kit/mib3clusterstream}
 DELIVER=${PATHB_DELIVER:-$HERE/deliver_ctl.sh}
+# deliver_ctl keeps its lock, oracle pid and MS-S capture in this dir.  Exported
+# before ANY call (reconcile and the first housekeeping run before the first
+# prepare_tick), or a mounted stick becomes that dir and gets an 8 MB/min capture.
+MIB3_DLV_STICK=${MIB3_DLV_STICK:-$RAM}; export MIB3_DLV_STICK
 DELAYLOG=$RAM/pathb_deliver.log
 DST=${PATHB_DST:-ff14::2:4%eth0.5}
 GPORT=${PATHB_GROUP_PORT:-42800}
 BENCH=${PATHB_BENCH:-0}
-SCOMM=${PATHB_D_SENDER_COMM:-}     # bench seam: expected /proc comm of the sender
+# the sender's /proc comm; computed once because every read_sender checks it
+SCOMM=${PATHB_D_SENDER_COMM:-$(basename "$MUXER" | cut -c1-15)}
 
 POLL=${PATHB_POLL_MS:-200}
 READY_STABLE=${PATHB_READY_STABLE_MS:-400}
@@ -100,17 +115,28 @@ GRACE=${PATHB_GRACE_MS:-4500}
 RETRY=${PATHB_RETRY_MS:-2000}
 TAKEOVER_MS=${PATHB_TAKEOVER_MS:-9000}
 LOG_MAX=${PATHB_LOG_MAX:-65536}
+# THE STOP DEADLINE IS THE TRAP'S WORST CASE.  A kill -9 in the middle of a hand-back
+# leaves the nav parked.  A trapped TERM waits for the running foreground command
+# (worst: a `back` in the loop's own release), then on_stop releases: unbind wait
+# 2500 + two `back`s with a 500 nap after each + sender_stop 3000.  One `back` is
+# bounded by deliver_ctl.sh: oracle start 2 s + seven RSI requests at curl
+# --max-time 8 + fast gate 3 s + 2 s for the second to turn + rescue 20 s = 83 s.
+BACK_WORST_MS=83000
+STOP_MS=$(( 3 * BACK_WORST_MS + 2500 + 2 * 500 + 3000 + 5000 ))   # 260.5 s
 
 PARK_CMD=${PATHB_D_PARK_CMD:-}
 BACK_CMD=${PATHB_D_BACK_CMD:-}
 FREE_CMD=${PATHB_D_PORTFREE_CMD:-}
+DISC_CMD=${PATHB_D_DISCOVER_CMD:-}
 
 # state (single instance, written by the loop)
 ST=IDLE
 ST_SINCE=0
 ST_REASON=-
 PORT=""
-STARTED=0SENDER_PID=""
+STARTED=0
+SENDER_PID=""
+PARK_PID=""   # a park still in flight; cleared once reaped so a recycled pid is never waited on
 KNOBS_PID=""
 ORACLE_DONE=0
 WHEEL_DONE=0
@@ -120,6 +146,8 @@ DISC_AT=0
 ORA_AT=0
 S_CONN=0; S_READY=0; S_BOUND=0; S_AU=0; S_OUT=0; S_MS=0
 LAST_AU=-1; LAST_FLOW=0; FLOW_SINCE=0; DEAD_SINCE=0; NEXT_RETRY=0; RETRY_AT=0; CONN_SINCE=0
+LAST_OUT=0; DARK_SINCE=0
+HOLD=0        # 1 after an operator release, until the phone session it interrupted ends
 
 # ------------------------------------------------------------------ plumbing
 now_ms(){
@@ -176,7 +204,8 @@ log(){
 state_write(){
   printf 'state=%s since_ms=%s started_ms=%s reason=%s port=%s bound=%s conn=%s ready=%s au=%s out=%s paused=%s sender=%s\n' \
     "$ST" "$ST_SINCE" "$STARTED" "$ST_REASON" "${PORT:--}" "$S_BOUND" "$S_CONN" "$S_READY" \
-    "$S_AU" "$S_OUT" "$(paused && echo yes || echo no)" "${SENDER_PID:--}" >"$STATE" 2>/dev/null
+    "$S_AU" "$S_OUT" "$(paused && echo yes || echo no)" "${SENDER_PID:--}" >"$STATE.tmp" 2>/dev/null \
+    && mv -f "$STATE.tmp" "$STATE" 2>/dev/null   # a reader never sees the truncated file
 }
 
 set_state(){  # set_state <state> <reason>
@@ -188,6 +217,18 @@ set_state(){  # set_state <state> <reason>
 
 paused(){ [ -f "$PAUSEF" ]; }
 me(){ cat "$PIDF" 2>/dev/null; }
+
+# A PIDFILE IS A CLAIM, NOT EVIDENCE.  One left by a killed daemon can name a
+# recycled pid, and `stop` runs as root: only a process running this script is us.
+is_daemon(){  # <pid>
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null || return 1
+  if [ -r "/proc/$1/cmdline" ]; then
+    grep -q 'pathb_daemon\.sh' "/proc/$1/cmdline" 2>/dev/null
+  else
+    ps -o args= -p "$1" 2>/dev/null | grep -q 'pathb_daemon\.sh'
+  fi
+}
 
 # --------------------------------------------------------------- the sender
 proc_comm(){  # basename of pid $1's executable, truncated like /proc comm
@@ -204,10 +245,9 @@ sender_alive(){
   [ -n "$_p" ] || _p=$(cat "$SPIDF" 2>/dev/null)
   case "${_p:-}" in ''|*[!0-9]*) return 1 ;; esac
   kill -0 "$_p" 2>/dev/null || return 1
-  _want=${SCOMM:-$(basename "$MUXER" | cut -c1-15)}
   _got=$(proc_comm "$_p")
   # a recycled pid is not our sender
-  [ "$_got" = "$_want" ] || return 1
+  [ "$_got" = "$SCOMM" ] || return 1
   SENDER_PID=$_p
   return 0
 }
@@ -264,6 +304,11 @@ sender_stop(){  # bounded ladder: TERM, 1 s, KILL, 2 s
 
 read_sender(){
   S_CONN=0; S_READY=0; S_BOUND=0; S_AU=0; S_OUT=0; S_MS=0
+  # A DEAD SENDER'S STATE FILE IS NOT EVIDENCE.  Its last line still says what
+  # it held, but the kernel freed that port when it died: trusting it sends a
+  # restart's reconcile to wait on an unbind nobody will perform, and a fresh
+  # sender starting at au=0 looks like "no change" instead of a new session.
+  sender_alive || return 0
   [ -r "$SSTATE" ] || return 0
   _l=""; read -r _l <"$SSTATE" 2>/dev/null || true
   for _kv in $_l; do
@@ -302,12 +347,16 @@ port_free(){
 }
 
 discover_port(){
-  _m=""
-  for c in "$HERE/pathb/msport.py" "$HERE/msport.py" /tmp/kit/msport.py; do
-    [ -f "$c" ] && { _m=$c; break; }
-  done
-  [ -n "$_m" ] || { log "port: msport.py not found"; return 1; }
-  _o=$(${PATHB_MPY:-python} "$_m" 2>/dev/null)
+  if [ -n "$DISC_CMD" ]; then
+    _o=$(sh -c "$DISC_CMD" 2>/dev/null)
+  else
+    _m=""
+    for c in "$HERE/pathb/msport.py" "$HERE/msport.py" /tmp/kit/msport.py; do
+      [ -f "$c" ] && { _m=$c; break; }
+    done
+    [ -n "$_m" ] || { log "port: msport.py not found"; return 1; }
+    _o=$(${PATHB_MPY:-python} "$_m" 2>/dev/null)
+  fi
   case "${_o:-}" in
     ''|*[!0-9]*)
       # MS-S is parked, or has just restarted: it legitimately owns no socket,
@@ -350,20 +399,23 @@ diagnose(){
 # ------------------------------------------------------------------ the lease
 takeover(){  # -> 0 on success; the caller sets ACTIVE
   _t0=$(now_ms)
-  # The port may not exist yet: multi-screen-server creates its socket when it
-  # first has something to stream.  Discover it HERE, at the moment we actually
-  # need it, rather than refusing to arm at boot.
-  if [ -z "${PORT:-}" ]; then
+  # MS-S binds a NEW source port per process, so the port of an earlier session is
+  # not evidence.  Discover it at every takeover, before the park, while MS-S still
+  # owns its socket.
+  if [ -n "${PATHB_PORT:-}" ]; then
+    PORT=$PATHB_PORT
+  else
     discover_port || { log "TAKEOVER: MS-S has no stream yet, so there is no port to take -- not arming"; return 1; }
   fi
   log "TAKEOVER: phone has frames (au=$S_AU); park + bind"
-  park & _parkpid=$!
+  : >"$PARKF"
+  park & PARK_PID=$!
   _bound=0; _tk_done=0; _tk_done_at=0
   while :; do
     [ $(( $(now_ms) - _t0 )) -lt "$TAKEOVER_MS" ] || break
     # If the park has already RETURNED and failed, waiting out the full deadline
     # buys nothing: stop early (bounded grace for the socket to close).
-    if ! kill -0 "$_parkpid" 2>/dev/null; then
+    if ! kill -0 "$PARK_PID" 2>/dev/null; then
       if [ "$_tk_done" = "0" ]; then _tk_done=1; _tk_done_at=$(now_ms); fi
       [ $(( $(now_ms) - _tk_done_at )) -gt 1500 ] && break
     fi
@@ -372,7 +424,7 @@ takeover(){  # -> 0 on success; the caller sets ACTIVE
       _w=$(now_ms)
       while [ $(( $(now_ms) - _w )) -lt 800 ]; do
         read_sender
-        [ "$S_BOUND" = "$PORT" ] && { _bound=1; break; }
+        [ "$S_BOUND" = "$PORT" ] && { _bound=1; _out0=$S_OUT; break; }
         nap_ms 50
       done
       [ "$_bound" = "1" ] && break
@@ -382,7 +434,7 @@ takeover(){  # -> 0 on success; the caller sets ACTIVE
   done
   if [ "$_bound" != "1" ]; then
     log "TAKEOVER FAIL: the port never became ours within ${TAKEOVER_MS}ms"
-    wait "$_parkpid" 2>/dev/null
+    wait "$PARK_PID" 2>/dev/null; PARK_PID=""
     return 1
   fi
   log "TAKEOVER: port $PORT is ours after $(( $(now_ms) - _t0 ))ms"
@@ -390,16 +442,18 @@ takeover(){  # -> 0 on success; the caller sets ACTIVE
   # The park must ALSO have succeeded: a nav element left in place means MS-S
   # would rebuild its stream on a port we are holding, fail to bind, and send
   # from an ephemeral port the ECU drops.
-  wait "$_parkpid" 2>/dev/null; _prc=$?
+  wait "$PARK_PID" 2>/dev/null; _prc=$?; PARK_PID=""
   if [ "$_prc" != "0" ]; then
     log "TAKEOVER FAIL: park rc=$_prc -- giving the port back"
     return 1
   fi
 
   # FIRST EMIT is the proof the wire is ours and decodable -- not "bound".
+  # `out` counts for the sender's whole life, so only an advance since the bind
+  # is this session's emit.
   while :; do
     read_sender
-    [ "$S_OUT" -gt 0 ] && break
+    [ "$S_OUT" -gt "$_out0" ] && break
     if [ $(( $(now_ms) - _t0 )) -ge "$TAKEOVER_MS" ]; then
       log "TAKEOVER FAIL: bound but nothing was emitted within ${TAKEOVER_MS}ms"
       return 1
@@ -433,7 +487,7 @@ release(){  # <reason> -> 0 only when the cluster is genuinely back with the nav
   fi
   _i=0; _rc=1
   while [ "$_i" -lt 2 ]; do
-    if back; then _rc=0; break; fi
+    if back; then _rc=0; rm -f "$PARKF"; break; fi
     _i=$((_i+1)); nap_ms 500
   done
   if [ "$_rc" != "0" ]; then
@@ -549,7 +603,6 @@ prepare_tick(){   # idempotent, cheap; the loop's housekeeping
   if [ "$BENCH" != "1" ]; then
     knobs_once
     if [ "$ORACLE_DONE" = "0" ] && [ -f "$DELIVER" ]; then
-      MIB3_DLV_STICK=/dev/shm; export MIB3_DLV_STICK
       if sh "$DELIVER" oracle start >/dev/null 2>&1; then ORACLE_DONE=1; log "prepare: oracle up"; fi
     fi
     if [ "$WHEEL_DONE" = "0" ]; then
@@ -573,26 +626,30 @@ prepare_tick(){   # idempotent, cheap; the loop's housekeeping
   return 0
 }
 
-reconcile(){   # run once at startup: never inherit a half-taken cluster
-  read_sender
-  if [ "${S_BOUND:-0}" != "0" ]; then
-    log "reconcile: a previous sender still holds udp/$S_BOUND -- releasing"
+reconcile(){   # run once at startup, after the old sender is stopped: never inherit a parked nav
+  if [ -f "$PARKF" ]; then
+    log "reconcile: a previous run left the nav parked -- releasing"
     release "reconcile"; _r=$?
     settle "reconcile" "$_r"
   fi
   rm -f "$CMDF"
 }
 
+on_stop(){
+  log "daemon stop (signal)"
+  # a park still in flight would delete the nav AFTER our hand-back
+  [ -n "$PARK_PID" ] && wait "$PARK_PID" 2>/dev/null
+  read_sender
+  if [ -f "$PARKF" ] || [ "${S_BOUND:-0}" != "0" ]; then release "daemon-stop"; fi
+  sender_stop
+  rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null
+  exit 0
+}
+
 # ---------------------------------------------------------------------- loop
 do_tick(){
   _now=$(now_ms)
   read_sender
-  # A DEAD SENDER'S STATE FILE IS NOT EVIDENCE.  Without this the daemon keeps
-  # parsing the last line a killed sender wrote, and a fresh sender starting at
-  # au=0 looks like "no change" instead of a new session.
-  if ! sender_alive; then
-    S_CONN=0; S_READY=0; S_BOUND=0; S_AU=0; S_OUT=0
-  fi
 
   if [ -f "$CMDF" ]; then
     _cmd=""; read -r _cmd <"$CMDF" 2>/dev/null || true
@@ -601,7 +658,7 @@ do_tick(){
       release*) log "cmd: operator release"
                 release "operator"; _r=$?
                 settle "operator-release" "$_r"
-                DEAD_SINCE=0; FLOW_SINCE=0; LAST_AU=$S_AU ;;
+                HOLD=1; DEAD_SINCE=0; FLOW_SINCE=0; LAST_AU=$S_AU; LAST_FLOW=$(now_ms) ;;
       *) log "cmd: unknown '$_cmd' -- ignored" ;;
     esac
   fi
@@ -616,8 +673,14 @@ do_tick(){
         if [ "$S_AU" != "$LAST_AU" ]; then
           if [ "$FLOW_SINCE" = "0" ]; then FLOW_SINCE=$_now; fi
           LAST_AU=$S_AU; LAST_FLOW=$_now
+        elif [ $(( _now - LAST_FLOW )) -gt $(( 2 * POLL )) ]; then
+          # the flow stopped: the next frames start a new debounce, not resume this one
+          FLOW_SINCE=0
         fi
-        if paused; then
+        if [ "$HOLD" = "1" ] && [ $(( _now - LAST_FLOW )) -ge "$GRACE" ]; then
+          HOLD=0; log "release hold lifted: no frames for ${GRACE}ms, that phone session is over"
+        fi
+        if paused || [ "$HOLD" = "1" ]; then
           FLOW_SINCE=0
         elif [ "$FLOW_SINCE" != "0" ] && [ $(( _now - LAST_FLOW )) -le $(( 2 * POLL )) ] \
            && [ $(( _now - FLOW_SINCE )) -ge "$READY_STABLE" ] \
@@ -629,7 +692,7 @@ do_tick(){
           # Discovery is retried by prepare_tick; we arm as soon as it lands.
           set_state TAKEOVER "frames-flowing"
           if takeover; then
-            set_state ACTIVE "lease-taken"; DEAD_SINCE=0; LAST_AU=$S_AU
+            set_state ACTIVE "lease-taken"; DEAD_SINCE=0; LAST_AU=$S_AU; LAST_OUT=$S_OUT; DARK_SINCE=0
           else
             NEXT_RETRY=$(( $(now_ms) + RETRY ))
             release "takeover-failed"; _r=$?
@@ -639,6 +702,8 @@ do_tick(){
         fi
       fi ;;
     ACTIVE)
+      _sent=0
+      if [ "$S_OUT" != "$LAST_OUT" ]; then _sent=1; LAST_OUT=$S_OUT; DARK_SINCE=0; fi
       if [ "$S_AU" = "$LAST_AU" ]; then
         [ "$DEAD_SINCE" = "0" ] && DEAD_SINCE=$_now
         if [ $(( _now - DEAD_SINCE )) -ge "$GRACE" ]; then
@@ -658,6 +723,18 @@ do_tick(){
           [ "$_gap" -ge 2000 ] && log "tolerated a ${_gap}ms silence (phone paused; not a disconnect)"
         fi
         LAST_AU=$S_AU; DEAD_SINCE=0
+        # FRAMES IN, NOTHING OUT, IS A DARK CLUSTER: the nav is parked and our wire
+        # is silent.  The clock starts only on a tick where `au` advanced and `out`
+        # did not, and any emit stops it, so a jitter-buffer lag or a pause cannot.
+        if [ "$_sent" = "0" ]; then
+          [ "$DARK_SINCE" = "0" ] && DARK_SINCE=$_now
+          if [ $(( _now - DARK_SINCE )) -ge "$GRACE" ]; then
+            log "the cluster is dark: frames keep arriving (au=$S_AU) but nothing was sent for $(( _now - DARK_SINCE ))ms (out=$S_OUT)"
+            release "dark"; _r=$?
+            settle "cluster-dark" "$_r"
+            NEXT_RETRY=$(( $(now_ms) + RETRY )); FLOW_SINCE=0; DEAD_SINCE=0; DARK_SINCE=0
+          fi
+        fi
       fi
       if [ "$ST" = "ACTIVE" ]; then
         if ! sender_alive; then
@@ -700,23 +777,38 @@ do_tick(){
 
 do_run(){
   _me=$$
-  _old=$(me)
-  if [ -n "${_old:-}" ] && [ "$_old" != "$_me" ] && kill -0 "$_old" 2>/dev/null; then
-    echo "pathb_daemon: already running (pid $_old)"
-    return 0
+  # mkdir is the atomic test-and-set.  The holder writes the pidfile right after
+  # it, so a lock with no pid is a start in progress, not a stale one.
+  if mkdir "$LOCKD" 2>/dev/null; then
+    printf '%s\n' "$_me" >"$PIDF"
+  else
+    _old=$(me)
+    if [ -z "${_old:-}" ] || is_daemon "$_old"; then
+      echo "pathb_daemon: already running (pid ${_old:-starting})"
+      return 0
+    fi
+    # A STALE LOCK IS CLAIMED IN PLACE, BY ONE STARTER.  Two starts can both find
+    # it stale: the break marker for that pid admits one at a time, and each
+    # re-reads the pidfile under it, since an earlier holder may have claimed it.
+    # The lock dir never disappears, so no third start can mkdir its way in.
+    _brk=$LOCKD.break.$_old
+    mkdir "$_brk" 2>/dev/null || { echo "pathb_daemon: already running (another start is claiming a stale lock)"; return 0; }
+    if [ "$(me)" != "$_old" ]; then
+      rmdir "$_brk"
+      echo "pathb_daemon: already running (pid $(me))"
+      return 0
+    fi
+    printf '%s\n' "$_me" >"$PIDF"
+    rmdir "$_brk"
   fi
-  printf '%s\n' "$_me" >"$PIDF"
   STARTED=$(now_ms); ST_SINCE=$STARTED
-  : >"$LOG" 2>/dev/null
+  # the previous run's last lines are why this one started: keep them
+  mv -f "$LOG" "$LOG.1" 2>/dev/null
   log "daemon start pid=$_me poll=${POLL}ms ready=${READY_STABLE}ms grace=${GRACE}ms"
   if [ "$NAP_FRAC" = "1" ]; then log "clock: fractional sleep"
   elif [ "$NAP_MODE" != "none" ]; then log "clock: usleep ($(( POLL ))ms tick)"
   else log "WARN no fractional sleep and no usleep -- every wait degrades to 1s"; fi
-  if [ "$BENCH" != "1" ]; then
-    trap 'log "daemon stop (signal)"; read_sender; [ "${S_BOUND:-0}" != "0" ] && release "daemon-stop"; sender_stop; rm -f "$PIDF"; exit 0' INT TERM HUP
-  else
-    trap 'rm -f "$PIDF"; exit 0' INT TERM HUP
-  fi
+  trap on_stop INT TERM HUP
   # ONE SENDER, AND IT IS OURS.  A previous daemon's sender survives (it is nohup'd
   # and orphaned) and an OLDER BINARY then keeps running with the old behaviour
   # while every counter looks right -- measured on the car 2026-11-02: a restarted
@@ -739,7 +831,7 @@ do_run(){
 
 do_status(){
   _p=$(me)
-  if [ -n "${_p:-}" ] && kill -0 "$_p" 2>/dev/null; then
+  if is_daemon "$_p"; then
     echo "daemon:   RUNNING pid $_p"
   else
     echo "daemon:   not running"
@@ -757,19 +849,24 @@ do_status(){
 
 do_stop(){
   _p=$(me)
-  if [ -z "${_p:-}" ] || ! kill -0 "$_p" 2>/dev/null; then
+  if ! is_daemon "$_p"; then
     echo "pathb_daemon: not running"
-    rm -f "$PIDF"
+    rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null
     return 0
   fi
   kill "$_p" 2>/dev/null
-  _i=0
-  while [ "$_i" -lt 40 ]; do
+  _t=$(now_ms)
+  while [ $(( $(now_ms) - _t )) -lt "$STOP_MS" ]; do
     kill -0 "$_p" 2>/dev/null || break
-    nap_ms 100; _i=$((_i+1))
+    nap_ms 100
   done
-  kill -9 "$_p" 2>/dev/null
-  rm -f "$PIDF"
+  if is_daemon "$_p"; then
+    # killed past its trap: nothing else will clear its claim
+    kill -9 "$_p" 2>/dev/null
+    rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null
+    echo "pathb_daemon: killed (its trap did not finish in ${STOP_MS}ms)"
+    return 0
+  fi
   echo "pathb_daemon: stopped"
 }
 

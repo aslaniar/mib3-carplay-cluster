@@ -21,7 +21,7 @@ mkdir -p "$BIN"
 cd "$HERE" || exit 1
 
 MD5SUM() { if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
-PIN() { sed -n "s/^$1=//p" "$REPO/up.sh" | head -n1; }
+PIN() { sed -n "s/^$1=//p" "$REPO/bin/PINS" | head -n1; }
 
 if [ -f "$REPO/R8830L_ROOTFS/lib64/libc.so.6" ]; then
   LIBC="$REPO/R8830L_ROOTFS/lib64/libc.so.6"
@@ -54,10 +54,10 @@ abi_check "$BIN/mib3clusterstream" libc.so.6
 
 echo
 echo "--- pins (md5) ---"
-chk_pin() { # chk_pin <file> <pin-from-up.sh>
+chk_pin() { # chk_pin <file> <pin-from-bin/PINS>
   _g=$(MD5SUM "$1")
-  if [ "$_g" = "$2" ]; then printf '  %-20s %s  matches up.sh\n' "$(basename "$1")" "$_g"
-  else printf '  %-20s %s  up.sh pins %s\n' "$(basename "$1")" "$_g" "$2"; fi
+  if [ "$_g" = "$2" ]; then printf '  %-20s %s  matches bin/PINS\n' "$(basename "$1")" "$_g"
+  else printf '  %-20s %s  bin/PINS has %s\n' "$(basename "$1")" "$_g" "$2"; fi
 }
 chk_pin "$BIN/mib3wheel"         "$(PIN WHEEL_PIN)"
 chk_pin "$BIN/mib3clusterstream" "$(PIN SENDER_PIN)"

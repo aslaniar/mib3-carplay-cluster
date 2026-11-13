@@ -66,7 +66,7 @@ for _ in range(50):
     try:
         s.connect(sockpath)
         break
-    except OSError:
+    except (OSError, socket.error):   # Python 2.7: socket.error is not an OSError
         time.sleep(0.1)
 else:
     print("cannot connect to %s" % sockpath)

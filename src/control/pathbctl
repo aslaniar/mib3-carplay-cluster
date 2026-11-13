@@ -12,8 +12,10 @@
 #   pathbctl log [n]           the last n decision lines (default 20)
 #   pathbctl pause             do not take the cluster over (survives sessions)
 #   pathbctl resume            allow it again
-#   pathbctl release           hand the cluster back NOW (one-shot, safe)
-#   pathbctl start | stop      the daemon itself (boot starts it for you)
+#   pathbctl release           hand the cluster back NOW and stay off for the rest
+#                              of this phone session; the next session is taken
+#                              as usual (use pause to stay off indefinitely)
+#   pathbctl start | stop      the daemon itself (up.sh starts it; nothing survives a reboot)
 #
 # There is deliberately no `up`: taking the cluster is the daemon's decision,
 # triggered by the phone actually streaming pictures, and there is no operator
@@ -60,10 +62,19 @@ dur(){  # ms -> "1.8s" | "2m14s" | "1h02m"
   fi
 }
 
+is_daemon(){  # <pid>: a stale pidfile can name a recycled pid, so check what runs there
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null || return 1
+  if [ -r "/proc/$1/cmdline" ]; then
+    grep -q 'pathb_daemon\.sh' "/proc/$1/cmdline" 2>/dev/null
+  else
+    ps -o args= -p "$1" 2>/dev/null | grep -q 'pathb_daemon\.sh'
+  fi
+}
+
 alive(){
   _p=$(cat "$PIDF" 2>/dev/null)
-  case "${_p:-}" in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$_p" 2>/dev/null || return 1
+  is_daemon "$_p" || return 1
   printf '%s' "$_p"
   return 0
 }
@@ -126,7 +137,7 @@ case "${1:-status}" in
       fi
     else
       echo "  daemon     not running"
-      [ -f "$PIDF" ] && echo "  note       a stale pidfile exists ($(cat "$PIDF" 2>/dev/null)); it names nothing"
+      [ -f "$PIDF" ] && echo "  note       a stale pidfile exists ($(cat "$PIDF" 2>/dev/null)); it names no daemon"
       [ -r "$STATE" ] && echo "  last state $(cat "$STATE")"
     fi
     ;;
@@ -156,7 +167,8 @@ case "${1:-status}" in
     fi
     printf 'release\n' >"$CMDF"
     echo "pathbctl: asked the daemon to hand the cluster back (it unbinds, proves"
-    echo "          the port is free, then restores the car's map)"
+    echo "          the port is free, then restores the car's map).  It stays off"
+    echo "          until the phone stops streaming; use 'pause' to stay off for good"
     ;;
 
   start)
@@ -174,16 +186,8 @@ case "${1:-status}" in
     ;;
 
   stop)
-    if ! _p=$(alive); then echo "pathbctl: not running"; rm -f "$PIDF"; exit 0; fi
-    kill "$_p" 2>/dev/null
-    _i=0
-    while [ "$_i" -lt 60 ]; do
-      kill -0 "$_p" 2>/dev/null || { echo "pathbctl: stopped"; exit 0; }
-      sleep 0.1 2>/dev/null || sleep 1
-      _i=$((_i+1))
-    done
-    kill -9 "$_p" 2>/dev/null
-    echo "pathbctl: killed (it did not stop in 6s) -- run 'pathbctl status'"
+    # the daemon owns the stop deadline: only it knows how long its hand-back can take
+    exec sh "$DAEMON" stop
     ;;
 
   restart)

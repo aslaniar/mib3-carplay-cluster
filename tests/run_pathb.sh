@@ -7,18 +7,27 @@
 # runs the old framing on purpose and must not satisfy T3:
 #
 #   T1  native build, -Wall -Wextra clean
-#   T2  unit build (aarch64, unit glibc), runs under the unit's own ld-2.23.so
+#   T2  unit build (aarch64, unit glibc).  Build only, and only with R8830L_ROOTFS;
+#       the run under the unit's own ld-2.23.so is the optional last leg of T12,
+#       which also needs Apple's `container`
 #   T3  FRAMING: shim-style input folds to one PES per frame, params in that PES
 #   T4  ...and the assertion is not vacuous: --no-fold (old behaviour) fails it
 #   T5  ES stays byte-exact through the fold (no byte is rewritten)
 #   T6  RECONNECT: one process survives 2 connections; RTP seq continuous across
 #       the boundary; PSI re-emitted for the new connection
+#   T6c a queue deeper than QMAXDRAIN is dropped; no 25 ms holds more than the
+#       rate ceiling allows
 #   T7  SPORT: --sport binds, and the datagrams really leave from that port
 #   T8  SPORT taken -> loud failure (exit 3), never a silent shared group
 #   T9  --sport auto refuses rather than guessing
 #   T10 AU socket is 0777 (carplay is uid 986; the label alone is not enough)
 #   T11 msport.py: single / absent / changed / ambiguous fake /proc fixtures
 #   T12 FILE MODE unchanged (independent RTP/TS verification still passes)
+#   T26 mib3wheel --selftest, built natively with -DHOST_TEST
+#   T27 fake_shim.py retries a connect that fails with a Python 2 socket.error
+#   T28 a peer that stalls mid-record is dropped within ~500 ms, so 'unbind' works
+#   T29 START GATE: an IDR that arrives before any SPS/PPS does not open the gate
+#   T30 a 'bind' that met a busy port succeeds once the port frees, same ctl line
 #
 # Desk only.  No car, no unit.  Usage: bash run_pathb.sh
 # ============================================================================
@@ -38,18 +47,21 @@ LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
 PY=python3
 mkdir -p "$OUT"
+# AF_UNIX paths are capped at 104 bytes on macOS, so sockets never live under $OUT.
+SOCKDIR="$(mktemp -d /tmp/mib3.XXXXXX)"
 
-P=0; F=0
+P=0; F=0; S=0
 ok(){ echo "PATHB $1 exp=$2 got=$2 PASS"; P=$((P+1)); }
 no(){ echo "PATHB $1 exp=$2 got=$3 FAIL"; F=$((F+1)); }
+sk(){ echo "PATHB $1 SKIP ($2)"; S=$((S+1)); }
 chk(){ if [ "$2" = "1" ]; then ok "$1" "$3"; else no "$1" "$3" "${4:-no}"; fi; }
 
 CLEANUP_PIDS=""
 cleanup(){
   for p in $CLEANUP_PIDS; do kill "$p" 2>/dev/null; done
-  rm -f "$OUT"/sock* 2>/dev/null
+  rm -f "$SOCKDIR"/* 2>/dev/null
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup; rm -rf "$SOCKDIR"' EXIT INT TERM
 track(){ CLEANUP_PIDS="$CLEANUP_PIDS $1"; }
 
 NAT="$OUT/mib3clusterstream.native"
@@ -66,8 +78,7 @@ fi
 
 echo; echo "############ T2: unit build (aarch64 + unit glibc) ############"
 if [ ! -d "$ROOT" ]; then
-  echo "  SKIP: R8830L_ROOTFS not present -- the aarch64/unit-glibc leg needs the"
-  echo "        firmware's lib64.  It is not distributed with this repository."
+  sk unit_build_glibc "R8830L_ROOTFS not present: the aarch64/unit-glibc leg needs the firmware's lib64, which is not distributed with this repository"
 elif "$LLVMCC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
         -fuse-ld="$LLD" -pie -Wl,-e,_start \
         -Wl,--dynamic-linker,/lib64/ld-linux-aarch64.so.1 \
@@ -82,7 +93,7 @@ fi
 # Run the muxer in unix mode against a shim-faithful feeder, then look at PES.
 frame_case(){   # $1=tag  $2=extra muxer args
   local tag="$1"; shift
-  local sock="$OUT/sock.$tag" dg="$OUT/$tag.dgrams"
+  local sock="$SOCKDIR/$tag" dg="$OUT/$tag.dgrams"
   rm -f "$sock" "$dg"
   "$NAT" --in "unix:$sock" --out "file:$dg" "$@" 2>"$OUT/$tag.mux.log" &
   local mp=$!; track $mp
@@ -189,9 +200,11 @@ else
      "differs ($(wc -c < "$OUT/fed.nops" | tr -d ' ') vs $(wc -c < "$OUT/wire.nops" | tr -d ' ') B)"
 fi
 # and the header must NOT have been silently dropped altogether
-$PY "$TOOLS/pes_extract.py" "$DG" --brief 2>/dev/null | grep -q 'params=0' \
-  && no framing_header_survived "params>0" "params=0 (header lost)" \
-  || ok framing_header_survived "params>0"
+HDR=$($PY "$TOOLS/pes_extract.py" "$DG" --brief 2>/dev/null)
+case "$HDR" in
+  *params=[1-9]*) ok framing_header_survived "params>0" ;;
+  *)              no framing_header_survived "params>0" "${HDR:-no output}" ;;
+esac
 grep -q "0 discontinuities" "$OUT/fold.report" && ok rtp_seq_continuous 0 || no rtp_seq_continuous 0 "$(grep 'discontin' "$OUT/fold.report")"
 
 echo; echo "############ T5b: every AU ends on a datagram boundary (MS-S format) ############"
@@ -245,7 +258,7 @@ else
 fi
 
 
-SOCK="$OUT/sock.recon"; DG2="$OUT/recon.dgrams"; rm -f "$SOCK" "$DG2"
+SOCK="$SOCKDIR/recon"; DG2="$OUT/recon.dgrams"; rm -f "$SOCK" "$DG2"
 "$NAT" --in "unix:$SOCK" --out "file:$DG2" 2>"$OUT/recon.mux.log" &
 MP=$!; track $MP
 for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.05; done
@@ -281,16 +294,23 @@ FR=$($PY "$TOOLS/pes_frames.py" "$DG2" --json | $PY -c "import json,sys;print(js
 echo "  $(grep -E 'conn open|conn close' "$OUT/recon.mux.log" | tr '\n' ' ')"
 
 echo; echo "############ T6b: a feed FASTER than the pacer must not lose its tail ############"
-# The pacer holds up to 8 access units.  Closing the connection with them queued
-# used to discard them silently -- measured on a real phone capture: 7 of 2077 AUs
-# never reached the wire and nothing said so.  The reconnect test above cannot see
-# that, because at 40 fps the feed is slower than the pacer and the queue never
-# fills.  So feed as fast as the socket allows and require EVERY AU to arrive.
-SOCKF="$OUT/sock.fast"; DGF="$OUT/fast.dgrams"; rm -f "$SOCKF" "$DGF"
+# Closing the connection with access units queued used to discard them silently --
+# measured on a real phone capture: 7 of 2077 AUs never reached the wire and
+# nothing said so.  The reconnect test above cannot see that, because at 40 fps
+# the feed is slower than the pacer and the queue never fills.  So feed as fast
+# as the socket allows and require EVERY AU to arrive.  Three GOPs (30 AUs) keep
+# the queue under QMAXDRAIN (40); a deeper queue is dropped on purpose (T6c).
+$PY - "$FIX" "$OUT/gop3.264" <<'PY'
+import sys
+d = open(sys.argv[1], "rb").read()
+sps = [i for i in range(len(d) - 4) if d[i:i+4] == b"\x00\x00\x00\x01" and d[i+4] & 0x1F == 7]
+open(sys.argv[2], "wb").write(d[:sps[3]])
+PY
+SOCKF="$SOCKDIR/fast"; DGF="$OUT/fast.dgrams"; rm -f "$SOCKF" "$DGF"
 "$NAT" --in "unix:$SOCKF" --out "file:$DGF" --pace-ms 40 2>"$OUT/fast.mux.log" &
 FP=$!; track $FP
 for _ in $(seq 1 40); do [ -S "$SOCKF" ] && break; sleep 0.05; done
-$PY "$KIT/pathb/fake_shim.py" "$FIX" 5000 "$SOCKF" >"$OUT/fast.feed.log" 2>&1
+$PY "$KIT/pathb/fake_shim.py" "$OUT/gop3.264" 5000 "$SOCKF" >"$OUT/fast.feed.log" 2>&1
 FEDN=$(sed -n 's/.*frames \([0-9]*\)$/\1/p' "$OUT/fast.feed.log" | head -1)
 sleep 2.0
 kill $FP 2>/dev/null; wait $FP 2>/dev/null
@@ -299,6 +319,33 @@ WIREN=$($PY "$TOOLS/pes_extract.py" "$DGF" --brief 2>/dev/null | sed -n 's/.*pes
   && ok pacer_drains_on_close "${FEDN:-?} AUs" || no pacer_drains_on_close "${FEDN:-?} AUs" "${WIREN:-0}"
 grep -q "drained-at-close=" "$OUT/fast.mux.log" && ok pacer_reports_drain yes || no pacer_reports_drain yes no
 echo "  fed=$FEDN  on-wire=$WIREN  $(grep -o 'drained-at-close=[0-9]*' "$OUT/fast.mux.log" | head -1)"
+
+echo; echo "############ T6c: a deep queue is dropped to the next IDR, never burst out ############"
+# A sustained feed faster than the release clock pushes the queue past QMAXDRAIN.
+# The old depth bound emitted the excess through pace_emit, which flushed each
+# in-flight AU at once: 75-298 datagrams in 25 ms on this feed.  The rate ceiling
+# is OUT_RATE_B_PER_MS = 2000 B/ms, 50,000 B per 25 ms, which fills 46 datagrams
+# of 6 x 184 = 1104 B.  On top of that each AU ends in one part-filled datagram
+# (the smallest AU here, 9,952 B, takes 5 ms at the ceiling, so at most 5 end in
+# a window), and a late wake on a busy desk releases up to one EMIT_BURST (8) of
+# overdue datagrams together: 46 + 5 + 8 = 59.  The teardown drain is excluded
+# by --stats-timing itself.
+cat "$FIX" "$FIX" "$FIX" >"$OUT/x3.264"
+SOCKD="$SOCKDIR/deep"; DGD="$OUT/deep.dgrams"; rm -f "$SOCKD" "$DGD"
+"$NAT" --in "unix:$SOCKD" --out "file:$DGD" --stats-timing 2>"$OUT/deep.mux.log" &
+DP=$!; track $DP
+for _ in $(seq 1 40); do [ -S "$SOCKD" ] && break; sleep 0.05; done
+$PY "$KIT/pathb/fake_shim.py" "$OUT/x3.264" 300 "$SOCKD" >"$OUT/deep.feed.log" 2>&1
+sleep 1.5; kill $DP 2>/dev/null; wait $DP 2>/dev/null
+PEAK=$(sed -n 's/.*peak-dg\/25ms=\([0-9]*\).*/\1/p' "$OUT/deep.mux.log" | head -1)
+WRITES=$(sed -n 's/^timing: writes=\([0-9]*\).*/\1/p' "$OUT/deep.mux.log" | head -1)
+grep -q "gate: behind (queue" "$OUT/deep.mux.log" && ok deep_queue_dropped yes \
+  || no deep_queue_dropped yes "no drop logged"
+[ "${WRITES:-0}" -ge 200 ] && ok deep_queue_streamed ">=200 datagrams" \
+  || no deep_queue_streamed ">=200 datagrams" "${WRITES:-0}"
+[ -n "${PEAK:-}" ] && [ "$PEAK" -le 59 ] && ok deep_queue_under_rate_ceiling "<=59 per 25 ms" \
+  || no deep_queue_under_rate_ceiling "<=59 per 25 ms" "${PEAK:-none}"
+echo "  writes=$WRITES peak-dg/25ms=$PEAK  $(grep -c 'gate: behind' "$OUT/deep.mux.log") drop(s)"
 
 cat > "$OUT/mcaster.py" <<'PY'
 import socket, struct, sys
@@ -383,7 +430,7 @@ grep -q "window elapsed" "$OUT/dark.log" && ok probe_reports_window yes || no pr
 echo "  elapsed ${EL}s, rc=$RC"
 
 echo; echo "############ T10: AU socket is 0777 ############"
-SOCK3="$OUT/sock.hyg"; rm -f "$SOCK3"
+SOCK3="$SOCKDIR/hyg"; rm -f "$SOCK3"
 "$NAT" --in "unix:$SOCK3" --out "file:$OUT/hyg.dgrams" 2>/dev/null &
 HP=$!; track $HP
 for _ in $(seq 1 40); do [ -S "$SOCK3" ] && break; sleep 0.05; done
@@ -466,7 +513,7 @@ if command -v container >/dev/null 2>&1 && [ -x "$UNIT" ]; then
     no unit_binary_under_unit_loader verified "$(tail -1 "$OUT/unitrun.log")"
   fi
 else
-  echo "  (container CLI unavailable -- skipping the unit-loader run)"
+  sk unit_binary_under_unit_loader "needs the T2 unit build and Apple's container CLI"
 fi
 
 # T13-T16 tested the retired shell controller (live_kit/pathb_ctl.sh).  That
@@ -491,7 +538,7 @@ open(sys.argv[2], "wb").write(d[nals[a-2][0]:nals[a][0]] + d[nals[a+1][0]:])
 PY
 gate_case(){   # $1=tag  $2..=extra muxer args
   local tag="$1"; shift
-  local sock="$OUT/sock.$tag" dg="$OUT/$tag.dgrams"
+  local sock="$SOCKDIR/$tag" dg="$OUT/$tag.dgrams"
   rm -f "$sock" "$dg"
   "$NAT" --in "unix:$sock" --out "file:$dg" "$@" 2>"$OUT/$tag.mux.log" &
   local mp=$!; track $mp
@@ -527,26 +574,27 @@ echo "############ T23-T25: MONITOR mode -- the port is taken on command #######
 # The resident supervisor's whole contract: own the AU socket from boot, take the
 # cluster's UDP port only when told, and give it back on command.  Nothing here
 # needs a phone: the control file is the interface.
-MON="$OUT/mon"
-rm -f "$MON".state "$MON".ctl "$MON".log "$MON".sock
+# The sender caps --ctl and --conn-state at 111 bytes, so they share the short dir.
+MON="$SOCKDIR/mon"; MONLOG="$OUT/mon.log"
+rm -f "$MON".state "$MON".ctl "$MON".sock "$MONLOG"
 "$NAT" --in "unix:$MON.sock" --dst "ff14::2:4%lo0" --port "$GPORT" --sport "$SPORT" \
-       --monitor --conn-state "$MON.state" --ctl "$MON.ctl" >"$MON.log" 2>&1 &
+       --monitor --conn-state "$MON.state" --ctl "$MON.ctl" >"$MONLOG" 2>&1 &
 MONPID=$!; track $MONPID
 sleep 0.6
-chk mon_starts_unbound "$(grep -q 'monitor: AU socket only' "$MON.log" && echo 1 || echo 0)" "no bind at start"
-chk mon_does_not_grab "$(grep -q 'bound source port' "$MON.log" && echo 0 || echo 1)" "port untouched"
+chk mon_starts_unbound "$(grep -q 'monitor: AU socket only' "$MONLOG" && echo 1 || echo 0)" "no bind at start"
+chk mon_does_not_grab "$(grep -q 'bound source port' "$MONLOG" && echo 0 || echo 1)" "port untouched"
 chk mon_state_unbound "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$MON.state" 2>/dev/null | grep -qx 0 && echo 1 || echo 0)" "bound=0"
 
 printf 'bind %s\n' "$SPORT" >"$MON.ctl"
 _i=0; while [ "$_i" -lt 40 ]; do
-  grep -q "PORT OURS" "$MON.log" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
-chk mon_bind_on_command "$(grep -q 'PORT OURS' "$MON.log" && echo 1 || echo 0)" "bound after 'bind'"
+  grep -q "PORT OURS" "$MONLOG" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
+chk mon_bind_on_command "$(grep -q 'PORT OURS' "$MONLOG" && echo 1 || echo 0)" "bound after 'bind'"
 chk mon_state_bound "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$MON.state" 2>/dev/null | grep -qx "$SPORT" && echo 1 || echo 0)" "bound=$SPORT"
 
 printf 'unbind\n' >"$MON.ctl"
 _i=0; while [ "$_i" -lt 40 ]; do
-  grep -q "port released" "$MON.log" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
-chk mon_unbind_on_command "$(grep -q 'port released' "$MON.log" && echo 1 || echo 0)" "released after 'unbind'"
+  grep -q "port released" "$MONLOG" 2>/dev/null && break; sleep 0.1; _i=$((_i+1)); done
+chk mon_unbind_on_command "$(grep -q 'port released' "$MONLOG" && echo 1 || echo 0)" "released after 'unbind'"
 chk mon_state_unbound_again "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$MON.state" 2>/dev/null | grep -qx 0 && echo 1 || echo 0)" "bound=0"
 # PROOF, not a log line: the port is actually free for somebody else.
 $PY - "$SPORT" <<'PYBIND' >/dev/null 2>&1 && ok mon_port_really_free yes || no mon_port_really_free yes "still bound"
@@ -557,8 +605,164 @@ s.close()
 PYBIND
 kill "$MONPID" 2>/dev/null
 
+echo; echo "############ T26: mib3wheel --selftest (HOST_TEST build) ############"
+if "$CC" -DHOST_TEST -O2 -Wall -Wextra -o "$OUT/mib3wheel.host" "$REPO/src/wheel/mib3wheel.c" \
+       2>"$OUT/wheel.build.log"; then
+  "$OUT/mib3wheel.host" --selftest >"$OUT/wheel.selftest.log" 2>&1
+  WRC=$?
+  sed 's/^/  /' "$OUT/wheel.selftest.log" | grep -E 'FAIL|TOTAL'
+  [ "$WRC" -eq 0 ] && ok wheel_selftest "rc=0" || no wheel_selftest "rc=0" "rc=$WRC"
+else
+  no wheel_selftest "rc=0" "$(tail -1 "$OUT/wheel.build.log")"
+fi
+
+echo; echo "############ T27: fake_shim.py retries a Python 2 socket.error ############"
+# The unit runs fake_shim.py on Python 2.7, where a refused connect raises
+# socket.error, which is not an OSError.  Python 3 cannot raise one, so model it:
+# the first two connects raise a socket.error outside the OSError tree.
+SOCKP="$SOCKDIR/py2err"; DGP="$OUT/py2err.dgrams"; rm -f "$SOCKP" "$DGP"
+"$NAT" --in "unix:$SOCKP" --out "file:$DGP" 2>"$OUT/py2err.mux.log" &
+PP=$!; track $PP
+for _ in $(seq 1 40); do [ -S "$SOCKP" ] && break; sleep 0.05; done
+$PY - "$KIT/pathb/fake_shim.py" "$FIX" 200 "$SOCKP" >"$OUT/py2err.feed.log" 2>&1 <<'PY'
+import runpy, socket, sys
+class Py2SocketError(Exception):
+    pass
+real = socket.socket
+class Refusing(real):
+    fails = 2
+    def connect(self, addr):
+        if Refusing.fails:
+            Refusing.fails -= 1
+            raise Py2SocketError(111, "Connection refused")
+        return real.connect(self, addr)
+socket.error = Py2SocketError
+socket.socket = Refusing
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+PY
+RC=$?
+kill $PP 2>/dev/null; wait $PP 2>/dev/null
+grep -q '^sent 50 frames' "$OUT/py2err.feed.log" && [ "$RC" = "0" ] \
+  && ok fake_shim_retries_socket_error "rc=0, sent 50 frames" \
+  || no fake_shim_retries_socket_error "rc=0, sent 50 frames" "rc=$RC $(tail -1 "$OUT/py2err.feed.log")"
+
+echo; echo "############ T28: a stalled record drops the connection, so 'unbind' still works ############"
+# A peer that sends a header and then stalls used to park the sender in read():
+# ctl_poll never ran, so the supervisor's 'unbind' was ignored and the cluster
+# could not be handed back.  Silence BETWEEN records is legitimate (a static map
+# sends nothing) and must not cost the connection.
+ST="$SOCKDIR/stall"; STLOG="$OUT/stall.log"; STPORT=43011
+rm -f "$ST".state "$ST".ctl "$ST".sock "$ST".sent "$STLOG"
+"$NAT" --in "unix:$ST.sock" --dst "ff14::2:4%lo0" --port 45997 --sport "$STPORT" \
+       --monitor --conn-state "$ST.state" --ctl "$ST.ctl" >"$STLOG" 2>&1 &
+STPID=$!; track $STPID
+for _ in $(seq 1 40); do [ -S "$ST.sock" ] && break; sleep 0.05; done
+printf 'bind %s\n' "$STPORT" >"$ST.ctl"
+_i=0; while [ "$_i" -lt 40 ]; do grep -q "PORT OURS" "$STLOG" && break; sleep 0.1; _i=$((_i+1)); done
+$PY - "$ST.sock" "$ST.sent" <<'PY' &
+import socket, struct, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+time.sleep(1.5)
+s.sendall(struct.pack("<IIQ", 0x4D334331, 1000, 1))
+open(sys.argv[2], "w").close()
+time.sleep(8)
+PY
+PEER=$!; track $PEER
+sleep 1.2
+chk stall_silence_between_records_kept "$(grep -q '^conn=1' "$ST.state" 2>/dev/null && echo 1 || echo 0)" \
+    "conn=1 after 1.2 s of silence" "$(cat "$ST.state" 2>/dev/null)"
+for _ in $(seq 1 40); do [ -e "$ST.sent" ] && break; sleep 0.05; done
+sleep 0.1
+printf 'unbind\n' >"$ST.ctl"
+_i=0; while [ "$_i" -lt 25 ]; do grep -q "port released" "$STLOG" && break; sleep 0.1; _i=$((_i+1)); done
+chk stall_unbind_honoured "$(grep -q 'port released' "$STLOG" && echo 1 || echo 0)" \
+    "released within 2.5 s of 'unbind'"
+chk stall_connection_dropped "$(kill -0 $PEER 2>/dev/null && grep -q '^conn=0' "$ST.state" && echo 1 || echo 0)" \
+    "conn=0 while the peer still holds its end" "$(cat "$ST.state" 2>/dev/null)"
+$PY - "$STPORT" <<'PYBIND' >/dev/null 2>&1 && ok stall_port_really_free yes || no stall_port_really_free yes "still bound"
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("::", int(sys.argv[1])))
+s.close()
+PYBIND
+kill $PEER $STPID 2>/dev/null; wait $STPID 2>/dev/null
+
+echo; echo "############ T29: START GATE -- an IDR before any SPS/PPS is not a start ############"
+# A connection starts with no parameter sets held.  An IDR record that arrives
+# before the shim's header record cannot be decoded, so it must not open the gate.
+SG="$SOCKDIR/idrfirst"; DGS="$OUT/idrfirst.dgrams"; rm -f "$SG" "$DGS"
+"$NAT" --in "unix:$SG" --out "file:$DGS" 2>"$OUT/idrfirst.mux.log" &
+SGP=$!; track $SGP
+for _ in $(seq 1 40); do [ -S "$SG" ] && break; sleep 0.05; done
+$PY - "$FIX" "$SG" >"$OUT/idrfirst.feed.log" 2>&1 <<'PY'
+import socket, struct, sys, time
+d = open(sys.argv[1], "rb").read()
+starts = [i for i in range(len(d) - 3) if d[i:i+3] == b"\x00\x00\x01"]
+nals = [d[a:b] for a, b in zip(starts, starts[1:] + [len(d)])]
+cfg, frames = {}, []
+for n in nals:
+    t = n[3] & 0x1F
+    if t in (7, 8):
+        cfg[t] = n
+    elif t in (1, 5):
+        frames.append((cfg.get(7, b"") + cfg.get(8, b""), n))
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[2])
+seq = [0]
+def rec(p):
+    seq[0] += 1
+    s.sendall(struct.pack("<IIQ", 0x4D334331, len(p), seq[0]) + p)
+rec(frames[0][1])                 # the IDR, slices only, before any header
+for c, au in frames:
+    rec(c)
+    rec(au)
+    time.sleep(0.02)
+s.close()
+PY
+sleep 1.0; kill $SGP 2>/dev/null; wait $SGP 2>/dev/null
+$PY "$TOOLS/pes_frames.py" "$DGS" --json >"$OUT/idrfirst.json" 2>/dev/null
+SGF=$($PY -c "import json;print(json.load(open('$OUT/idrfirst.json'))['frames'][0]['nal'])" 2>/dev/null)
+SGBARE=$($PY -c "
+import json
+f = json.load(open('$OUT/idrfirst.json'))['frames']
+print(sum(1 for x in f if 5 in x['nal'] and not (7 in x['nal'] and 8 in x['nal'])))" 2>/dev/null)
+echo "$SGF" | grep -q '7, 8.*5' && ok gate_waits_for_params "first PES carries SPS+PPS+IDR" \
+  || no gate_waits_for_params "first PES carries SPS+PPS+IDR" "${SGF:-no PES}"
+[ "${SGBARE:-x}" = "0" ] && ok gate_no_idr_without_params 0 || no gate_no_idr_without_params 0 "${SGBARE:-?}"
+
+echo; echo "############ T30: a 'bind' that found the port busy is retried ############"
+# The supervisor writes 'bind <port>' once.  If MS-S still holds the port the
+# bind fails; when the port frees, the same line must take it without an
+# intervening 'unbind'.
+BR="$SOCKDIR/rebind"; BRLOG="$OUT/rebind.log"; BRPORT=43013
+rm -f "$BR".state "$BR".ctl "$BR".sock "$BRLOG"
+$PY - "$BRPORT" <<'PY' &
+import socket, sys, time
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("::", int(sys.argv[1])))
+time.sleep(30)
+PY
+BRHOLD=$!; track $BRHOLD
+sleep 0.5
+"$NAT" --in "unix:$BR.sock" --dst "ff14::2:4%lo0" --port 45996 \
+       --monitor --conn-state "$BR.state" --ctl "$BR.ctl" >"$BRLOG" 2>&1 &
+BRPID=$!; track $BRPID
+for _ in $(seq 1 40); do [ -S "$BR.sock" ] && break; sleep 0.05; done
+printf 'bind %s\n' "$BRPORT" >"$BR.ctl"
+_i=0; while [ "$_i" -lt 30 ]; do grep -q "SPORT_BUSY" "$BRLOG" && break; sleep 0.1; _i=$((_i+1)); done
+chk rebind_first_attempt_busy "$(grep -q 'SPORT_BUSY' "$BRLOG" && echo 1 || echo 0)" "SPORT_BUSY while held"
+kill $BRHOLD 2>/dev/null; wait $BRHOLD 2>/dev/null
+_i=0; while [ "$_i" -lt 20 ]; do grep -q "PORT OURS" "$BRLOG" && break; sleep 0.1; _i=$((_i+1)); done
+chk rebind_same_line_succeeds "$(grep -q 'PORT OURS' "$BRLOG" && echo 1 || echo 0)" \
+    "PORT OURS within 2 s of the port freeing"
+chk rebind_state_bound "$(sed -n 's/.*bound=\([0-9]*\).*/\1/p' "$BR.state" 2>/dev/null | grep -qx "$BRPORT" && echo 1 || echo 0)" \
+    "bound=$BRPORT" "$(cat "$BR.state" 2>/dev/null)"
+kill $BRPID 2>/dev/null; wait $BRPID 2>/dev/null
+
 echo
 echo "============================================================"
-echo "Path B bench: PASS=$P FAIL=$F   (artifacts in $OUT)"
+echo "Path B bench: PASS=$P FAIL=$F SKIP=$S   (artifacts in $OUT)"
 echo "============================================================"
 [ "$F" -eq 0 ]

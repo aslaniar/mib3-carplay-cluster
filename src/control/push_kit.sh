@@ -25,9 +25,9 @@
 #   wheel_zoom.sh      steering-wheel zoom tap (optional, started if present)
 #   mib3wheel          its watcher binary
 #
-# The four binaries are md5-fenced against the sources in this tree, so a stale
-# build cannot reach the car: rebuild with `sh src/shim/build.sh` and
-# `sh tools/build.sh` if the pre-flight complains.
+# The three binaries are md5-fenced against bin/PINS, so a stale build cannot
+# reach the car: rebuild with `sh src/shim/build.sh` and `sh tools/build.sh`,
+# then `sh tools/pin.sh`, if the pre-flight complains.
 # ============================================================================
 set -e
 HOST="${1:-mib3}"
@@ -37,10 +37,10 @@ cd "$ROOT" || exit 1
 
 md5of() { if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
 
-# Field-proven builds (2026-11-02).  A pin is a binary that has run on the car.
-SHIM_WANT=dc723befb0cd4c636ca2aa2a8f2c3743
-SENDER_WANT=a9ab16d0bb8f29ed0ceda3f3ad69472d
-WHEEL_WANT=e689515fc20a701f0e84d62d9dcd6251
+pin() { sed -n "s/^$1=//p" bin/PINS 2>/dev/null | head -n1; }
+SHIM_WANT=$(pin SHIM_PIN); SENDER_WANT=$(pin SENDER_PIN); WHEEL_WANT=$(pin WHEEL_PIN)
+[ -n "$SHIM_WANT" ] && [ -n "$SENDER_WANT" ] && [ -n "$WHEEL_WANT" ] \
+  || { echo "[!] bin/PINS is missing or incomplete -- run sh tools/pin.sh"; exit 1; }
 
 checkpin() { # checkpin <path> <want>
   _got=$(md5of "$1" 2>/dev/null || echo missing)
@@ -54,7 +54,7 @@ checkpin bin/mib3shim.so             "$SHIM_WANT"
 checkpin bin/mib3clusterstream       "$SENDER_WANT"
 checkpin bin/mib3wheel               "$WHEEL_WANT"
 
-FILES="bin/mib3shim.so \
+FILES="bin/PINS bin/mib3shim.so \
   src/inject/inject.py src/inject/inject_shim.py src/inject/target_env.py src/inject/run_inject.sh \
   src/control/pathb_daemon.sh src/control/pathbctl src/control/deliver_ctl.sh \
   src/control/wheel_zoom.sh src/control/pathb/msport.py \

@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
 # run_inject.sh -- stage the shim and INSTALL ITS SEAMS into the RUNNING carplay.
-# Run ON THE UNIT, from the stick. No restart. No reboot. Re-runnable.
+# Run ON THE UNIT, from the staged kit. No restart. No reboot. Re-runnable.
 #
-#   sh /tmp/USB/PORT2/PART1/run_inject.sh
+#   sh /tmp/kit/run_inject.sh        (up.sh stages the kit and runs this)
 #
 # WHY: symbol interposition depends on load order, and a dlopen()'d library is
 # appended LAST, so every call still lands on the real LG/Apple function. So we
@@ -18,12 +18,14 @@
 # ============================================================================
 set -u
 STICK="$(cd "$(dirname "$0")" && pwd)"
-# The shim that MUST be staged: the field-proven Path B build (2026-11-02).
-# It reproduces byte-identical from mib3shim.c with `sh shim/build.sh`.
+# The shim that MUST be staged: the one bin/PINS names, staged beside this
+# script as PINS.  Build it with `sh src/shim/build.sh`, pin it with
+# `sh tools/pin.sh`.
 # The fence exists because a stale shim on this unit looks healthy from every
 # counter (2026-10-19: five builds injected into one carplay) -- so an md5
 # mismatch aborts before anything is persisted.
-WANT_MD5=dc723befb0cd4c636ca2aa2a8f2c3743
+WANT_MD5=$(sed -n 's/^SHIM_PIN=//p' "$STICK/PINS" 2>/dev/null | head -n1)
+[ -n "$WANT_MD5" ] || { echo "[!] no SHIM_PIN in $STICK/PINS -- run up.sh, which stages it"; exit 1; }
 # DELIBERATE VALIDATION ESCAPE: set MIB3_SHIP_NEW_MD5=<md5> to inject a build
 # that has not run on the car yet.  It must be stated, never implied.
 if [ -n "${MIB3_SHIP_NEW_MD5:-}" ]; then

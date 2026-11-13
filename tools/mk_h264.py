@@ -8,7 +8,10 @@ correct if it is the right size, so the file is genuinely decodable H.264 (not
 random bytes with a NAL header) -- the container proof then rests on a real
 bitstream, not a stub.
 
-usage: mk_h264.py [nAUs] [width] [height] > out.264
+usage: mk_h264.py [nAUs] [width] [height] [pcm|i16|i16x2] > out.264
+
+i16x2 codes each picture as two I_16x16 slices (first_mb_in_slice 0, then
+half the macroblocks), the shape that tests multi-slice AU splitting.
 """
 import sys
 
@@ -102,7 +105,7 @@ def make_idr(w, h, luma):
     bw.rbsp_trailing()
     return nal(0x65, bw.bytes())
 
-def make_idr_i16(w, h):
+def make_idr_i16(w, h, first_mb=0, nmb=None):
     """IDR I-slice using I_16x16 intra prediction with DC mode and NO residual.
 
     I_PCM (above) is legal H.264 but many hardware decoders do not implement it.
@@ -113,7 +116,7 @@ def make_idr_i16(w, h):
     so the decoded frame is a clean uniform grey -- unmistakable against 'no data'.
     """
     bw = BW()
-    bw.ue(0)          # first_mb_in_slice
+    bw.ue(first_mb)   # first_mb_in_slice
     bw.ue(2)          # slice_type = I
     bw.ue(0)          # pps_id
     bw.u(4, 0)        # frame_num
@@ -122,8 +125,8 @@ def make_idr_i16(w, h):
     bw.u(1, 0)        # dec_ref_pic_marking: long_term_reference_flag
     bw.se(0)          # slice_qp_delta
     bw.ue(1)          # disable_deblocking_filter_idc
-    mbw, mbh = w // 16, h // 16
-    for _ in range(mbh * mbw):
+    mbs = (w // 16) * (h // 16)
+    for _ in range(mbs - first_mb if nmb is None else nmb):
         bw.ue(1 + 2)  # mb_type: I_16x16, intra16x16PredMode=2 (DC), CBP 0/0
         bw.ue(0)      # intra_chroma_pred_mode = DC
         bw.se(0)      # mb_qp_delta (ALWAYS present for I_16x16)
@@ -142,7 +145,11 @@ def main():
     for i in range(n):
         out.write(sps)
         out.write(pps)
-        out.write(make_idr_i16(w, h) if mode == "i16" else make_idr(w, h, i))
+        if mode == "i16x2":
+            half = (w // 16) * (h // 16) // 2
+            out.write(make_idr_i16(w, h, 0, half) + make_idr_i16(w, h, half))
+        else:
+            out.write(make_idr_i16(w, h) if mode == "i16" else make_idr(w, h, i))
     out.flush()
 
 if __name__ == "__main__":

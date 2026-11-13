@@ -14,6 +14,8 @@
 #       tsid 100, PMT pid 1000, PCR/ES pid 17, stream_type 0x1b, PTS monotone,
 #       continuity counters continuous, CRC32 correct
 #   T6  byte-exact round trip: reassembled ES == input ES
+#   T6b the same for AUs shorter than one TS packet (adaptation-field stuffing)
+#   T6c a two-slice picture is muxed as one access unit
 #   T7  tshark independently dissects RTP/PT=33 + MPEG-2 PAT/PMT + AVC (if tshark)
 #   T8  unix mode: the shim's helper protocol (16-byte header, 1 AU per message)
 #   T9  the aarch64 binary runs under the unit's own ld-2.23.so in an Apple
@@ -31,10 +33,14 @@ LLD=/opt/homebrew/opt/lld/bin/ld.lld
 READELF=/opt/homebrew/opt/llvm/bin/llvm-readelf
 LIBC="$ROOT/lib64/libc.so.6"
 mkdir -p "$OUT"
+# AF_UNIX paths are capped at 104 bytes on macOS, so the socket never lives under $OUT.
+SOCKDIR="$(mktemp -d /tmp/mib3.XXXXXX)"
+trap 'rm -rf "$SOCKDIR"' EXIT INT TERM
 
-P=0; F=0
+P=0; F=0; S=0
 ok(){ echo "PBENCH $1 exp=$2 got=$2 PASS"; P=$((P+1)); }
 no(){ echo "PBENCH $1 exp=$2 got=$3 FAIL"; F=$((F+1)); }
+sk(){ echo "PBENCH $1 SKIP ($2)"; S=$((S+1)); }
 
 echo "############ T1: native build ############"
 if cc -O2 -Wall -Wextra -o "$OUT/mib3clusterstream.native" "$REPO/src/sender/mib3clusterstream.c" 2>"$OUT/native.build.log"; then
@@ -45,7 +51,9 @@ fi
 NAT="$OUT/mib3clusterstream.native"
 
 echo; echo "############ T2: unit build (aarch64 + unit glibc) ############"
-if "$CC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
+if [ ! -d "$ROOT" ]; then
+  sk unit_build "R8830L_ROOTFS not present: the aarch64/unit-glibc leg needs the firmware's lib64, which is not distributed with this repository"
+elif "$CC" --target=aarch64-linux-gnu -DMIB3_UNIT_AARCH64 -O2 -nostdlib -fPIE \
         -fuse-ld="$LLD" -pie -Wl,-e,_start \
         -Wl,--dynamic-linker,/lib64/ld-linux-aarch64.so.1 \
         -o "$OUT/mib3clusterstream.unit" "$REPO/src/sender/mib3clusterstream.c" "$LIBC" \
@@ -86,6 +94,30 @@ fi
 if cmp -s "$OUT/frames.264" "$OUT/roundtrip.264"; then ok es_roundtrip_byte_exact exact
 else no es_roundtrip_byte_exact exact "differ"; fi
 
+echo; echo "############ T6b: an AU shorter than its first TS packet round-trips exact ############"
+# 16x16 I_16x16 frames: SPS+PPS+IDR is 27 bytes, so the whole AU sits in the
+# first packet and the rest of that packet must be adaptation-field stuffing.
+python3 "$REPO/tools/mk_h264.py" 6 16 16 i16 > "$OUT/small.264"
+SMALL_MAX=$(python3 -c "import sys;d=open(sys.argv[1],'rb').read();print(max(len(a)+5 for a in d.split(b'\x00\x00\x00\x01\x67') if a))" "$OUT/small.264")
+[ "$SMALL_MAX" -lt 160 ] && ok small_au_fixture "AU<160B" || no small_au_fixture "AU<160B" "${SMALL_MAX}B"
+"$NAT" --in "$OUT/small.264" --out "file:$OUT/small.dgrams" --fps 30 2>"$OUT/small.mux.log"
+if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/small.dgrams" --extract "$OUT/small.rt.264" \
+        --expect-frames 6 --quiet >"$OUT/small.verify" 2>&1 && cmp -s "$OUT/small.264" "$OUT/small.rt.264"; then
+  ok small_au_roundtrip_byte_exact exact
+else
+  no small_au_roundtrip_byte_exact exact "$(tail -1 "$OUT/small.verify"); $(wc -c < "$OUT/small.264" | tr -d ' ')B in, $(wc -c < "$OUT/small.rt.264" 2>/dev/null | tr -d ' ')B out"
+fi
+
+echo; echo "############ T6c: a two-slice picture is ONE access unit ############"
+python3 "$REPO/tools/mk_h264.py" 6 64 32 i16x2 > "$OUT/twoslice.264"
+"$NAT" --in "$OUT/twoslice.264" --out "file:$OUT/twoslice.dgrams" --fps 30 2>"$OUT/twoslice.mux.log"
+if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/twoslice.dgrams" --extract "$OUT/twoslice.rt.264" \
+        --expect-frames 6 --quiet >"$OUT/twoslice.verify" 2>&1 && cmp -s "$OUT/twoslice.264" "$OUT/twoslice.rt.264"; then
+  ok two_slice_pictures_one_au_each "6 AUs exact"
+else
+  no two_slice_pictures_one_au_each "6 AUs exact" "$(tail -1 "$OUT/twoslice.verify")"
+fi
+
 echo; echo "############ T7: tshark independent dissection ############"
 TSHARK=/Applications/Wireshark.app/Contents/MacOS/tshark
 if [ -x "$TSHARK" ]; then
@@ -96,11 +128,11 @@ if [ -x "$TSHARK" ]; then
   "$TSHARK" -r "$OUT/stream.pcap" -d udp.port==42800,rtp -c 1 -T fields -e rtp.ssrc 2>/dev/null \
     | grep -q "0x000186a0" && ok tshark_ssrc_100000 0x000186a0 || no tshark_ssrc_100000 0x000186a0 "absent"
 else
-  echo "  (tshark not found -- skipping; not a failure)"
+  sk tshark_dissection "tshark not found"
 fi
 
 echo; echo "############ T8: unix (helper-protocol) input mode ############"
-python3 - "$OUT/frames.264" "$OUT/fake_shim.sock" <<'PY' &
+python3 - "$OUT/frames.264" "$SOCKDIR/fake_shim.sock" <<'PY' &
 import sys, socket, struct, time, os
 frames=open(sys.argv[1],'rb').read()
 # re-split into AUs the same way (4-byte start codes, SPS+PPS+IDR per AU)
@@ -123,15 +155,17 @@ PY
 PY_PEER=$!
 # The muxer RE-ACCEPTS forever since 2026-10-26 (a shim reconnect must not kill the
 # delivery), so run it in the background and stop it once the peer is done.
-"$NAT" --in "unix:$OUT/fake_shim.sock" --out "file:$OUT/stream_unix.dgrams" >/dev/null 2>"$OUT/unix.log" &
+"$NAT" --in "unix:$SOCKDIR/fake_shim.sock" --out "file:$OUT/stream_unix.dgrams" >/dev/null 2>"$OUT/unix.log" &
 MUXPID=$!
 wait $PY_PEER 2>/dev/null
 sleep 0.6
 kill $MUXPID 2>/dev/null; wait $MUXPID 2>/dev/null
-if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/stream_unix.dgrams" --quiet >/dev/null 2>&1; then
-  ok unix_helper_protocol verified
+# frames.264 holds 6 IDR AUs and the peer sends one message per AU.
+if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/stream_unix.dgrams" --expect-frames 6 --quiet \
+        >"$OUT/unix.verify" 2>&1; then
+  ok unix_helper_protocol "verified, 6 AUs"
 else
-  no unix_helper_protocol verified "$(tail -1 "$OUT/unix.log")"
+  no unix_helper_protocol "verified, 6 AUs" "$(tail -1 "$OUT/unix.verify")"
 fi
 
 echo; echo "############ T9: the aarch64 build under the unit's own ld-2.23.so ############"
@@ -152,25 +186,27 @@ if command -v container >/dev/null 2>&1 && [ -x "$OUT/mib3clusterstream.unit" ];
   fi
   tr -d '\r' < "$OUT/container.log" | grep -E 'access units|datagrams|rc=' | sed 's/^/  /'
 else
-  echo "  (container CLI or unit binary unavailable -- skipping T9)"
+  sk unit_binary_runs_under_unit_loader "needs the T2 unit build and Apple's container CLI"
 fi
 
 echo; echo "############ T10: --probe mode (blind capture of an existing sender) ############"
 "$NAT" --in "$OUT/frames.264" --dst "ff14::2:4%lo0" --port 45888 --fps 60 --loop >/dev/null 2>&1 &
 SP=$!
 sleep 0.6
-"$NAT" --probe --dst "ff14::2:4%lo0" --port 45888 --probe-count 12 --out "file:$OUT/probe.bin" \
-      >/dev/null 2>"$OUT/probe.log"
+# --probe-secs bounds the wait: with nothing arriving on the group (a sandbox
+# that blocks multicast loopback) the probe otherwise never returns.
+"$NAT" --probe --dst "ff14::2:4%lo0" --port 45888 --probe-count 12 --probe-secs 5 \
+      --out "file:$OUT/probe.bin" >/dev/null 2>"$OUT/probe.log"
 kill $SP 2>/dev/null; wait $SP 2>/dev/null
 if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/probe.bin" --quiet --no-psi >/dev/null 2>&1; then
   ok probe_capture verified
 else
-  no probe_capture verified "$(tail -1 "$OUT/probe.log")"
+  no probe_capture verified "$(grep -o 'datagrams=[0-9]*' "$OUT/probe.log" | head -1) of 12 in 5 s on ff14::2:4%lo0 (multicast loopback blocked?)"
 fi
 sed 's/^/  /' "$OUT/probe.log"
 
 echo
 echo "============================================================"
-echo "Path B bench: PASS=$P FAIL=$F   (artifacts in $OUT)"
+echo "Path B bench: PASS=$P FAIL=$F SKIP=$S   (artifacts in $OUT)"
 echo "============================================================"
 [ "$F" -eq 0 ]
