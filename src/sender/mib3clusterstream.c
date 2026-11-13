@@ -1181,20 +1181,6 @@ static long pending_bytes(int fd)
     return (long)avail;
 }
 
-/* ------------------------------------------------------------- keepalive -----
- * The phone STOPS SENDING when its picture is static.  multi-screen-server never
- * does: it re-encodes the Weston surface every 100 ms regardless, so on the old
- * path the ECU never sees silence.  Measured on the car 2026-10-27: the phone's
- * map rendered on the cluster for ~1 s, the phone went quiet, and the ECU's map
- * app restarted into "Starting map display..." and stayed there.
- *
- * So: when no AU has arrived for `ka_ms`, re-send the last frame that carries a
- * REFERENCE slice (nal_ref_idc != 0).  Re-decoding the same reference frame is
- * harmless -- it reproduces the same picture -- and it keeps the receiver's
- * pipeline fed so it does not decide the stream died.  Non-reference (B) frames
- * are never replayed: they depend on pictures that may no longer be there.
- */
-
 static u8 *avcc_to_annexb(const u8 *d, usize_t n, usize_t *outlen)
 {
     usize_t cap = n + 1024, o = 0, i = 0;
@@ -1366,28 +1352,13 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
     return 0;
 }
 
-/* ------------------------------------------------------- output pacer / fill ---
+/* ------------------------------------------------------------- output pacer ---
  * The phone does not send a stream, it sends bursts: in 41 s of captured stream,
  * 226 frames 16 ms apart, 53 stamped inside one millisecond, and 99 stalls over
  * 34 ms including 600-840 ms holes.  The car's own stream has none of it --
  * multi-screen-server re-encodes on a ~100 ms clock for as long as it is up --
  * and a starved, desynced receiver is exactly what "draws a frame, then falls
- * back to Starting map display" looks like.
- *
- *   --pace-ms N   (default 10) floor between datagram groups, so a burst leaves
- *                 as a trickle instead of a spike
- *   --ka-ms N     (default 0 = off) idle fill: re-send the last reference frame
- *                 after N ms of silence
- *
- * Nothing is dropped and no rate is reduced: same AUs, same order, same average,
- * only the delivery shape changes.
- *
- * IDLE FILL IS OFF BY DEFAULT, measured: with pacing and fill the wire had zero
- * gaps over 150 ms and 429 byte-identical repeats, and the cluster still fell
- * back after ~0.5 s -- while a repeat re-uses its frame_num, which a strict
- * decoder latches as an error.  The real starvation was the AU boundary above,
- * not the silence.  The fill stays behind --ka-ms so a later session can still
- * attribute with it. */
+ * back to Starting map display" looks like. */
 /* THE QUEUE IS THE JITTER BUFFER (2026-10-30).  8 entries was a latency bound
  * for a pass-through pacer; it is not a buffer.  A jitter buffer has to hold
  * the phone's worst measured hole (486 ms, ~9 AUs at 17 fps) plus its bursts,
@@ -1408,8 +1379,7 @@ static int probe(const char *dst, int port, const char *out, int count, int seco
 #define LAT_CAP_MS 400u
 
 typedef struct {
-    Mux *m; u64 t0; u64 frame; u64 last_emit;
-    u8 *ref; usize_t ref_len, ref_cap;
+    Mux *m; u64 frame;
     u64 step;                 /* the COMMITTED PTS step per AU (90 kHz) */
     u64 step_ewma;            /* the sensor: arrival-interval EWMA (ms*90) */
     u64 step_commit_ms;       /* when the sensor was last committed to step */
@@ -1420,21 +1390,6 @@ typedef struct {
 /* (car-declared helper removed 2026-10-30: the release interval is now a
  * time-window rate measurement inside the clock block, not an average of gaps --
  * see "ARRIVAL RATE METER" there for why the gap average was 15% too fast.) */
-
-static int au_is_ref(const u8 *d, usize_t n){
-    usize_t i = 0;
-    while (i + 3 <= n) {
-        if (d[i] == 0 && d[i+1] == 0 && d[i+2] == 1) {
-            usize_t h = i + 3;
-            if (h < n) {
-                u8 b = d[h]; int t = b & 0x1F;
-                if ((t == 1 || t == 5) && ((b >> 5) & 3) != 0) return 1;
-            }
-            i = h;
-        } else i++;
-    }
-    return 0;
-}
 
 /* ---------------------------------------------------------------- CADENCE
  * What we could not see before: RHYTHM, the gap between one emission and the
@@ -1611,14 +1566,6 @@ static void pace_emit(Pace *p, const u8 *au, usize_t len)
      * that muxes without pace_emit (file mode) leaves it 0, so it writes
      * immediately exactly as before. */
     p->frame++;
-    if (au_is_ref(au, len)) {                 /* remember a fill frame */
-        if (len > p->ref_cap) {
-            u8 *nb = (u8 *)realloc(p->ref, len);
-            if (nb) { p->ref = nb; p->ref_cap = len; }
-        }
-        if (len <= p->ref_cap) { memcpy(p->ref, au, len); p->ref_len = len; }
-    }
-    p->last_emit = now_ms();
 }
 
 /* -------------------------------------------------------------------- main */
@@ -1755,7 +1702,6 @@ int mib3_run(int argc, char **argv)
     const char *in = "-", *dst = DEF_DST, *src = 0, *out = 0, *infmt = "annexb";
     int port = DEF_PORT, loop = 0, realtime = 0, fps = 30, do_probe = 0, probe_n = -1;
     int probe_secs = 0, probe_video = 0;
-    int pace_ms = 10, ka_ms = 0;   /* output shape: see the pacer block */
     int jit_ms = 300;              /* jitter buffer depth (the isochronous clock);
                                   * 2026-10-30: 500 -> 300 ms.  With the pacer
                                   * fixed the wire is smooth, and buffer depth is
@@ -1806,10 +1752,8 @@ int mib3_run(int argc, char **argv)
         else if (!strcmp(a, "--probe-count") && v) { probe_n = atoi(v); i++; }  /* -1 = unlimited (default) */
         else if (!strcmp(a, "--probe-secs") && v) { probe_secs = atoi(v); i++; }
         else if (!strcmp(a, "--probe-video-only")) probe_video = 1;
-        else if (!strcmp(a, "--pace-ms") && v) { pace_ms = atoi(v); i++; }
-        else if (!strcmp(a, "--no-pace")) pace_ms = 0;
-        else if (!strcmp(a, "--ka-ms") && v) { ka_ms = atoi(v); i++; }
-        else if (!strcmp(a, "--no-ka")) ka_ms = 0;
+        /* Retired: tests/run_pathb.sh still passes it, so accept and ignore. */
+        else if (!strcmp(a, "--pace-ms") && v) i++;
         /* Record the monotonic timestamp of every write() and report the
          * inter-datagram gap distribution at exit.  The capture format has no
          * timestamps, so this is the ONLY way to prove the wire is continuous. */
@@ -1977,8 +1921,7 @@ int mib3_run(int argc, char **argv)
          * for the rest of the boot, so re-accept forever.  `seq` and `t0_ms`
          * live in Mux and therefore continue across connections: a reset there
          * would look like a new stream to the receiver mid-flight. */
-        say("pacer: floor="); say_int("", pace_ms); say(" ms/group  idle-fill=");
-        say_int("", ka_ms); say(" ms  jitter-buffer=ADAPTIVE (start ");
+        say("pacer: jitter-buffer=ADAPTIVE (start ");
         say_int("", jit_ms); say(" ms, grows on starvation, shrinks when idle)");
         say("  intra-frame release=ON (loop/ppoll, byte-proportional)\n");
         say("  spread-pct="); say_int("", (long)g_spread_pct);
@@ -2023,14 +1966,14 @@ int mib3_run(int argc, char **argv)
             streaming = 0;
             say("conn open  frame=");   say_int("", (long)frame);
 
-            /* ---- PACER + IDLE FILL (see the block above) ---------------------- */
+            /* ---- PACER (see the block above) ---------------------------------- */
             u8 *qb[QCAP]; usize_t ql[QCAP]; usize_t qcap[QCAP];
             u64 qarr[QCAP];      /* arrival ms per queued AU (latency measurement) */
             int qh = 0, qn = 0;         /* ring head + count: never shift pointers */
             for (int k = 0; k < QCAP; k++) { qb[k] = 0; ql[k] = 0; qcap[k] = 0; }
             Pace pc; memset(&pc, 0, sizeof pc);
-            pc.m = &m; pc.t0 = m.t0_ms; pc.frame = frame;
-            u64 next_emit = 0, ka_count = 0, gaps = 0, last_arrive = 0;
+            pc.m = &m; pc.frame = frame;
+            u64 next_emit = 0, gaps = 0, last_arrive = 0;
             /* cadence window state (2026-11-02): see the CADENCE block */
             int  iv_band = 0;              /* consecutive out-of-band rate samples */
             u64 cad_win_ms = 0;
@@ -2616,7 +2559,6 @@ int mib3_run(int argc, char **argv)
               if (drained) { say("  pacer: drained-at-close="); say_int("", drained); }
               g_tm.ignore = 0;
             }
-            say("  pacer: idle-fills="); say_int("", (long)ka_count);
             say("  arrival-gaps>250ms="); say_int("", (long)gaps);
             /* The numbers that say whether the emulation is working.  starved
              * ticks and depth-drains measure the isochronous clock; spread-
@@ -2633,7 +2575,6 @@ int mib3_run(int argc, char **argv)
             timing_report();      /* --stats-timing: this session's wire shape */
             timing_reset();
             { int k2; for (k2 = 0; k2 < QCAP; k2++) { free(qb[k2]); } }
-            free(pc.ref); pc.ref = 0; pc.ref_len = pc.ref_cap = 0;
             if (held || backlog) {
                 say("  gate: held=");   say_int("", (long)held);
                 say("  backlog drains="); say_int("", (long)backlog);
