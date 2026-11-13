@@ -96,9 +96,12 @@ injects the shim into the running CarPlay, and starts the supervisor. It is safe
 
 ```sh
 sh /tmp/kit/pathbctl status     # what the supervisor is doing, and why
-sh /tmp/kit/pathbctl release    # hand the cluster back to the car
+sh /tmp/kit/pathbctl release    # hand the cluster back until this phone session ends
+sh /tmp/kit/pathbctl pause      # stay off until `pathbctl resume`
 sh /tmp/kit/pathbctl stop       # stop the supervisor
 ```
+
+The supervisor hands the cluster back to the car on its own when the phone stops streaming, or when frames arrive but nothing reaches the cluster.
 
 ## Test on the desk
 
