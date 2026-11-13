@@ -38,6 +38,7 @@
 #        still beats discovery
 #   D21  `stop` (daemon and CLI) during a slow hand-back that fails once waits
 #        for the trap's retry: the order log ends with back
+#   D22  ACTIVE, frames keep arriving but none is sent -> release, logged as dark
 #
 # Usage: sh tests/run_pathb_daemon.sh
 # ============================================================================
@@ -486,6 +487,19 @@ for _how in daemon cli; do
   chk "d21_${_how}_stop_clears_parked" "$( [ -f "$TMP/pathb_nav.parked" ] && echo 0 || echo 1 )" "no parked marker left"
   reset_all
 done
+
+echo
+echo "############ D22: frames arrive but nothing is sent -> the cluster is dark ############"
+dstart; phone_on
+wait_state ACTIVE 5000 >/dev/null 2>&1
+sleep 1.5
+chk d22_healthy_stays_active "$( [ "$(dstate)" = "ACTIVE" ] && echo 1 || echo 0 )" "ACTIVE while frames are sent ($(dstate))"
+: >"$TMP/no_emit"
+wait_line "^back$" 5000
+_b=$(first_line "^bind " "$TMP/order.log"); _k=$(first_line "^back$" "$TMP/order.log")
+chk d22_dark_handed_back "$( [ -n "$_b" ] && [ -n "$_k" ] && [ "$_b" -lt "$_k" ] && echo 1 || echo 0 )" "bind ($_b) < back ($_k)"
+chk d22_dark_logged "$( has x 'cluster is dark' "$TMP/pathb_daemon.log" )" "logged why"
+reset_all
 
 echo
 echo "############ D16: a one-shot tick starts from clean state ############"

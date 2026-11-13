@@ -36,7 +36,8 @@
 #   TAKEOVER  owner=nobody (transient): park the nav element, bind the port the
 #             instant the kernel says it is free, wait for one emitted AU.
 #   ACTIVE    owner=us.  When `au` stops advancing for GRACE the session is over,
-#             however healthy the socket still looks.
+#             however healthy the socket still looks.  When `au` advances but
+#             `out` does not for GRACE, the cluster is dark: release.
 #   RELEASE   owner=nobody (transient): unbind (which frees the port), prove it in
 #             the kernel, hand the nav element back, confirm.
 #   DEGRADED  a step did not complete: retry the release on a backoff, never arm.
@@ -140,6 +141,7 @@ DISC_AT=0
 ORA_AT=0
 S_CONN=0; S_READY=0; S_BOUND=0; S_AU=0; S_OUT=0; S_MS=0
 LAST_AU=-1; LAST_FLOW=0; FLOW_SINCE=0; DEAD_SINCE=0; NEXT_RETRY=0; RETRY_AT=0; CONN_SINCE=0
+LAST_OUT=0; DARK_SINCE=0
 HOLD=0        # 1 after an operator release, until the phone session it interrupted ends
 
 # ------------------------------------------------------------------ plumbing
@@ -686,7 +688,7 @@ do_tick(){
           # Discovery is retried by prepare_tick; we arm as soon as it lands.
           set_state TAKEOVER "frames-flowing"
           if takeover; then
-            set_state ACTIVE "lease-taken"; DEAD_SINCE=0; LAST_AU=$S_AU
+            set_state ACTIVE "lease-taken"; DEAD_SINCE=0; LAST_AU=$S_AU; LAST_OUT=$S_OUT; DARK_SINCE=0
           else
             NEXT_RETRY=$(( $(now_ms) + RETRY ))
             release "takeover-failed"; _r=$?
@@ -696,6 +698,8 @@ do_tick(){
         fi
       fi ;;
     ACTIVE)
+      _sent=0
+      if [ "$S_OUT" != "$LAST_OUT" ]; then _sent=1; LAST_OUT=$S_OUT; DARK_SINCE=0; fi
       if [ "$S_AU" = "$LAST_AU" ]; then
         [ "$DEAD_SINCE" = "0" ] && DEAD_SINCE=$_now
         if [ $(( _now - DEAD_SINCE )) -ge "$GRACE" ]; then
@@ -715,6 +719,18 @@ do_tick(){
           [ "$_gap" -ge 2000 ] && log "tolerated a ${_gap}ms silence (phone paused; not a disconnect)"
         fi
         LAST_AU=$S_AU; DEAD_SINCE=0
+        # FRAMES IN, NOTHING OUT, IS A DARK CLUSTER: the nav is parked and our wire
+        # is silent.  The clock starts only on a tick where `au` advanced and `out`
+        # did not, and any emit stops it, so a jitter-buffer lag or a pause cannot.
+        if [ "$_sent" = "0" ]; then
+          [ "$DARK_SINCE" = "0" ] && DARK_SINCE=$_now
+          if [ $(( _now - DARK_SINCE )) -ge "$GRACE" ]; then
+            log "the cluster is dark: frames keep arriving (au=$S_AU) but nothing was sent for $(( _now - DARK_SINCE ))ms (out=$S_OUT)"
+            release "dark"; _r=$?
+            settle "cluster-dark" "$_r"
+            NEXT_RETRY=$(( $(now_ms) + RETRY )); FLOW_SINCE=0; DEAD_SINCE=0; DARK_SINCE=0
+          fi
+        fi
       fi
       if [ "$ST" = "ACTIVE" ]; then
         if ! sender_alive; then
