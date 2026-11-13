@@ -1002,17 +1002,19 @@ static void mux_au(Mux *m, const u8 *au, int len, u64 pts90k)
 }
 
 /* ------------------------------------------------------- Annex-B AU splitter */
-/* ISO 14496-10 7.4.1.2.4: a new AU begins at an AUD, or at any NAL that follows
- * a VCL NAL in the current AU.  SPS/PPS preceding the first slice belong to the
- * AU being opened, so they must not split it.  (The socket input needs none of
- * this: there each message is already exactly one AU.) */
-static int nal_is_new_au(u8 h, int have_slice)
+/* ISO 14496-10 7.4.1.2.4: a new AU begins at an AUD, at an SEI/SPS/PPS that
+ * follows a VCL NAL in the current AU, or at the first slice of the next
+ * picture (first_mb_in_slice == 0).  The other slices of a multi-slice picture
+ * stay in its AU, and SPS/PPS preceding the first slice belong to the AU being
+ * opened.  (The socket input needs none of this: there each message is already
+ * exactly one AU.) */
+static int nal_is_new_au(u8 h, int first_mb_zero, int have_slice)
 {
     int t = h & 0x1F;
     if (t == 9) return 1;
     if (!have_slice) return 0;
     if (t == 7 || t == 8 || t == 6) return 1;
-    if (t == 1 || t == 5) return 1;
+    if (t == 1 || t == 5) return first_mb_zero;
     return 0;
 }
 
@@ -1029,16 +1031,16 @@ static int split_annexb(const u8 *d, usize_t n, const u8 **aus, int *alen, int m
             int hdr = (int)(i + 3);
             if (hdr < (int)n) {
                 u8 h = d[hdr];
+                int vcl = (h & 0x1F) == 1 || (h & 0x1F) == 5;
+                /* first_mb_in_slice is ue(v): a leading 1 bit means 0 */
+                int mb0 = vcl && (usize_t)hdr + 1 < n && (d[hdr+1] & 0x80);
                 if (!started) { au_start = sc; started = 1; }
-                else if (nal_is_new_au(h, have_slice)) {
+                else if (nal_is_new_au(h, mb0, have_slice)) {
                     usize_t sz = sc - au_start;
                     if (sz && naus < maxau) { aus[naus] = d + au_start; alen[naus] = (int)sz; naus++; }
                     au_start = sc; have_slice = 0;
                 }
-                if ((h & 0x1F) == 1 || (h & 0x1F) == 5) {
-                    int n2 = (int)(n - (usize_t)hdr - 1);
-                    if (n2 > 0 && (d[hdr+1] & 0x80)) have_slice = 1;
-                }
+                if (vcl) have_slice = 1;
             }
             i += 3;
         } else i++;

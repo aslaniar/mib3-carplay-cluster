@@ -15,6 +15,7 @@
 #       continuity counters continuous, CRC32 correct
 #   T6  byte-exact round trip: reassembled ES == input ES
 #   T6b the same for AUs shorter than one TS packet (adaptation-field stuffing)
+#   T6c a two-slice picture is muxed as one access unit
 #   T7  tshark independently dissects RTP/PT=33 + MPEG-2 PAT/PMT + AVC (if tshark)
 #   T8  unix mode: the shim's helper protocol (16-byte header, 1 AU per message)
 #   T9  the aarch64 binary runs under the unit's own ld-2.23.so in an Apple
@@ -99,6 +100,16 @@ if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/small.dgrams" --extract "$OUT/s
   ok small_au_roundtrip_byte_exact exact
 else
   no small_au_roundtrip_byte_exact exact "$(tail -1 "$OUT/small.verify"); $(wc -c < "$OUT/small.264" | tr -d ' ')B in, $(wc -c < "$OUT/small.rt.264" 2>/dev/null | tr -d ' ')B out"
+fi
+
+echo; echo "############ T6c: a two-slice picture is ONE access unit ############"
+python3 "$REPO/tools/mk_h264.py" 6 64 32 i16x2 > "$OUT/twoslice.264"
+"$NAT" --in "$OUT/twoslice.264" --out "file:$OUT/twoslice.dgrams" --fps 30 2>"$OUT/twoslice.mux.log"
+if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/twoslice.dgrams" --extract "$OUT/twoslice.rt.264" \
+        --expect-frames 6 --quiet >"$OUT/twoslice.verify" 2>&1 && cmp -s "$OUT/twoslice.264" "$OUT/twoslice.rt.264"; then
+  ok two_slice_pictures_one_au_each "6 AUs exact"
+else
+  no two_slice_pictures_one_au_each "6 AUs exact" "$(tail -1 "$OUT/twoslice.verify")"
 fi
 
 echo; echo "############ T7: tshark independent dissection ############"
