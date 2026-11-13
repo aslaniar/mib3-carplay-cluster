@@ -14,6 +14,7 @@
 #       tsid 100, PMT pid 1000, PCR/ES pid 17, stream_type 0x1b, PTS monotone,
 #       continuity counters continuous, CRC32 correct
 #   T6  byte-exact round trip: reassembled ES == input ES
+#   T6b the same for AUs shorter than one TS packet (adaptation-field stuffing)
 #   T7  tshark independently dissects RTP/PT=33 + MPEG-2 PAT/PMT + AVC (if tshark)
 #   T8  unix mode: the shim's helper protocol (16-byte header, 1 AU per message)
 #   T9  the aarch64 binary runs under the unit's own ld-2.23.so in an Apple
@@ -85,6 +86,20 @@ else
 fi
 if cmp -s "$OUT/frames.264" "$OUT/roundtrip.264"; then ok es_roundtrip_byte_exact exact
 else no es_roundtrip_byte_exact exact "differ"; fi
+
+echo; echo "############ T6b: an AU shorter than its first TS packet round-trips exact ############"
+# 16x16 I_16x16 frames: SPS+PPS+IDR is 27 bytes, so the whole AU sits in the
+# first packet and the rest of that packet must be adaptation-field stuffing.
+python3 "$REPO/tools/mk_h264.py" 6 16 16 i16 > "$OUT/small.264"
+SMALL_MAX=$(python3 -c "import sys;d=open(sys.argv[1],'rb').read();print(max(len(a)+5 for a in d.split(b'\x00\x00\x00\x01\x67') if a))" "$OUT/small.264")
+[ "$SMALL_MAX" -lt 160 ] && ok small_au_fixture "AU<160B" || no small_au_fixture "AU<160B" "${SMALL_MAX}B"
+"$NAT" --in "$OUT/small.264" --out "file:$OUT/small.dgrams" --fps 30 2>"$OUT/small.mux.log"
+if python3 "$REPO/tools/cluster_rtp_ts.py" "$OUT/small.dgrams" --extract "$OUT/small.rt.264" \
+        --expect-frames 6 --quiet >"$OUT/small.verify" 2>&1 && cmp -s "$OUT/small.264" "$OUT/small.rt.264"; then
+  ok small_au_roundtrip_byte_exact exact
+else
+  no small_au_roundtrip_byte_exact exact "$(tail -1 "$OUT/small.verify"); $(wc -c < "$OUT/small.264" | tr -d ' ')B in, $(wc -c < "$OUT/small.rt.264" 2>/dev/null | tr -d ' ')B out"
+fi
 
 echo; echo "############ T7: tshark independent dissection ############"
 TSHARK=/Applications/Wireshark.app/Contents/MacOS/tshark

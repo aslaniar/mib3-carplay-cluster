@@ -445,7 +445,12 @@ static void pack_ts(u8 *o, int pid, int pusi, int cc,
     o[1] = (u8)((pusi ? 0x40 : 0x00) | ((pid >> 8) & 0x1F));
     o[2] = (u8)(pid & 0xFF);
 
-    int afb = want_pcr ? 7 : (rai ? 1 : (183 - plen));
+    /* The payload must end at byte 188: whatever it does not fill is stuffing
+     * inside the adaptation field, never 0xFF after the payload, which a
+     * demuxer would read as part of the PES. */
+    int afb = 183 - plen;
+    int afb_min = want_pcr ? 7 : (rai ? 1 : 0);
+    if (afb < afb_min) afb = afb_min;
     if (afb < 0) afb = 0;
 
     if (afb == 0) {
