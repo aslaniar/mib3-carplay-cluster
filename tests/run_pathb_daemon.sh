@@ -16,7 +16,8 @@
 #   D3   frames flowing -> TAKEOVER -> ACTIVE, park BEFORE bind
 #   D4   with the car's nav still streaming, bind happens only after park
 #   D5   frames stop -> RELEASE, unbind BEFORE hand back, nav gets the port
-#   D6   `pathbctl release` while ACTIVE hands the cluster back
+#   D6   `pathbctl release` while ACTIVE hands the cluster back and stays off
+#        while that session streams; the next session is taken again
 #   D7   park fails after we bound -> we give the port straight back
 #   D8   the pause marker stops any takeover
 #   D9   a second daemon refuses to run (single instance), two started together
@@ -213,6 +214,14 @@ PATHB_RAM="$TMP" sh "$CLI" release >/dev/null 2>&1
 if wait_state IDLE 6000; then chk d6_operator_release 1 "IDLE after release"; else chk d6_operator_release 0 "$(dstate)"; fi
 chk d6_back_called "$( [ -n "$(first_line "^back$" "$TMP/order.log")" ] && echo 1 || echo 0 )" "hand-back ran"
 chk d6_reason_logged "$( has x 'operator' "$TMP/pathb_daemon.log" )" "logged as operator"
+# the phone is still streaming: the next IDLE tick must not take the cluster back
+sleep 2
+chk d6_stays_released_2s "$( [ "$(dstate)" = "IDLE" ] && echo 1 || echo 0 )" "IDLE 2 s after release ($(dstate))"
+sleep 2
+chk d6_stays_released_4s "$( [ "$(dstate)" = "IDLE" ] && [ "$(grep -c '^bind ' "$TMP/order.log")" = "1" ] && echo 1 || echo 0 )" "IDLE 4 s after release, one bind ($(dstate), $(grep -c '^bind ' "$TMP/order.log"))"
+# frames stop for longer than GRACE: that session is over, so the next one is taken
+phone_off; sleep 1.2; phone_on
+if wait_state ACTIVE 5000; then chk d6_next_session_taken 1 "ACTIVE after the phone came back"; else chk d6_next_session_taken 0 "$(dstate)"; fi
 reset_all
 
 echo

@@ -12,7 +12,9 @@
 #   pathbctl log [n]           the last n decision lines (default 20)
 #   pathbctl pause             do not take the cluster over (survives sessions)
 #   pathbctl resume            allow it again
-#   pathbctl release           hand the cluster back NOW (one-shot, safe)
+#   pathbctl release           hand the cluster back NOW and stay off for the rest
+#                              of this phone session; the next session is taken
+#                              as usual (use pause to stay off indefinitely)
 #   pathbctl start | stop      the daemon itself (boot starts it for you)
 #
 # There is deliberately no `up`: taking the cluster is the daemon's decision,
@@ -166,7 +168,8 @@ case "${1:-status}" in
     fi
     printf 'release\n' >"$CMDF"
     echo "pathbctl: asked the daemon to hand the cluster back (it unbinds, proves"
-    echo "          the port is free, then restores the car's map)"
+    echo "          the port is free, then restores the car's map).  It stays off"
+    echo "          until the phone stops streaming; use 'pause' to stay off for good"
     ;;
 
   start)

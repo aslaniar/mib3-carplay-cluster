@@ -18,7 +18,9 @@
 #                            CarPlay the phone's TCP connection stays ESTABLISHED
 #                            after the phone leaves, so "connected" outlives the
 #                            session by hours.
-#   IN   pathb_daemon.cmd    one-shot operator command ("release")
+#   IN   pathb_daemon.cmd    one-shot operator command ("release": hand back now and
+#                            take nothing until frames stop for GRACE, i.e. until
+#                            this phone session is over)
 #   IN   pathb_daemon.pause  present = never take over
 #   IN   /proc/net/udp{,6}   is the port free? THE proof, not a hint
 #   OUT  pathb_sender.ctl    "bind <port>" | "unbind"
@@ -128,6 +130,7 @@ DISC_AT=0
 ORA_AT=0
 S_CONN=0; S_READY=0; S_BOUND=0; S_AU=0; S_OUT=0; S_MS=0
 LAST_AU=-1; LAST_FLOW=0; FLOW_SINCE=0; DEAD_SINCE=0; NEXT_RETRY=0; RETRY_AT=0; CONN_SINCE=0
+HOLD=0        # 1 after an operator release, until the phone session it interrupted ends
 
 # ------------------------------------------------------------------ plumbing
 now_ms(){
@@ -633,7 +636,7 @@ do_tick(){
       release*) log "cmd: operator release"
                 release "operator"; _r=$?
                 settle "operator-release" "$_r"
-                DEAD_SINCE=0; FLOW_SINCE=0; LAST_AU=$S_AU ;;
+                HOLD=1; DEAD_SINCE=0; FLOW_SINCE=0; LAST_AU=$S_AU; LAST_FLOW=$(now_ms) ;;
       *) log "cmd: unknown '$_cmd' -- ignored" ;;
     esac
   fi
@@ -652,7 +655,10 @@ do_tick(){
           # the flow stopped: the next frames start a new debounce, not resume this one
           FLOW_SINCE=0
         fi
-        if paused; then
+        if [ "$HOLD" = "1" ] && [ $(( _now - LAST_FLOW )) -ge "$GRACE" ]; then
+          HOLD=0; log "release hold lifted: no frames for ${GRACE}ms, that phone session is over"
+        fi
+        if paused || [ "$HOLD" = "1" ]; then
           FLOW_SINCE=0
         elif [ "$FLOW_SINCE" != "0" ] && [ $(( _now - LAST_FLOW )) -le $(( 2 * POLL )) ] \
            && [ $(( _now - FLOW_SINCE )) -ge "$READY_STABLE" ] \
