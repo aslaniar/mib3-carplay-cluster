@@ -40,7 +40,7 @@
  *                             "-i ncm0 -p tcp --dport 5000:5001"); 6031 and any
  *                             ephemeral port are FIREWALL-DROPPED on ncm0/wlap
  *                             -- the phone's SYN never reaches us -- and need
- *                             live_kit/cluster_port_fw.sh first.
+ *                             a firewall rule this repo does not ship.
  *   MIB3_SHIM_CMDS=0/1        send forceKeyFrame/showUI/setNightMode to the
  *                             phone once the 111 stream connects (default 1)
  *   MIB3_SHIM_SINK=off|helper where cluster frames go (default off; `helper`
@@ -416,8 +416,8 @@ static int helper_connect(void){
    * "blocky flat areas, wrong tints, text stays sharp".
    *
    * So: ask for 4 MB (~28 max-size AUs), READ IT BACK, and say so when the kernel
-   * clamped it -- SO_SNDBUF is clamped to 2*net.core.wmem_max, which bring_up.sh
-   * raises, so an unraised unit silently caps at 208 KB.  Sends stay
+   * clamped it -- SO_SNDBUF is clamped to 2*net.core.wmem_max, which the deleted
+   * bring_up.sh used to raise, so an unraised unit silently caps at 208 KB.  Sends stay
    * non-blocking: no drop policy, timeout or thread changes here. */
   { long want = (long)env_num("MIB3_SHIM_HLP_SNDBUF", (u64)(4u<<20));
     if (want > 0){
@@ -429,7 +429,7 @@ static int helper_connect(void){
         hlp_sndbuf = got;
         logkv("sink","helper sndbuf granted",(u64)(u32)got,0);
         if (got < 425984) /* 2*208KB: the pre-bring_up ceiling */
-          logline("sink","helper sndbuf CLAMPED -- raise net.core.wmem_max (bring_up.sh does it) or AUs will drop here");
+          logline("sink","helper sndbuf CLAMPED -- raise net.core.wmem_max (echo 8388608 > /proc/sys/net/core/wmem_max) or AUs will drop here");
       } }
   }
   hlp_fd = fd; hlp_conns++;
@@ -3487,7 +3487,7 @@ static void *cluster_thread(void *arg){
  * event listener owns 5001 and the stock screen owns 6030, so 5000 is the only
  * firewall-legal free port.  6031 (the MHI3-native alt port) and any ephemeral
  * port are DROPPED -- the phone's SYN never arrives -- so they are fallbacks that
- * need live_kit/cluster_port_fw.sh first. */
+ * need a firewall rule this repo does not ship. */
 static int own_listen(int *out_port, int *out_gen){
   extern int socket(int, int, int);
   extern int setsockopt(int, int, int, const void*, unsigned int);
@@ -3500,8 +3500,8 @@ static int own_listen(int *out_port, int *out_gen){
   int fd, one = 1;
   struct sa6 sa, got; unsigned int glen = sizeof(got);
   /* port chain: explicit knob -> 5000 (fw-allowlisted, stock-observed free) ->
-   * 6031 (MHI3-native alt; fw-DROPPED, needs cluster_port_fw.sh) -> ephemeral
-   * (fw-DROPPED, needs cluster_port_fw.sh).  Log every attempt so the log
+   * 6031 (MHI3-native alt; fw-DROPPED, needs a firewall rule) -> ephemeral
+   * (fw-DROPPED, needs a firewall rule).  Log every attempt so the log
    * shows exactly which link of the chain won. */
   unsigned long chain[4]; int nc = 0;
   { char *pe = getenv("MIB3_SHIM_PORT");
@@ -3549,7 +3549,7 @@ static int own_listen(int *out_port, int *out_gen){
     logkv("cluster/listen","bound port",(u64)(u32)(*out_port),0);
     { const char *fw = (*out_port == 5000 || *out_port == 5001) ? "FW-ALLOWED (ncm0 5000:5001)"
                       : (*out_port == 6030 || *out_port == 7000) ? "FW-ALLOWED but stock-owned"
-                      : "FW-DROPPED (needs live_kit/cluster_port_fw.sh)";
+                      : "FW-DROPPED (needs a firewall rule this repo does not ship)";
       logline("cluster/listen/fw", fw); }
   }
   return fd;

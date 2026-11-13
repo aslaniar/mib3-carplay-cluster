@@ -59,7 +59,7 @@ labels(){
 }
 
 probe(){
-  [ -x "$WHEEL" ] || { say "missing $WHEEL -- run push_kit.sh"; exit 1; }
+  [ -x "$WHEEL" ] || { say "missing $WHEEL -- run up.sh"; exit 1; }
   say "=== probe (read-only) ==="
   "$WHEEL" --probe --probe-all --port "$PORT" 2>&1
   say "=== reading this ==="
@@ -70,7 +70,7 @@ probe(){
 }
 
 start(){
-  [ -x "$WHEEL" ] || { say "missing $WHEEL -- run push_kit.sh"; exit 1; }
+  [ -x "$WHEEL" ] || { say "missing $WHEEL -- run up.sh"; exit 1; }
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     say "already running (pid $(cat "$PIDFILE"))"; return 0
   fi
