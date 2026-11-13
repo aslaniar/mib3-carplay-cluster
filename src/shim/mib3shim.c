@@ -333,6 +333,11 @@ static u64 env_num(const char *name, u64 dflt); /* defined after the CF section 
 #define SOL_SOCKET_ 1
 #define SO_SNDTIMEO_ 21
 #define SO_SNDBUF_  7
+#define SO_KEEPALIVE_  9
+#define SOL_TCP_       6
+#define TCP_KEEPIDLE_  4
+#define TCP_KEEPINTVL_ 5
+#define TCP_KEEPCNT_   6
 static int hlp_fd = -1;
 static unsigned long hlp_seq = 0, hlp_sent = 0, hlp_drop = 0, hlp_conns = 0;
 /* the granted SO_SNDBUF of the live helper socket (0 = unknown).  The send-side
@@ -3143,6 +3148,7 @@ typedef struct {
   void *screen; int lsock; int lsockgen; void *session; int flags; void *stream;
   unsigned char key[32]; int keylen; int cipher; long counter;   /* B: stream crypto */
   long night; int aes_inited;
+  unsigned cmdgen;                 /* g_cmd_gen when this setup became the command target */
 } cl_ctx;
 
 /* The type-111 listener we currently own, plus a GENERATION token.  A newer
@@ -3202,6 +3208,16 @@ static void *cluster_thread(void *arg){
     if (g_lsock_gen == c->lsockgen){ g_lsock = -1; g_lsock_gen++; }
     c->lsock = -1;
     logline("cluster/thread","stream connected");
+    /* `c->session` is borrowed, not retained, so this thread must not outlive
+     * the phone.  A vanished peer (cable pulled) never sends EOF; keepalive turns
+     * it into a read error after ~8 s.  No idle timeout: a static map is
+     * legitimately silent, and the phone's kernel answers the probes. */
+    { int on = 1, idle = 5, intvl = 1, cnt = 3;
+      if (setsockopt(connfd, SOL_SOCKET_, SO_KEEPALIVE_, &on, sizeof(on)) != 0 ||
+          setsockopt(connfd, SOL_TCP_, TCP_KEEPIDLE_, &idle, sizeof(idle)) != 0 ||
+          setsockopt(connfd, SOL_TCP_, TCP_KEEPINTVL_, &intvl, sizeof(intvl)) != 0 ||
+          setsockopt(connfd, SOL_TCP_, TCP_KEEPCNT_, &cnt, sizeof(cnt)) != 0)
+        logkv("cluster/thread","keepalive setsockopt failed errno",(u64)(unsigned)SHIM_ERRNO,0); }
     /* THE SINK STANDS UP HERE -- on this thread, NOT in the SETUP seam.  A
      * failing/blocking sink can no longer stall CarPlay session setup.  In the
      * default (off) mode this touches nothing at all; in helper mode it is one
@@ -3473,6 +3489,12 @@ static void *cluster_thread(void *arg){
   } else {
     logline("cluster/thread","accept failed or none");
   }
+  /* Stop naming a session that may be freed once we are gone, unless a newer
+   * SETUP already took the command target (generation moved). */
+  { void *mine = c->session;
+    if (g_cmd_gen == c->cmdgen &&
+        __atomic_compare_exchange_n(&g_cmd_session, &mine, (void*)0, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+      logline("cluster/thread","command target cleared"); }
   logline("cluster/thread","exit");
   if (p_free) p_free(c);
   return 0;
@@ -3659,6 +3681,7 @@ static int cluster_setup(void *session, void *streamDict, void *response){
   c->night = g_night_mode; c->aes_inited = 0;
   g_cmd_session = session;   /* the command target once the stream connects */
   g_cmd_gen++;               /* invalidate completions from the previous SETUP */
+  c->cmdgen = g_cmd_gen;
   /* the wheel->CarPlay zoom path: one listener per process, started here so it
    * outlives per-connection cluster threads.
    * It only QUEUES steps; the cluster thread ships them (no session lifetime
