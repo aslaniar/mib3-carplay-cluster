@@ -829,8 +829,7 @@ static char g_cluster_url[160];            /* showUI url (== the advertised init
 #define K128 (0x08000100)   /* kCFStringEncodingUTF8 */
 
 static void resolve(void){
-  if (resolved) return;
-  resolved = 1;
+  if (__atomic_load_n(&resolved, __ATOMIC_ACQUIRE)) return;
   p_CFStringCreateWithCString = (fn_CFStringCreateWithCString)R("CFStringCreateWithCString");
   p_CFStringGetCString        = (fn_CFStringGetCString)       R("CFStringGetCString");
   p_CFArrayGetCount           = (fn_CFArrayGetCount)          R("CFArrayGetCount");
@@ -888,6 +887,7 @@ static void resolve(void){
   /* libAirPlay load base, for the few UNEXPORTED internal helpers we must call
    * by RVA (chacha key derive, screen time-sync callbacks).  R8830L-specific. */
   if (real_AddScreenDisplay) g_libap_base = (char*)real_AddScreenDisplay - 0x1f670;
+  __atomic_store_n(&resolved, 1, __ATOMIC_RELEASE);
 
   logline("init","resolved");
   logkv("init","p_CFArrayAppendValue",(u64)p_CFArrayAppendValue,1);
