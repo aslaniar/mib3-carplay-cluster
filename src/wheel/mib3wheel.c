@@ -67,6 +67,7 @@ extern void   _exit(int);
 extern int    socket(int, int, int);
 extern int    connect(int, const void *, unsigned int);
 extern int    setsockopt(int, int, int, const void *, unsigned int);
+extern long   send(int, const void *, unsigned long, int);
 
 extern int    usleep(unsigned int);
 extern long   time(long *);
@@ -138,9 +139,16 @@ static int tcp_connect(const char *host, int port){
   if (connect(fd, &sa, (unsigned int)sizeof(sa)) != 0){ close(fd); return -1; }
   return fd;
 }
+/* Every wfull target is a socket.  A peer that has closed (the shim inbox, RSI)
+ * must cost a failed write, not a SIGPIPE that kills the watcher. */
+#ifdef HOST_TEST
+#define MSG_NOSIGNAL 0x80000
+#else
+#define MSG_NOSIGNAL 0x4000
+#endif
 static int wfull(int fd, const void *buf, usize n){
   usize o = 0;
-  while (o < n){ long r = write(fd, (const char*)buf + o, n - o); if (r <= 0) return 0; o += (usize)r; }
+  while (o < n){ long r = send(fd, (const char*)buf + o, n - o, MSG_NOSIGNAL); if (r <= 0) return 0; o += (usize)r; }
   return 1;
 }
 /* GET path; returns HTTP status (0 = transport error), body in out (NUL-terminated).
@@ -298,9 +306,12 @@ static long ws_read(int fd, char *out, usize cap){
  *      parity and the scanner then reads punctuation as keys -- it silently found
  *      only the FIRST renderer of a two-renderer array.
  *  (2) so the multi-object walk below enumerates the array's objects by brace
- *      depth and scans each object from ITS OWN START. */
+ *      depth and scans each object from ITS OWN START.
+ *  (3) a scan ENDS where the object (or array) it started in closes.  The
+ *      array walk hands over a pointer into the whole body, so an unbounded
+ *      scan of a renderer lacking a key took the NEXT renderer's value. */
 static const char *find_key(const char *j, const char *key){
-  usize kl = slen(key);
+  usize kl = slen(key); int depth = 0;
   while (*j){
     if (*j == '"'){
       const char *k = j + 1; usize n = 0;
@@ -317,6 +328,8 @@ static const char *find_key(const char *j, const char *key){
       j = k + n + 1;
       continue;
     }
+    if (*j == '{' || *j == '[') depth++;
+    else if ((*j == '}' || *j == ']') && --depth <= 0) return 0;
     j++;
   }
   return 0;
@@ -519,11 +532,11 @@ static int renderer_slot(const char *name, const char *uri){
 }
 
 /* ---- selftest: the parsers over fixtures that mirror the shipped spec --- */
-static int g_fail;
+static int g_fail, g_pass;
 static void ck(const char *name, int got, int exp){
-  P(2, "WHEEL selftest exp="); PN(2, exp); P(2, " got="); PN(2, got);
+  P(2, "WHEEL "); P(2, name); P(2, " exp="); PN(2, exp); P(2, " got="); PN(2, got);
   P(2, got == exp ? " PASS\n" : " FAIL\n");
-  if (got != exp) g_fail++;
+  if (got != exp) g_fail++; else g_pass++;
 }
 static int selftest(void){
   s64 v = 0;
@@ -573,6 +586,13 @@ static int selftest(void){
     ck("selftest.obj1", (o1 && get_str(o1, "name", nm, sizeof(nm)) && streq(nm, "kombi")) ? 1 : 0, 1);
     ck("selftest.obj1_len", (int)l1, 27); }
 
+  /* a key missing from one object must not be read from the NEXT object */
+  { const char *two = "{\"data\":[{\"name\":\"mainunit\",\"zoomMode\":\"manual\"},"
+                      "{\"name\":\"kombi\",\"distancePerPixel\":26.312}]}";
+    s64 mm = 0; usize l0 = 0;
+    const char *o0 = json_array_object(find_key(two, "data"), 0, &l0);
+    ck("selftest.missing_key_stays_in_object", get_float_milli(o0, "distancePerPixel", &mm), 0); }
+
   /* the poll-path decision (added 2026-10-19): the car's kombi renderer flipped
    * auto -> manual with a 6.9x jump when the wheel was first rolled, so the EDGE
    * must be adopted silently, and only manual-mode deltas are steps. */
@@ -584,7 +604,7 @@ static int selftest(void){
     ck("selftest.decide_below_threshold", dpp_decide(26312, 0, 27000, 0, &d), 0);
     ck("selftest.decide_auto_ignored", dpp_decide(3000, 1, 6000, 1, &d), 0); }
 
-  if (!g_fail) P(2, "TOTAL: PASS=19 FAIL=0\n");
+  P(2, "TOTAL: PASS="); PN(2, g_pass); P(2, " FAIL="); PN(2, g_fail); P(2, "\n");
   return g_fail ? 1 : 0;
 }
 

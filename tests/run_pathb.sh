@@ -19,6 +19,7 @@
 #   T10 AU socket is 0777 (carplay is uid 986; the label alone is not enough)
 #   T11 msport.py: single / absent / changed / ambiguous fake /proc fixtures
 #   T12 FILE MODE unchanged (independent RTP/TS verification still passes)
+#   T26 mib3wheel --selftest, built natively with -DHOST_TEST
 #
 # Desk only.  No car, no unit.  Usage: bash run_pathb.sh
 # ============================================================================
@@ -556,6 +557,17 @@ s.bind(("::", int(sys.argv[1])))
 s.close()
 PYBIND
 kill "$MONPID" 2>/dev/null
+
+echo; echo "############ T26: mib3wheel --selftest (HOST_TEST build) ############"
+if "$CC" -DHOST_TEST -O2 -Wall -Wextra -o "$OUT/mib3wheel.host" "$REPO/src/wheel/mib3wheel.c" \
+       2>"$OUT/wheel.build.log"; then
+  "$OUT/mib3wheel.host" --selftest >"$OUT/wheel.selftest.log" 2>&1
+  WRC=$?
+  sed 's/^/  /' "$OUT/wheel.selftest.log" | grep -E 'FAIL|TOTAL'
+  [ "$WRC" -eq 0 ] && ok wheel_selftest "rc=0" || no wheel_selftest "rc=0" "rc=$WRC"
+else
+  no wheel_selftest "rc=0" "$(tail -1 "$OUT/wheel.build.log")"
+fi
 
 echo
 echo "============================================================"
