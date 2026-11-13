@@ -36,6 +36,8 @@
 #   D19  stopped while DEGRADED: the restart hands the nav back
 #   D20  each takeover binds the port discovery reports now, and PATHB_PORT
 #        still beats discovery
+#   D21  `stop` (daemon and CLI) during a slow hand-back that fails once waits
+#        for the trap's retry: the order log ends with back
 #
 # Usage: sh tests/run_pathb_daemon.sh
 # ============================================================================
@@ -114,6 +116,12 @@ cat >"$TMP/back.sh" <<'BACK'
 # The fail flag is a FILE, not an env var: the daemon's environment is fixed at
 # exec, so a test that wants to change the RSI's behaviour mid-run must not use
 # an exported variable.
+[ -f "$PATHB_RAM/back_slow" ] && sleep "$(cat "$PATHB_RAM/back_slow")"
+if [ -f "$PATHB_RAM/back_fail_once" ]; then
+  rm -f "$PATHB_RAM/back_fail_once"
+  echo "back-failed" >>"$PATHB_RAM/order.log"
+  exit 1
+fi
 if [ -f "$PATHB_RAM/back_fail" ]; then
   echo "back-failed" >>"$PATHB_RAM/order.log"
   exit 1
@@ -151,7 +159,8 @@ reset_all(){
         "$TMP"/pathb_daemon.state "$TMP"/pathb_daemon.log "$TMP"/pathb_daemon.cmd \
         "$TMP"/pathb_daemon.pause "$TMP"/pathb_daemon.pid "$TMP"/order.log \
         "$TMP"/port_held "$TMP"/fake_phone "$TMP"/back_fail "$TMP"/no_emit \
-        "$TMP"/pathb_nav.parked "$TMP"/msport "$TMP"/pathb_sport
+        "$TMP"/pathb_nav.parked "$TMP"/msport "$TMP"/pathb_sport \
+        "$TMP"/back_slow "$TMP"/back_fail_once
   rmdir "$TMP/pathb_daemon.lock" 2>/dev/null
 }
 dstart(){ nohup sh "$DAEMON" run >"$TMP/daemon.stdout" 2>&1 & sleep 0.8; }
@@ -458,6 +467,25 @@ wait_state ACTIVE 5000 >/dev/null 2>&1
 chk d20_override_wins "$( [ "$(dfield bound)" = "42989" ] && echo 1 || echo 0 )" "PATHB_PORT beats discovery ($(dfield bound))"
 unset PATHB_D_DISCOVER_CMD
 reset_all
+
+echo
+echo "############ D21: stop during a slow hand-back waits for the trap ############"
+# The loop's own `back` takes 8 s and fails.  The trap only runs once it returns,
+# and its retry takes another 8 s: a stop that kills -9 sooner leaves the nav parked.
+for _how in daemon cli; do
+  dstart; phone_on
+  wait_state ACTIVE 5000 >/dev/null 2>&1
+  printf '8\n' >"$TMP/back_slow"; : >"$TMP/back_fail_once"
+  phone_off
+  wait_line "^unbind$" 6000
+  sleep 0.3
+  if [ "$_how" = "daemon" ]; then sh "$DAEMON" stop >/dev/null 2>&1
+  else PATHB_RAM="$TMP" sh "$CLI" stop >/dev/null 2>&1; fi
+  _i=0; while [ "$_i" -lt 400 ] && pgrep -f "$TMP/back.sh" >/dev/null 2>&1; do sleep 0.05; _i=$((_i+1)); done
+  chk "d21_${_how}_stop_ends_handed_back" "$( [ "$(tail -n 1 "$TMP/order.log" 2>/dev/null)" = "back" ] && echo 1 || echo 0 )" "order.log ends with back ($(tail -n 1 "$TMP/order.log" 2>/dev/null))"
+  chk "d21_${_how}_stop_clears_parked" "$( [ -f "$TMP/pathb_nav.parked" ] && echo 0 || echo 1 )" "no parked marker left"
+  reset_all
+done
 
 echo
 echo "############ D16: a one-shot tick starts from clean state ############"

@@ -109,6 +109,14 @@ GRACE=${PATHB_GRACE_MS:-4500}
 RETRY=${PATHB_RETRY_MS:-2000}
 TAKEOVER_MS=${PATHB_TAKEOVER_MS:-9000}
 LOG_MAX=${PATHB_LOG_MAX:-65536}
+# THE STOP DEADLINE IS THE TRAP'S WORST CASE.  A kill -9 in the middle of a hand-back
+# leaves the nav parked.  A trapped TERM waits for the running foreground command
+# (worst: a `back` in the loop's own release), then on_stop releases: unbind wait
+# 2500 + two `back`s with a 500 nap after each + sender_stop 3000.  One `back` is
+# bounded by deliver_ctl.sh: oracle start 2 s + seven RSI requests at curl
+# --max-time 8 + fast gate 3 s + 2 s for the second to turn + rescue 20 s = 83 s.
+BACK_WORST_MS=83000
+STOP_MS=$(( 3 * BACK_WORST_MS + 2500 + 2 * 500 + 3000 + 5000 ))   # 260.5 s
 
 PARK_CMD=${PATHB_D_PARK_CMD:-}
 BACK_CMD=${PATHB_D_BACK_CMD:-}
@@ -814,15 +822,17 @@ do_stop(){
     return 0
   fi
   kill "$_p" 2>/dev/null
-  _i=0
-  while [ "$_i" -lt 40 ]; do
+  _t=$(now_ms)
+  while [ $(( $(now_ms) - _t )) -lt "$STOP_MS" ]; do
     kill -0 "$_p" 2>/dev/null || break
-    nap_ms 100; _i=$((_i+1))
+    nap_ms 100
   done
   if is_daemon "$_p"; then
     # killed past its trap: nothing else will clear its claim
     kill -9 "$_p" 2>/dev/null
     rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null
+    echo "pathb_daemon: killed (its trap did not finish in ${STOP_MS}ms)"
+    return 0
   fi
   echo "pathb_daemon: stopped"
 }

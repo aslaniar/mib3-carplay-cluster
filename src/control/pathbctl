@@ -28,7 +28,6 @@ RAM=${PATHB_RAM:-/dev/shm}
 STATE=$RAM/pathb_daemon.state
 LOG=$RAM/pathb_daemon.log
 PIDF=$RAM/pathb_daemon.pid
-LOCKD=$RAM/pathb_daemon.lock
 CMDF=$RAM/pathb_daemon.cmd
 PAUSEF=$RAM/pathb_daemon.pause
 DAEMON=$HERE/pathb_daemon.sh
@@ -187,16 +186,8 @@ case "${1:-status}" in
     ;;
 
   stop)
-    if ! _p=$(alive); then echo "pathbctl: not running"; rm -f "$PIDF"; rmdir "$LOCKD" 2>/dev/null; exit 0; fi
-    kill "$_p" 2>/dev/null
-    _i=0
-    while [ "$_i" -lt 60 ]; do
-      kill -0 "$_p" 2>/dev/null || { echo "pathbctl: stopped"; exit 0; }
-      sleep 0.1 2>/dev/null || sleep 1
-      _i=$((_i+1))
-    done
-    is_daemon "$_p" && kill -9 "$_p" 2>/dev/null
-    echo "pathbctl: killed (it did not stop in 6s) -- run 'pathbctl status'"
+    # the daemon owns the stop deadline: only it knows how long its hand-back can take
+    exec sh "$DAEMON" stop
     ;;
 
   restart)
