@@ -929,6 +929,12 @@ hand_back_to_nav_rollback() {
 #   gate looks "fine".  Only a resync (stop+recreate) forces a start, so step 3
 #   retries through one.  [STATIC]+[EXEC]
 # ----------------------------------------------------------------------------
+back_resync() {   # a real 0 -> 1 resync transition (see handover_arm)
+  if [ "${MIB3_DLV_RESYNC_FLIP:-1}" = "1" ]; then
+    h POST "http://$RSI:$DMP$SP" '{"resync":false}' >/dev/null 2>&1; echo; nap_next_second
+  fi
+  h POST "http://$RSI:$DMP$SP" '{"resync":true}' >/dev/null 2>&1; echo
+}
 handover_back() {
   _to="${1:-20}"                       # the SLOW budget (rescue path)
   _fast=$(( ${MIB3_DLV_BACK_T:-3} * 1000 ))   # the FAST budget: one sample + encoder
@@ -982,8 +988,12 @@ handover_back() {
     say "HANDOVER BACK: the nav element is already present (trap predicted: no startShare will come without a resync)"
   fi
   if [ "${NOOR:-0}" = "1" ]; then
-    say "HANDOVER BACK: DEGRADED (no oracle) -- mutations sent; cannot verify the encoder"
-    nap 3
+    # No oracle: the trap still needs its resync, and the element list is the
+    # only evidence left.
+    [ "$_trap" = "1" ] && { bc "handover:back:resync"; back_resync; }
+    _r2="$(uris)" && [ -n "$(uri_of "$_r2" $NAVNAME)" ] && [ -z "$(uri_of "$_r2" $OURNAME)" ] \
+      || { say "HANDOVER BACK FAIL: DEGRADED (no oracle) and the nav element is not back"; return 1; }
+    say "HANDOVER BACK: DEGRADED (no oracle) -- nav element present (trap=$_trap); the encoder is unverified"
     return 0
   fi
   tstep mutations
@@ -1012,10 +1022,7 @@ handover_back() {
   say "HANDOVER BACK: no nav share yet -- forcing a resync (re-created-nav trap)"
   bc "handover:back:resync"
   _mk2="$(oracle_mark)"
-  if [ "${MIB3_DLV_RESYNC_FLIP:-1}" = "1" ]; then
-    h POST "http://$RSI:$DMP$SP" '{"resync":false}' >/dev/null 2>&1; echo; nap_next_second
-  fi
-  h POST "http://$RSI:$DMP$SP" '{"resync":true}' >/dev/null 2>&1; echo
+  back_resync
   _t_resync="$(now_ms)"
   if wait_oracle_ms "share_surface_id = $NAVID" $(( _to * 1000 )) "$_mk2"; then
     tstep rescue
