@@ -17,7 +17,7 @@ Upcoming features:
 | --- | --- |
 | **Shim** | Interposes three CarPlay library seams inside the running `carplay` process, advertises a second display (type 111) for the cluster, receives that stream, decrypts it, and hands access units to a socket. |
 | **Sender** | Re-muxes each access unit into MPEG-TS and paces it onto the cluster's RTP multicast, sending the video through the car's internal Ethernet bus. |
-| **Supervisor** | One resident process/deamon. When the phone starts streaming it takes the cluster's UDP port; when the session ends it hands the port back to the car.  |
+| **Supervisor** | One resident process/daemon. When the phone starts streaming it takes the cluster's UDP port; when the session ends it hands the port back to the car.  |
 
 
 ## Requirements
