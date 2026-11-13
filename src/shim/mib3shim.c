@@ -3156,9 +3156,14 @@ typedef struct {
  * The token, not the fd number, is the ownership test: own_listen closes the old
  * fd and immediately socket()s a new one, which the kernel hands back with the
  * SAME number -- so an fd comparison would let a stale receiver thread accept on
- * the NEW listener and service the new phone stream with an OLD key/session. */
+ * the NEW listener and service the new phone stream with an OLD key/session.
+ * CLOSE OWNERSHIP: the party that moves g_lsock_gen from G to G+1 by CAS closes
+ * generation G's fd, and nobody else does -- either the receiver thread after its
+ * accept, or own_listen superseding it.  g_lsock and g_lsock_fdgen are written
+ * only by the SETUP side. */
 static volatile int g_lsock = -1;
 static volatile int g_lsock_gen = 0;
+static int g_lsock_fdgen = 0;              /* the generation g_lsock was published under */
 
 /* Which cluster thread owns the helper (AU) socket.  One phone session gets one
  * cluster setup and therefore one thread, but the unit measured 8 connects / 7
@@ -3204,8 +3209,9 @@ static void *cluster_thread(void *arg){
   }
   logkv("cluster/thread","conn fd",(u64)(u32)connfd,0);
   if (connfd >= 0){
-    if (p_close){ p_close(c->lsock); }
-    if (g_lsock_gen == c->lsockgen){ g_lsock = -1; g_lsock_gen++; }
+    { int g = c->lsockgen;
+      if (__atomic_compare_exchange_n(&g_lsock_gen, &g, g + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) && p_close)
+        p_close(c->lsock); }
     c->lsock = -1;
     logline("cluster/thread","stream connected");
     /* `c->session` is borrowed, not retained, so this thread must not outlive
@@ -3538,9 +3544,13 @@ static int own_listen(int *out_port, int *out_gen){
    * listener, and the bind would fall through to the firewall-dropped 6031.
    * Closing it here also unsticks the old thread's poll. */
   if (g_lsock >= 0){
-    int old = g_lsock; g_lsock = -1; g_lsock_gen++; close(old);
-    logkv("cluster/listen","superseded old listener fd",(u64)(u32)old,0);
-    logkv("cluster/listen","new listener generation",(u64)(u32)g_lsock_gen,0);
+    int old = g_lsock, g = g_lsock_fdgen;
+    g_lsock = -1;
+    if (__atomic_compare_exchange_n(&g_lsock_gen, &g, g + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)){
+      close(old);
+      logkv("cluster/listen","superseded old listener fd",(u64)(u32)old,0);
+      logkv("cluster/listen","new listener generation",(u64)(u32)g_lsock_gen,0);
+    }
   }
   fd = socket(10 /*AF_INET6*/, 1 /*SOCK_STREAM*/, 0);
   if (fd < 0) return -1;
@@ -3562,8 +3572,8 @@ static int own_listen(int *out_port, int *out_gen){
   }
   if (listen(fd, 8) != 0){ close(fd); return -1; }
   g_lsock = fd;                 /* we own it until a newer SETUP supersedes it */
-  g_lsock_gen++;
-  if (out_gen) *out_gen = g_lsock_gen;
+  g_lsock_fdgen = __atomic_add_fetch(&g_lsock_gen, 1, __ATOMIC_SEQ_CST);
+  if (out_gen) *out_gen = g_lsock_fdgen;
   *out_port = 0;
   if (getsockname(fd, &got, &glen) == 0){
     *out_port = (int)(((got.port & 0xff) << 8) | (got.port >> 8));   /* ntohs */
