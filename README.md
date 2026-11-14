@@ -7,7 +7,7 @@ It takes over the head unit's stream to the cluster and replaces it with the alt
 
 
 This mod has been tested and driven in a real car. Here's what it looks like: 
-![](docs/images/cluster.jpg)
+![](/docs/images/cluster.JPG)
 
 Upcoming features: 
  - Non-root instalation
