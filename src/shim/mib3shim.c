@@ -26,6 +26,14 @@
  *                                        on the mutable /info dict the unit is
  *                                        about to serialise.
  *
+ * ...plus THREE HOOKS, a different mechanism on purpose (libc GOT slots inside
+ * the carplay executable, not Apple/LG seams):
+ *   connect/send/close -> mib3_nt_connect/send/close (mib3navtext.c): the
+ *   cluster NAV-TEXT GATE.  The address / arrival-time bands the cluster draws
+ *   around our map come from TEXT the head unit posts to simplenav over
+ *   /tmp/Simple_Socket.  See the NAV-TEXT GATE block below and the head of
+ *   mib3navtext.c for the chain and the record format.
+ *
  * Logs to /tmp/mib3shim.log (world-writable tmpfs; SMACK `_`).
  * Env knobs (the load-bearing ones; the RUN banner prints the live set):
  *   MIB3_SHIM_ADD=0/1         advertise the cluster display (default 1)
@@ -47,6 +55,13 @@
  *                             = the AU socket -> mib3clusterstream.  Anything
  *                             else is refused loudly -- the in-process display
  *                             sink is gone)
+ *   MIB3_SHIM_NAVTEXT=off|filter|all|capture
+ *                             THE CLUSTER NAV-TEXT GATE (default off).  The
+ *                             address / arrival-time bands the cluster draws
+ *                             around our map are the CAR's, fed by text carplay
+ *                             posts to simplenav on /tmp/Simple_Socket.  This
+ *                             drops those records at that socket (mib3navtext.c).
+ *   MIB3_SHIM_NAVTEXT_DROP=100,101,102   which event ids `filter` drops
  *   MIB3_SHIM_HELPER=<path>   the AU socket path (default /dev/shm/mib3cluster.sock)
  *   MIB3_SHIM_IDR_MS=<n>      recovery-point request cadence (default 500 ms,
  *                             0 = off; the phone honours ~1 in 10)
@@ -3688,6 +3703,113 @@ int  mib3shim_gate_active(void){ resolve(); return gate_active(); }
 int  mib3shim_cluster_advertised(void){ return g_cluster_advertised; }
 
 /* ==========================================================================
+ * THE CLUSTER NAV-TEXT GATE -- glue only; the gate itself lives in
+ * mib3navtext.c so the desk test can build and drive the SAME code against a
+ * real socket (tests/run_navtext.sh).
+ *
+ * WHAT IT IS FOR.  The cluster draws its own address/street line and its own
+ * distance + arrival-time line around the map window we send.  It gets the text
+ * as DATA, not pixels: carplay -> /tmp/Simple_Socket -> simplenav -> RSI
+ * "simplenavigation" -> navsd -> BAP -> ECU.  This glue hooks carplay's
+ * connect()/send()/close() GOT slots (src/inject/inject_shim.py patches them)
+ * and drops the phone's navigation records on that ONE socket, so navsd has
+ * nothing to publish and the ECU has nothing to print.  The socket, the picture
+ * and every other byte on that socket are untouched.
+ *
+ * Knobs (live, no rebuild -- see the preset table at the top of mib3navtext.c):
+ *   MIB3_SHIM_NAVTEXT=off|filter|all|capture        (default off)
+ *   MIB3_SHIM_NAVTEXT_DROP=100,101,102              what `filter` drops
+ *
+ * SAFETY: the hooks NEVER change whether a socket connects, never replace an fd
+ * and never allocate; a defect here can only drop nav text, and
+ * MIB3_SHIM_NAVTEXT=off takes effect on the next record.
+ *
+ * THE THREE EXPORTED NAMES ARE DELIBERATE: they are NOT connect/send/close (an
+ * exported `connect` would be found by RTLD_DEFAULT, and the shim's own helper
+ * socket would call itself), so the injector points the GOT slots at these names
+ * instead of relying on symbol equality.
+ * ========================================================================*/
+extern void mib3_navtext_install(void (*)(const char *),
+                                 int (*)(int, const void *, unsigned int),
+                                 long (*)(int, const void *, unsigned long, int),
+                                 int (*)(int));
+extern int  mib3_navtext_connect(int, const void *, unsigned int);
+extern long mib3_navtext_send(int, const void *, unsigned long, int);
+extern int  mib3_navtext_close(int);
+extern int  mib3_navtext_mode(void);
+
+static void navtext_log(const char *m){ logline("cluster/navtext", m); }
+
+/* Resolve the REAL libc entry point for one of the hooked calls.
+ *
+ * The version tag matters: carplay's own relocations are connect@GLIBC_2.17,
+ * send@GLIBC_2.17, close@GLIBC_2.17, so a VERSIONED lookup cannot land on some
+ * other library's wrapper that happens to be earlier in the global scope --
+ * which a plain dlsym(RTLD_DEFAULT) could.  Note the slot does not necessarily
+ * hold libc: on glibc <= 2.33 libpthread carries the cancellable wrappers for
+ * exactly these calls and it is libpthread that wins resolution in carplay, so
+ * the injector validates the slot value against the object that contains it
+ * rather than against a pre-computed libc address.  dlvsym is itself looked up
+ * with dlsym, so the shim gains NO new load-time dependency (a missing symbol
+ * would make the dlopen fail, i.e. no cluster advertisement at all). */
+static void *navtext_real(const char *name, void *linked)
+{
+  typedef void *(*fn_dlvsym)(void *, const char *, const char *);
+  static fn_dlvsym p_dlvsym;
+  static int tried;
+  void *p = 0;
+  if (!tried){ tried = 1; p_dlvsym = (fn_dlvsym)dlsym(RTLD_DEFAULT, "dlvsym"); }
+  if (p_dlvsym) p = p_dlvsym(RTLD_DEFAULT, name, "GLIBC_2.17");
+  if (!p) p = dlsym(RTLD_DEFAULT, name);
+  if (!p) p = linked;
+  return p;
+}
+
+/* Arm on EVERY entry.  The seams are installed into a RUNNING process, so the
+ * first thing carplay does after injection may be a send() on a socket it
+ * connected long before we existed -- the gate must be armed before it judges
+ * anything, and the arm must be cheap (a flag + four pointer stores). */
+static void navtext_arm(void)
+{
+  static int armed = 0;
+  void *pc, *ps, *pcl;
+  if (armed) return;
+  pc  = navtext_real("connect", (void *)connect);
+  ps  = navtext_real("send",    (void *)send);
+  pcl = navtext_real("close",   (void *)close);
+  /* NEVER pass NULL: a null real function would turn every connect() in carplay
+   * into -1. */
+  if (!pc)  pc  = (void *)connect;
+  if (!ps)  ps  = (void *)send;
+  if (!pcl) pcl = (void *)close;
+  mib3_navtext_install(navtext_log,
+                       (int  (*)(int, const void *, unsigned int))pc,
+                       (long (*)(int, const void *, unsigned long, int))ps,
+                       (int  (*)(int))pcl);
+  armed = 1;
+}
+
+/* The three GOT targets (see src/inject/inject_shim.py HOOKS). */
+int mib3_nt_connect(int fd, const void *sa, unsigned int len)
+{
+  navtext_arm();
+  return mib3_navtext_connect(fd, sa, len);
+}
+long mib3_nt_send(int fd, const void *buf, unsigned long n, int flags)
+{
+  navtext_arm();
+  return mib3_navtext_send(fd, buf, n, flags);
+}
+int mib3_nt_close(int fd)
+{
+  navtext_arm();
+  return mib3_navtext_close(fd);
+}
+
+/* harness/kit probe: the live mode, so the banner or a test can read it */
+int  mib3shim_navtext_mode(void){ return mib3_navtext_mode(); }
+
+/* ==========================================================================
  * The display seam.
  * ========================================================================*/
 /* ---- run banner ----------------------------------------------------------
@@ -3703,7 +3825,7 @@ static void run_banner(void){
   int  tzh = (int)env_num("MIB3_SHIM_TZ", 12);           /* hours WEST of the unit clock (tuned: unit clock is +4h) */
   long sod = (t - (long)tzh * 3600) % 86400; if (sod < 0) sod += 86400;
   int hh = (int)(sod / 3600), mm = (int)((sod % 3600) / 60), ss = (int)(sod % 60);
-  char mem[768]; buf b = { mem, sizeof(mem)-2, 0 };
+  char mem[1024]; buf b = { mem, sizeof(mem)-2, 0 };   /* the NT=/NTDROP= tail must fit */
   bs(&b,"\n[mib3shim] ================================================================\n");
   bs(&b,"[mib3shim] ====== RUN "); bu64(&b,(u64)(++g_run_no),10,0);
   bs(&b,"  pid="); bu64(&b,(u64)getpid(),10,0);
@@ -3753,6 +3875,14 @@ static void run_banner(void){
     bs(&b,"mm="); bu64(&b,(u64)(u32)geom_density_milli(&gm),10,0);
     bs(&b,"px/mm(milli)"); }
   bs(&b,"  APPEARANCE="); bu64(&b,(u64)env_on("MIB3_SHIM_APPEARANCE",0),10,0);
+  /* THE CLUSTER NAV-TEXT GATE: the address / arrival-time bands are the CAR's,
+   * fed by carplay -> /tmp/Simple_Socket -> simplenav -> navsd -> BAP.  NT is the
+   * live mode (0 off, 1 filter, 2 all, 3 capture); NTDROP is what `filter`
+   * drops, printed RAW so a mistyped knob is visible on the banner instead of
+   * being inferred from a cluster that still shows the bands. */
+  bs(&b,";  NT="); bu64(&b,(u64)(u32)mib3_navtext_mode(),10,0);
+  { const char *d = getenv("MIB3_SHIM_NAVTEXT_DROP");
+    bs(&b,"  NTDROP="); bs(&b, (d && d[0]) ? d : "100,101,102"); }
   /* command-channel health, cumulative since injection: /0 accepted, /refused,
    * /stale.  A non-zero REFUSED or STALE here is the first thing to read when a
    * command "did nothing". */

@@ -26,8 +26,10 @@
 # ============================================================================
 set -u
 
-# ---- the pinned builds (2026-11-02, field-verified on the car) -------------
-SHIM_PIN=dc723befb0cd4c636ca2aa2a8f2c3743
+# ---- the pinned builds (field-verified on the car) -------------------------
+# The shim is the build with the cluster nav-text gate (the address /
+# arrival-time bands) and the tuned safe area; both are field-verified.
+SHIM_PIN=c789666fa9fccfcad45a5607e5785482
 SENDER_PIN=a9ab16d0bb8f29ed0ceda3f3ad69472d
 WHEEL_PIN=e689515fc20a701f0e84d62d9dcd6251
 
@@ -109,6 +111,39 @@ else
     warn "inject: run_inject.sh failed -- see $LOG"
   fi
 fi
+
+# ============== 3b. set the shim's knobs BEFORE the phone connects ==========
+# The daemon re-asserts these at each session's prepare, but /info is built when
+# the phone CONNECTS -- i.e. before prepare -- so a knob set only by the daemon
+# would miss the FIRST session after a reboot (the advert would carry the old
+# full-panel safe area, and the nav-text gate would still be armed-but-off).
+# Poking them here, right after the injection and before a plug, makes the first
+# session correct.  Same list as src/control/pathb_daemon.sh knobs_once: keep
+# them in step (tests/run_navtext.sh N12 checks that they are).
+knobs() {
+  _cp=$(pidof carplay 2>/dev/null | awk '{print $1}')
+  [ -n "${_cp:-}" ] || { warn "knobs: carplay is not running -- the daemon will set them at prepare"; return 0; }
+  [ -f "$KIT/target_env.py" ] || { warn "knobs: target_env.py missing -- skipping"; return 0; }
+  _n=0
+  for _kv in MIB3_SHIM_SINK=helper \
+             MIB3_SHIM_FPS=60 \
+             MIB3_SHIM_NAVTEXT=filter \
+             MIB3_SHIM_VIEWAREAS=1 \
+             MIB3_SHIM_VA_COUNT=4 \
+             MIB3_SHIM_VA_VISIBLE=0 \
+             MIB3_SHIM_VA_NOOUTSIDE=1 \
+             MIB3_SHIM_VA_INITIAL=1 \
+             "MIB3_SHIM_VA0=0,0,1280,480,0,0,1280,480" \
+             "MIB3_SHIM_VA1=0,0,1280,480,0,0,1280,440" \
+             "MIB3_SHIM_VA2=0,0,1280,480,0,0,1280,400" \
+             "MIB3_SHIM_VA3=0,0,1280,480,0,0,1280,360" \
+             "MIB3_SHIM_URL=maps:/car/instrumentcluster/map?showETA=no&maneuverLayout=topAligned&showSpeedLimit=no" \
+             MIB3_SHIM_CMDACK=1; do
+    /usr/bin/python "$KIT/target_env.py" "$_cp" "$_kv" >/dev/null 2>&1 && _n=$((_n+1))
+  done
+  step "knobs: $_n set on carplay pid $_cp (nav gate, safe area, fps/sink/url)"
+}
+knobs
 
 # ============================ 4. start the supervisor =======================
 step "supervisor: starting (it takes the cluster when the phone streams)"

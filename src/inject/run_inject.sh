@@ -18,12 +18,15 @@
 # ============================================================================
 set -u
 STICK="$(cd "$(dirname "$0")" && pwd)"
-# The shim that MUST be staged: the field-proven Path B build (2026-11-02).
-# It reproduces byte-identical from mib3shim.c with `sh shim/build.sh`.
+# The shim that MUST be staged: the field-proven Path B chain PLUS the cluster
+# NAV-TEXT GATE -- carplay's guidance records to simplenav on /tmp/Simple_Socket
+# are dropped, so the cluster ECU stops printing its own address line and its
+# distance/arrival-time line around our map.  It reproduces byte-identical from
+# mib3shim.c + mib3navtext.c with `sh src/shim/build.sh`, and
+# `bash tests/run_navtext.sh` must be 0-failure.
 # The fence exists because a stale shim on this unit looks healthy from every
-# counter (2026-10-19: five builds injected into one carplay) -- so an md5
-# mismatch aborts before anything is persisted.
-WANT_MD5=dc723befb0cd4c636ca2aa2a8f2c3743
+# counter, so an md5 mismatch aborts before anything is persisted.
+WANT_MD5=c789666fa9fccfcad45a5607e5785482
 # DELIBERATE VALIDATION ESCAPE: set MIB3_SHIP_NEW_MD5=<md5> to inject a build
 # that has not run on the car yet.  It must be stated, never implied.
 if [ -n "${MIB3_SHIP_NEW_MD5:-}" ]; then
@@ -100,6 +103,11 @@ echo "[*] OPTIONAL live knobs (no rebuild, between phone plugs):"
 echo "      /usr/bin/python $STICK/target_env.py $CP MIB3_SHIM_ADD=0"
 echo "      /usr/bin/python $STICK/target_env.py $CP MIB3_SHIM_INFO=0"
 echo "      /usr/bin/python $STICK/target_env.py $CP MIB3_SHIM_GATE=1"
+echo "      /usr/bin/python $STICK/target_env.py $CP MIB3_SHIM_NAVTEXT=capture   # probe: log the nav records, drop nothing"
+echo "      /usr/bin/python $STICK/target_env.py $CP MIB3_SHIM_NAVTEXT=filter    # drop them (the kit's default)"
+echo "      /usr/bin/python $STICK/target_env.py $CP MIB3_SHIM_NAVTEXT=off       # REVERT: the bands come back"
+echo "    The gate proves itself in the log with:  'cluster/navtext: armed fd=<n>'"
+echo "    and then one 'cluster/navtext: DROP evt=1NN' per record it dropped."
 echo
 echo "[*] NEXT: plug in the iPhone, then watch:  tail -f /tmp/mib3shim.log"
 echo "    want: 'init: resolved' -> 'AddScreenDisplay: ADDING cluster display'"

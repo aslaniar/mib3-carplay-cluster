@@ -488,16 +488,41 @@ knobs_once(){   # once per carplay process, never per session (it is a ptrace)
     # must reproduce it exactly:
     #   SINK=helper   frames must leave the process at all
     #   FPS=60        the phone uses this as its rate (26.6 fps delivered)
-    #   VIEWAREAS=0   the multi-area card advert was tried on the car and is buggy
+    #   VIEWAREAS=1   THE SAFE AREA (2026-11-15).  The phone composes the cluster
+    #                 scene inside the advertised safe box, and with the box equal
+    #                 to the whole panel the vehicle marker and Apple's road-name
+    #                 text sit low enough to fall into the ECU's transparent bottom
+    #                 strip (mileage / seatbelt lamps).  Four areas are declared so
+    #                 the safe height can be A/B'd LIVE (control inbox: v0..v3,
+    #                 next, prev) with no replug; the keeper is VA_INITIAL=1.
+    #                 Safe-area-only: the VISIBLE frame stays the full panel
+    #                 (VA_VISIBLE=0) -- shrinking it is what got the 111 stream
+    #                 rejected at activation.  The earlier "VIEWAREAS=1 is buggy
+    #                 here" note referred to the multi-area CARD advert, not this.
     #   URL=...       map-only, no ETA, no speed limit, card top-aligned
+    #   NAVTEXT=filter  DROP THE CAR'S OWN ADDRESS / ARRIVAL-TIME BANDS.  The
+    #                 cluster draws them itself from nav text carplay posts to
+    #                 simplenav; the shim's nav-text gate (mib3navtext.c) drops
+    #                 those records at /tmp/Simple_Socket.  Without this line the
+    #                 gate is INERT (default off) and the bands come back -- which
+    #                 is also the revert: set it to off and replug the phone.
     for _kv in MIB3_SHIM_FPS=60 \
-               MIB3_SHIM_VIEWAREAS=0 \
+               MIB3_SHIM_VIEWAREAS=1 \
+               MIB3_SHIM_VA_COUNT=4 \
+               MIB3_SHIM_VA_VISIBLE=0 \
+               MIB3_SHIM_VA_NOOUTSIDE=1 \
+               MIB3_SHIM_VA_INITIAL=1 \
+               "MIB3_SHIM_VA0=0,0,1280,480,0,0,1280,480" \
+               "MIB3_SHIM_VA1=0,0,1280,480,0,0,1280,440" \
+               "MIB3_SHIM_VA2=0,0,1280,480,0,0,1280,400" \
+               "MIB3_SHIM_VA3=0,0,1280,480,0,0,1280,360" \
                "MIB3_SHIM_URL=maps:/car/instrumentcluster/map?showETA=no&maneuverLayout=topAligned&showSpeedLimit=no" \
-               MIB3_SHIM_CMDACK=1; do
+               MIB3_SHIM_CMDACK=1 \
+               MIB3_SHIM_NAVTEXT=filter; do
       /usr/bin/python /tmp/kit/target_env.py "$_cp" "$_kv" >/dev/null 2>&1
     done
     KNOBS_PID=$_cp
-    log "prepare: shim knobs set for carplay pid $_cp (sink=helper fps=60 card=off, MHI2 scene)"
+    log "prepare: shim knobs set for carplay pid $_cp (sink=helper fps=60 navtext=filter safearea=v1(440) VA_INITIAL=1, MHI2 scene)"
   fi
 }
 

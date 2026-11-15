@@ -37,8 +37,12 @@ cd "$ROOT" || exit 1
 
 md5of() { if command -v md5sum >/dev/null 2>&1; then md5sum "$1" | awk '{print $1}'; else md5 -q "$1"; fi; }
 
-# Field-proven builds (2026-11-02).  A pin is a binary that has run on the car.
-SHIM_WANT=dc723befb0cd4c636ca2aa2a8f2c3743
+# Pins.  A pin is a binary that has run on the car AND passed the bench, and the kit
+# refuses to stage anything else.  The shim pin is the 2026-11-12 build: Path B's
+# proven chain plus the cluster nav-text gate, field-verified 2026-11-15 (the two
+# bands did not appear on guidance start; 8 records dropped, 0 leaked, 0 frames lost).
+# The pre-gate build dc723befb0cd4c636ca2aa2a8f2c3743 is the one-line fallback.
+SHIM_WANT=c789666fa9fccfcad45a5607e5785482
 SENDER_WANT=a9ab16d0bb8f29ed0ceda3f3ad69472d
 WHEEL_WANT=e689515fc20a701f0e84d62d9dcd6251
 

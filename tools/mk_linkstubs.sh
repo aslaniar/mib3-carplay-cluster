@@ -16,9 +16,10 @@ mkdir -p "$OUT"
 # Every libc function the on-unit tools may call. Kept at GLIBC_2.17 -- nothing
 # in src/ needs newer, and the unit runs 2.23.
 LIBC_SYMS="__errno_location _exit accept access atoi bcmp bind chmod clock_gettime
-close connect free fsync getenv getpid getsockname getsockopt htons if_nametoindex
-inet_pton ioctl listen malloc memcpy memset open poll ppoll read realloc rename
-send setenv setsockopt socket strcmp strlen strncmp time unlink usleep write"
+close connect free fsync getenv getpeername getpid getsockname getsockopt htons
+if_nametoindex inet_pton ioctl listen malloc memcpy memmove memset open poll ppoll
+read realloc rename send setenv setsockopt socket strcmp strlen strncmp time unlink
+usleep write"
 
 LIBDL_SYMS="dlsym"
 

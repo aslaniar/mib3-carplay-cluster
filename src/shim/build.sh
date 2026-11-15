@@ -30,7 +30,7 @@ echo "linking against: $LIBC  $LIBDL"
 
 $CC --target=aarch64-linux-gnu -O2 -fPIC -fvisibility=default -nostdlib \
     -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-unused-but-set-variable \
-    --ld-path="$LLD" -shared -o "$BIN/mib3shim.so" mib3shim.c "$LIBC" "$LIBDL"
+    --ld-path="$LLD" -shared -o "$BIN/mib3shim.so" mib3shim.c mib3navtext.c "$LIBC" "$LIBDL"
 echo "built $BIN/mib3shim.so ($(wc -c < "$BIN/mib3shim.so") bytes)"
 
 ABI_REPO="$REPO"; . "$REPO/tools/abi_check.sh"
@@ -40,6 +40,23 @@ for _s in AirPlayInfoArrayAddScreenDisplay AirPlayReceiverSessionSetup AirPlayCo
   $READELF --dyn-syms "$BIN/mib3shim.so" | grep -q "GLOBAL.* $_s\$" || { echo "MISSING SEAM: $_s"; exit 1; }
 done
 echo "exported seams: ok"
+
+# The nav-text gate's three hooks.  They are NOT seams: they are libc call slots
+# inside the carplay executable, patched by src/inject/inject_shim.py's HOOKS
+# table.  If one disappears the injector installs two of three and the gate
+# silently never sees a record -- so fail the build here instead.
+for _s in mib3_nt_connect mib3_nt_send mib3_nt_close; do
+  $READELF --dyn-syms "$BIN/mib3shim.so" | grep -q "GLOBAL.* $_s\$" || { echo "MISSING HOOK: $_s"; exit 1; }
+done
+echo "exported hooks: ok"
+# An exported plain connect/send/close would be found by RTLD_DEFAULT, and the
+# shim's OWN helper socket would then call the gate (a loop).  Refuse it.
+for _s in connect send close; do
+  if $READELF --dyn-syms "$BIN/mib3shim.so" | grep -q "GLOBAL.* $_s\$"; then
+    echo "REFUSING: the shim must NOT export $_s (RTLD_DEFAULT would find it)"; exit 1
+  fi
+done
+echo "no bare libc exports: ok"
 
 _g=$(MD5SUM "$BIN/mib3shim.so"); _p="$(sed -n 's/^SHIM_PIN=//p' "$REPO/up.sh" | head -n1)"
 if [ "$_g" = "$_p" ]; then echo "pin: $_g  matches up.sh"; else echo "pin: $_g  up.sh pins $_p"; fi
