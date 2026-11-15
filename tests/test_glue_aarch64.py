@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""test_glue_aarch64.py -- the aarch64 GLUE, checked by disassembly.
+"""test_glue_aarch64.py -- the aarch64 glue, checked by disassembly.
 
 The host bench drives mib3navtext.c natively, but the three exported wrappers in
-mib3shim.c (mib3_nt_connect/send/close + navtext_arm + navtext_real) are only ever
-built for the unit, so nothing exercises them on the desk.  They cannot be run
-here, but their SHAPE can be asserted from the built .so, and the two failure
-modes that would break carplay are shapes:
+mib3shim.c (mib3_nt_connect/send/close plus navtext_arm and navtext_real) are
+only ever built for the unit, so nothing runs them on the bench.  Their shape
+can still be asserted from the built .so, and the two failure modes that would
+break carplay are visible as shapes:
 
-  1. the wrapper must delegate to the gate (a call/branch to another function in
-     this library), not re-implement it;
-  2. the wrapper must call the REAL libc function through the resolved POINTER
+  1. the wrapper must delegate to the gate (a call or branch to another function
+     in this library) rather than re-implement it;
+  2. the wrapper must call the real libc function through the resolved pointer
      (an indirect branch), never through a direct call to this library's own
-     `send`/`connect`/`close` PLT slot -- a direct call would make the hook call
-     libc unconditionally and bypass the gate's whole decision.
+     send/connect/close PLT slot.  A direct call would reach libc
+     unconditionally and bypass the gate's decision.
 
-A remaining gap is stated, not hidden: the runtime behaviour of the wrappers
-(arm-on-first-entry, the dlvsym fallback) is first exercised on the car, and the
-log line `cluster/navtext: armed fd=` is the on-car proof that it happened.
+One gap is stated rather than hidden: the runtime behaviour of the wrappers
+(arming on first entry, the dlvsym fallback) is first exercised on the car,
+where the log line `cluster/navtext: armed fd=` is the proof that it happened.
 
-  python3 shim/harness/test_glue_aarch64.py
+  python3 tests/test_glue_aarch64.py
 """
 import os
 import struct
@@ -101,9 +101,10 @@ def main():
                     and i.operands and i.operands[0].type == ARM64_OP_REG]
         ok(len(calls) >= 1,
            "%s delegates to code in this library (%d direct branch(es))" % (hook, len(calls)))
-        # NB the wrapper TAIL-CALLS the gate, so the real libc call is an indirect
-        # branch INSIDE mib3_navtext_<slot>, not here -- that is the next loop.
-        # and it must NOT fall back to this library's own PLT slot for the real call
+        # The wrapper tail-calls the gate, so the real libc call is an indirect
+        # branch inside mib3_navtext_<slot>, not here; the next loop checks
+        # that.  What matters here is that it does not use this library's own
+        # PLT slot for the real call.
         own_plt = []
         for plt in plt_of[slot]:
             own_plt.append(plt)
@@ -111,8 +112,8 @@ def main():
         ok(not bad,
            "%s never calls the shim's own %s PLT slot (that would bypass the gate)" % (hook, slot))
 
-    # ---- the GATE functions: this is where the real call happens, through the
-    # pointer the arm resolved (an indirect branch), never a direct one.
+    # ---- the gate functions: this is where the real call happens, through the
+    # pointer that arming resolved (an indirect branch), never a direct one.
     for sym in ("mib3_navtext_connect", "mib3_navtext_send", "mib3_navtext_close"):
         ok(sym in dynsym and dynsym[sym][0] != 0, "%s is defined in the shim" % sym)
         insns, _ = disas(sym)

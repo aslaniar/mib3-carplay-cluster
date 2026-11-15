@@ -488,24 +488,28 @@ knobs_once(){   # once per carplay process, never per session (it is a ptrace)
     # must reproduce it exactly:
     #   SINK=helper   frames must leave the process at all
     #   FPS=60        the phone uses this as its rate (26.6 fps delivered)
-    #   VIEWAREAS=1   THE SAFE AREA (2026-11-15).  The phone composes the cluster
-    #                 scene inside the advertised safe box, and with the box equal
-    #                 to the whole panel the vehicle marker and Apple's road-name
-    #                 text sit low enough to fall into the ECU's transparent bottom
-    #                 strip (mileage / seatbelt lamps).  Four areas are declared so
-    #                 the safe height can be A/B'd LIVE (control inbox: v0..v3,
-    #                 next, prev) with no replug; the keeper is VA_INITIAL=1.
-    #                 Safe-area-only: the VISIBLE frame stays the full panel
-    #                 (VA_VISIBLE=0) -- shrinking it is what got the 111 stream
-    #                 rejected at activation.  The earlier "VIEWAREAS=1 is buggy
-    #                 here" note referred to the multi-area CARD advert, not this.
+    #   VIEWAREAS=1   the safe area.  The phone composes the cluster scene
+    #                 inside the advertised safe box, and with that box equal
+    #                 to the whole panel the vehicle marker and Apple's
+    #                 road-name text sit low enough to fall into the ECU's
+    #                 transparent bottom strip (mileage / seatbelt lamps).
+    #                 Four areas are declared so the safe height can be
+    #                 compared live from the control inbox (v0..v3, next,
+    #                 prev) without a replug; the keeper is VA_INITIAL=1.
+    #                 Only the safe box changes: the visible frame stays the
+    #                 full panel (VA_VISIBLE=0), because shrinking it is what
+    #                 got the 111 stream rejected at activation.  The earlier
+    #                 "VIEWAREAS=1 is buggy here" note referred to the
+    #                 multi-area card advert, not to this.
     #   URL=...       map-only, no ETA, no speed limit, card top-aligned
-    #   NAVTEXT=filter  DROP THE CAR'S OWN ADDRESS / ARRIVAL-TIME BANDS.  The
-    #                 cluster draws them itself from nav text carplay posts to
-    #                 simplenav; the shim's nav-text gate (mib3navtext.c) drops
-    #                 those records at /tmp/Simple_Socket.  Without this line the
-    #                 gate is INERT (default off) and the bands come back -- which
-    #                 is also the revert: set it to off and replug the phone.
+    #   NAVTEXT=filter  drop the car's own address and arrival-time bands.
+    #                 The cluster draws them itself from nav text carplay
+    #                 posts to simplenav, and the shim's nav-text gate
+    #                 (mib3navtext.c) drops those records at
+    #                 /tmp/Simple_Socket.  Without this line the gate is
+    #                 inert, because its default is off, and the bands
+    #                 return; the revert is to set it to off and replug the
+    #                 phone.
     for _kv in MIB3_SHIM_FPS=60 \
                MIB3_SHIM_VIEWAREAS=1 \
                MIB3_SHIM_VA_COUNT=4 \

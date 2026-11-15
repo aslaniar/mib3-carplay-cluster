@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_inject_hooks.py -- the injector's NEW logic, tested on the desk.
+"""test_inject_hooks.py -- the injector's new logic, tested on the bench.
 
 inject_shim.py cannot be run without a live carplay, but the parts added for the
 nav-text gate are pure functions plus one table:
@@ -8,12 +8,12 @@ nav-text gate are pure functions plus one table:
   exe_path           the executable the kernel reports for a pid
   base_of_path       load base of an exact mapped object
   lib_syms_for       dynsym of a library, resolved the way the unit sees it
-  elf_jumpslots      the call slots (already exercised by navtext_proof.py)
+  elf_jumpslots      the call slots (also exercised by navtext_proof.py)
 
 A wrong base here would patch a random page of carplay, so the arithmetic gets
 its own assertions rather than a comment.
 
-  python3 shim/harness/test_inject_hooks.py
+  python3 tests/test_inject_hooks.py
 """
 import os
 import sys
@@ -56,9 +56,9 @@ def main():
        "hook symbols are mib3_nt_* (never the libc names: RTLD_DEFAULT must not find them)")
 
     # ---- 2) every hook symbol is really exported by the built shim --------
-    # NB elf_dynsym keeps UNDEFINED entries too (value 0), which is exactly what
-    # lets this assert both halves: the hook has an address, the bare libc name
-    # has none (it is only an undefined reference the shim links against).
+    # elf_dynsym keeps undefined entries too (value 0), which allows both halves
+    # of the assertion: the hook has an address, and the bare libc name has none
+    # because it is only an undefined reference the shim links against.
     syms = I.elf_dynsym(shim)
     for slot, lib, hook, holder in I.HOOKS:
         ok(syms.get(hook, 0) != 0, "the shim DEFINES %s" % hook)
@@ -81,8 +81,9 @@ def main():
     ok(I.base_of_path(1234, "/not/mapped") is None,
        "base_of_path returns None for an object that is not mapped")
 
-    # ---- 3b) the SONAME is not the mapped basename (libc.so.6 -> libc-2.23.so)
-    #          -- this is what broke the first live hot-swap of this build ----
+    # ---- 3b) the SONAME is not the mapped basename (libc.so.6 ->
+    #          libc-2.23.so), which is what broke the first hot-swap of this
+    #          build ---------------------------------------------------------
     resolved = [
         (0x7000, 0x8000, "r-xp", "00000000", "/lib64/libc-2.23.so"),
         (0x8000, 0x9000, "r--p", "00019000", "/lib64/libc-2.23.so"),
@@ -111,10 +112,11 @@ def main():
     s2, p2 = I.lib_syms_for(1234, "does-not-exist.so")
     ok(s2 is None and p2 is None, "lib_syms_for fails cleanly for an unknown library")
 
-    # ---- 4b) the SLOT VALIDATOR: libpthread, not libc, is the real provider ---
-    # On this image carplay's connect/send/close slots point into libpthread-2.23.so
-    # (glibc's cancellable wrappers).  The injector must accept that as "the real
-    # thing" -- and must NOT accept a value that is merely inside a mapped file.
+    # ---- 4b) the slot validator: libpthread, not libc, is the real provider --
+    # On this image carplay's connect/send/close slots point into
+    # libpthread-2.23.so, which holds glibc's cancellable wrappers.  The
+    # injector must accept that as the real thing, and must not accept a value
+    # that is merely inside a mapped file.
     pthread = os.path.join(root, "lib64/libpthread-2.23.so")
     if os.path.exists(pthread):
         psyms = I.elf_dynsym(pthread)
@@ -136,9 +138,10 @@ def main():
            "value_is_real accepts libc's %s as well (any object that defines it)" % "connect")
 
     # ---- 5) the slots themselves, through the injector's own helper -------
-    # NB: no local copy of the addresses here.  An assertion that compares a
-    # table against itself would pass forever; §6 below is the real check --
-    # the injector and the proof script must agree on the .got addresses.
+    # There is no local copy of the addresses here: an assertion that compares a
+    # table against itself would pass forever, and section 6 below is the real
+    # check, where the injector and the proof script must agree on the .got
+    # addresses.
     for slot in ("connect", "send", "close"):
         sl = I.elf_jumpslots(carplay, slot)
         ok(len(sl) == 1, "%s has exactly one JUMP_SLOT in the carplay executable" % slot)

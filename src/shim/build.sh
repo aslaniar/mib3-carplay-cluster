@@ -41,16 +41,17 @@ for _s in AirPlayInfoArrayAddScreenDisplay AirPlayReceiverSessionSetup AirPlayCo
 done
 echo "exported seams: ok"
 
-# The nav-text gate's three hooks.  They are NOT seams: they are libc call slots
-# inside the carplay executable, patched by src/inject/inject_shim.py's HOOKS
-# table.  If one disappears the injector installs two of three and the gate
-# silently never sees a record -- so fail the build here instead.
+# The nav-text gate's three hooks.  They are not seams: they are libc call slots
+# inside the carplay executable, patched by the HOOKS table in
+# src/inject/inject_shim.py.  If one of them goes missing the injector installs
+# two of three and the gate never sees a record, so the build fails here
+# instead.
 for _s in mib3_nt_connect mib3_nt_send mib3_nt_close; do
   $READELF --dyn-syms "$BIN/mib3shim.so" | grep -q "GLOBAL.* $_s\$" || { echo "MISSING HOOK: $_s"; exit 1; }
 done
 echo "exported hooks: ok"
 # An exported plain connect/send/close would be found by RTLD_DEFAULT, and the
-# shim's OWN helper socket would then call the gate (a loop).  Refuse it.
+# shim's own helper socket would then call the gate, recursively.  Refuse it.
 for _s in connect send close; do
   if $READELF --dyn-syms "$BIN/mib3shim.so" | grep -q "GLOBAL.* $_s\$"; then
     echo "REFUSING: the shim must NOT export $_s (RTLD_DEFAULT would find it)"; exit 1

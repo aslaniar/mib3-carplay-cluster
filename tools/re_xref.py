@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""re_xref.py -- find code that references a string/address in an aarch64 ELF.
+"""re_xref.py -- find code that references a string or address in an aarch64
+ELF.
 
-Built while chasing the cluster's navigation-text path: the carplay binary is
-stripped of names but not of strings, so the way in is "who loads this literal".
-It resolves ADRP+ADD / ADRP+LDR pairs (the aarch64 idiom for RIP-relative data)
-across the whole .text once, then answers queries.
+Used to trace the cluster's navigation-text path.  The carplay binary is
+stripped of names but not of strings, so the way in is to ask which code loads a
+given literal.  The tool resolves ADRP+ADD and ADRP+LDR pairs, the aarch64 idiom
+for PC-relative data, across the whole .text once, and then answers queries.
 
   python3 re_xref.py <elf> <string-or-hex-addr> [--limit N]
 
-Output: for every reference, the containing function (nearest preceding
-STP x29,x30 frame setup or the nearest 'ret'-delimited boundary), the
-instruction address, and a short disassembly window -- enough to pick the next
+Output: for every reference, the containing function (the nearest preceding
+STP x29,x30 frame setup, or the nearest ret-delimited boundary), the instruction
+address and a short disassembly window, which is enough to pick the next
 function to read.
 """
 import re
@@ -72,14 +73,14 @@ def resolve_xrefs(insns):
             dst = ins.operands[0]
             src = ins.operands[1]
             if src.type == ARM64_OP_MEM and src.mem.base in last_adrp:
-                # adrp page; ldr/str [xN, #disp]
+                # adrp page, then ldr/str [xN, #disp]
                 _, page = last_adrp[src.mem.base]
                 target = page + src.mem.disp
                 refs.setdefault(target, []).append((ins.address, m))
                 continue
-            # `add xD, xPage, #low12` -- capstone's operands are (dst, srcreg, imm),
-            # so the immediate lives in operands[2]; reading operands[1] as the imm
-            # silently found nothing.  (Both bugs cost a debug cycle here.)
+            # `add xD, xPage, #low12` has capstone operands (dst, srcreg, imm),
+            # so the immediate is operands[2]; reading operands[1] as the
+            # immediate found nothing.
             if len(ins.operands) == 3 and src.type == ARM64_OP_REG and \
                src.reg in last_adrp and ins.operands[2].type == ARM64_OP_IMM:
                 _, page = last_adrp[src.reg]
@@ -89,7 +90,8 @@ def resolve_xrefs(insns):
 
 
 def function_start(insns, addr):
-    """Nearest preceding 'stp x29, x30' or literal-pool gap; approximate."""
+    """The nearest preceding stp x29, x30 frame setup, or a ret boundary.  This
+    is an approximation, and it can return None."""
     best = None
     for i, ins in enumerate(insns):
         if ins.address > addr:

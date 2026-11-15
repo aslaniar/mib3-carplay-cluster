@@ -45,35 +45,35 @@ SEAMS = (
     ("AirPlayCopyServerInfo",           "libAirPlay.so", "libAirPlay.so"),
 )
 
-# ---- HOOKS: libc call slots inside the carplay executable (2026-11-12) ------
+# ---- HOOKS: libc call slots inside the carplay executable -------------------
 # (slot symbol, real symbol's library, hook symbol exported by the shim)
 #
-# These are NOT seams: they are plain libc calls that carplay makes through its
-# own PLT, and the shim is the cluster NAV-TEXT GATE (mib3navtext.c) -- carplay's
-# guidance records to simplenav on /tmp/Simple_Socket are dropped there.
+# These are not seams.  They are plain libc calls that carplay makes through
+# its own PLT, and the hook is the cluster nav-text gate (mib3navtext.c), which
+# drops carplay's guidance records to simplenav on /tmp/Simple_Socket.
 #
-#   reason for each:
-#     connect -- learn WHICH fd is the simplenav socket (its path is the argument)
-#     send    -- judge and, in filter/all mode, drop one whole record
-#     close   -- forget the fd, so a reused fd number is never mistaken for it
+#   the reason for each hook:
+#     connect -- learns which fd is the simplenav socket, from its path argument
+#     send    -- judges one record and, in filter/all mode, drops it whole
+#     close   -- forgets the fd, so a reused fd number is never taken for it
 #
-# The hook symbol is deliberately NOT named connect/send/close: an exported
-# `connect` in the shim would be found by RTLD_DEFAULT and the shim's own helper
+# The hook symbol is deliberately not named connect/send/close: an exported
+# connect in the shim would be found by RTLD_DEFAULT and the shim's own helper
 # socket would call the gate recursively.  Because the names differ, the injector
-# cannot compare "slot holds the real symbol" -- it compares against the slot
+# cannot compare "slot holds the real symbol"; it compares against the slot
 # symbol's real address, and accepts a previous shim's address for re-injection.
 #
-# carplay is BIND_NOW + PIE (verified with llvm-readelf: FLAGS_1 NOW, single
-# R_AARCH64_JUMP_SLOT per symbol at .got 0x371230/0x371388/0x371720), so the slot
-# already holds a resolved address and, once patched, is never re-resolved again.
+# carplay is BIND_NOW and PIE (verified with llvm-readelf: FLAGS_1 NOW, a single
+# R_AARCH64_JUMP_SLOT per symbol at .got 0x371230/0x371388/0x371720), so a slot
+# already holds a resolved address and is never re-resolved once patched.
 #
-# BUT THE SLOT DOES NOT HOLD LIBC'S ADDRESS.  On glibc <= 2.33 libpthread carries
-# the CANCELLABLE wrappers for exactly these calls, and it is libpthread that wins
-# resolution in carplay: /proc/maps proved it on the car (0x7f88779c60 =
-# libpthread-2.23.so + 0xc60 == its `connect`).  So the hook is validated by
-# "this value is <object containing it> + <offset>, and that object defines
-# <symbol> at that offset" -- not by comparing against a pre-computed libc
-# address, which is what refused the first hot-swap (2026-11-14).
+# The slot does not hold libc's address.  On glibc <= 2.33 libpthread carries
+# the cancellable wrappers for exactly these calls, and libpthread is what wins
+# resolution in carplay: /proc/maps shows 0x7f88779c60 = libpthread-2.23.so +
+# 0xc60, which is its connect.  A hook is therefore validated by "this value is
+# <object containing it> + <offset>, and that object defines <symbol> at that
+# offset", not by comparing against a pre-computed libc address; the exact
+# comparison was what refused the first hot-swap of this build (2026-11-14).
 HOOKS = (
     ("connect", "libc.so.6", "mib3_nt_connect", "carplay"),
     ("send",    "libc.so.6", "mib3_nt_send",    "carplay"),
@@ -199,8 +199,8 @@ def mapped_path(pid, suffix):
     return None
 
 def exe_path(pid):
-    """The executable the kernel says this pid is running (/proc/pid/exe).
-    Used instead of guessing a path for the HOOKS' slot holder."""
+    """The executable the kernel reports for this pid (/proc/pid/exe), used
+    instead of guessing a path for the object that holds the HOOKS' slots."""
     try:
         return os.readlink("/proc/%d/exe" % pid)
     except OSError:
@@ -217,11 +217,11 @@ def base_of_path(pid, path):
 
 LIBDIRS = ("/lge/app_rw/lib64/", "/lib64/", "/usr/lib64/", "/lge/app_ro/lib64/")
 
-# The mapped basename is NOT always the SONAME: on this image libc.so.6 is a
-# symlink to libc-2.23.so and /proc/<pid>/maps reports the RESOLVED name, so an
-# exact suffix match finds nothing.  That is not a theory -- it stopped the first
-# hot-swap of the nav-text gate cold: "libc.so.6 is not mapped in the target",
-# with the shim loaded but no hook and therefore no gate (2026-11-14).
+# The mapped basename is not always the SONAME: on this image libc.so.6 is a
+# symlink to libc-2.23.so and /proc/<pid>/maps reports the resolved name, so an
+# exact suffix match finds nothing.  An exact match failed the first hot-swap of
+# the nav-text gate with "libc.so.6 is not mapped in the target": the shim was
+# loaded but no hook was installed, so no gate ran (2026-11-14).
 LIB_ALIASES = {
     "libc.so.6": ("libc.so.6", "libc-"),
 }
@@ -257,10 +257,10 @@ def syms_of(path):
     return _SYMS_CACHE[path]
 
 def value_is_real(pid, value, name):
-    """True when `value` is the REAL implementation of `name` in this process:
-    it lies in a mapped file, at the exact offset that file's .dynsym gives for
-    `name`.  Which library that is does not matter (libc, libpthread, ...), and
-    that is the point -- the resolver that matters is the one the loader used."""
+    """True when value is the real implementation of name in this process: it
+    lies in a mapped file, at the exact offset that file's .dynsym gives for
+    name.  Which library that is does not matter (libc, libpthread, ...): the
+    resolver that matters is the one the loader used."""
     if not value:
         return False
     path = None
@@ -279,8 +279,8 @@ def lib_syms_for(pid, suffix, mapped=None):
     """dynsym of a library, resolved the way the running unit sees it.
 
     The prefix differs per library on this image (/lge/app_rw/lib64 for the
-    smartlink libs, /lib64 for libc), so ask /proc/maps first and only then the
-    usual directories -- the old code hardcoded one prefix."""
+    smartlink libraries, /lib64 for libc), so ask /proc/maps first and only then
+    the usual directories.  The previous version hardcoded one prefix."""
     p = mapped or mapped_path(pid, suffix)
     if p and os.path.exists(p):
         return elf_dynsym(p), p
@@ -397,9 +397,9 @@ def main():
             sym, real, lib, lib_syms[sym], shim, shim_syms[sym], hold))
 
     # ---- HOOKS: libc slots in the carplay executable (the nav-text gate) ------
-    # Same discipline as the seams: resolve everything first, abort before any
-    # write if one is missing.  The slot symbol (connect/send/close) and the hook
-    # symbol (mib3_nt_*) differ on purpose -- see HOOKS.
+    # The same discipline as the seams: resolve everything first, and abort
+    # before any write if one is missing.  The slot symbol (connect/send/close)
+    # and the hook symbol (mib3_nt_*) differ on purpose; see HOOKS.
     hook_plan = []
     exe = exe_path(pid)
     exe_base = base_of_path(pid, exe) or load_base(pid, "carplay")

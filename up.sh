@@ -27,7 +27,7 @@
 set -u
 
 # ---- the pinned builds (field-verified on the car) -------------------------
-# The shim is the build with the cluster nav-text gate (the address /
+# The shim is the build with the cluster nav-text gate (the address and
 # arrival-time bands) and the tuned safe area; both are field-verified.
 SHIM_PIN=c789666fa9fccfcad45a5607e5785482
 SENDER_PIN=a9ab16d0bb8f29ed0ceda3f3ad69472d
@@ -114,12 +114,13 @@ fi
 
 # ============== 3b. set the shim's knobs BEFORE the phone connects ==========
 # The daemon re-asserts these at each session's prepare, but /info is built when
-# the phone CONNECTS -- i.e. before prepare -- so a knob set only by the daemon
-# would miss the FIRST session after a reboot (the advert would carry the old
-# full-panel safe area, and the nav-text gate would still be armed-but-off).
-# Poking them here, right after the injection and before a plug, makes the first
-# session correct.  Same list as src/control/pathb_daemon.sh knobs_once: keep
-# them in step (tests/run_navtext.sh N12 checks that they are).
+# the phone connects, which is before prepare, so a knob set only by the daemon
+# would miss the first session after a reboot: the advert would carry the old
+# full-panel safe area and the nav-text gate would still be armed but off.  Set
+# them here, right after the injection and before a plug, so the first session
+# is correct.  This is the same list as knobs_once in
+# src/control/pathb_daemon.sh and the two must stay in step
+# (tests/run_navtext.sh N12 checks that they are).
 knobs() {
   _cp=$(pidof carplay 2>/dev/null | awk '{print $1}')
   [ -n "${_cp:-}" ] || { warn "knobs: carplay is not running -- the daemon will set them at prepare"; return 0; }

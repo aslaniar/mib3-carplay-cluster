@@ -1,94 +1,96 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* ============================================================================
- * mib3navtext.c -- THE CLUSTER NAV-TEXT GATE (the two bands on the cluster).
+ * mib3navtext.c -- drops the head unit's navigation text records on the socket
+ * between carplay and simplenav.
  *
- * WHY THIS EXISTS
- * ---------------
- * The instrument cluster is not a television.  On this car it is a small
- * computer with its own navigation frame: it draws its own address/street line
- * across the top and its own distance + ARRIVAL TIME line across the bottom,
- * and it composites the H.264 map window we send inside that frame.  So with
- * Path B up, you see the phone's Apple Maps AND the car's own two bands around
- * it.  No scene URL, safe area, pixel crop or `showETA=` value can remove them:
- * they are painted after our pixels arrive, from TEXT the head unit keeps
- * sending.
+ * The instrument cluster draws its own address/street line across the top of
+ * the map and its own distance and arrival-time line across the bottom.  Those
+ * two bands are drawn by the cluster ECU around the H.264 window we send, from
+ * text that reaches it as data, so no scene URL, safe area or pixel crop can
+ * remove them.  The chain, all on the head unit:
  *
- * The chain, all on the head unit:
+ *   carplay --/tmp/Simple_Socket--> simplenav --RSI "simplenavigation"-->
+ *        navsd --BAP NavigationSd--> carifservice --> cluster ECU
  *
- *   carplay ──/tmp/Simple_Socket──► simplenav ──RSI "simplenavigation"──►
- *        navsd ──BAP NavigationSd──► carifservice ──► CLUSTER ECU (draws the
- *                                                    street line, the distance
- *                                                    and the arrival time)
+ * This file cuts the first link of that chain.  When simplenav is never told
+ * about the phone's route, navsd has nothing to publish and the ECU has nothing
+ * to print, while the map picture and every other byte on that socket are
+ * unaffected.
  *
- * This file cuts the FIRST link: the socket from carplay to simplenav.  If
- * simplenav is never told about the phone's route, navsd has nothing to publish
- * and the ECU has nothing to print -- while the picture, the socket and
- * everything else on it are untouched.
+ * Process and entry points
+ * ------------------------
+ * The code runs inside the carplay process.  It is reached through the libc
+ * call slots carplay uses for connect(), send() and close(): the shim exports
+ * mib3_nt_connect/send/close (see the glue in mib3shim.c) and
+ * src/inject/inject_shim.py repoints those slots at them.
  *
- * THE PROTOCOL (read from the shipped binaries)
- * --------------------------------------------------------
+ * Wire format, read from the shipped binaries
+ * -------------------------------------------
  * simplenav reads one record per recv() into a 1000-byte struct
- * (`Simple_Socket_Server::Simple_Socket` -> recv(fd, buf, 1000) ->
- * `Receive_Check` -> memcpy 1000 -> `SimpleIPCService::Receive_Parsing`), and
+ * (Simple_Socket_Server::Simple_Socket -> recv(fd, buf, 1000) ->
+ * Receive_Check -> memcpy 1000 -> SimpleIPCService::Receive_Parsing), and
  * Receive_Parsing switches on:
  *
- *     offset 0 : u32 EVENT ID
- *     offset 4 : u32 TECHNOLOGY (0 = androidAuto, 1 = appleCarPlay)
- *     offset 8 : the payload struct
+ *     offset 0  u32 event id
+ *     offset 4  u32 technology (0 = androidAuto, 1 = appleCarPlay)
+ *     offset 8  the payload struct
  *
- *     The record's u32@0 is authored by the PHONE and relayed verbatim, so the
- *     gate reads it exactly the way simplenav does (the receiving contract).
- *     Do not infer the layout from carplay's side: its EAP data callback reads a
- *     u16 from its OWN per-connection wrapper struct to choose one of five
- *     destination sockets -- a different object that happens to hold the same
- *     event code.
+ * The u32 at offset 0 is written by the phone and relayed unchanged, so the
+ * gate reads it the way simplenav does, which is the receiving contract.  The
+ * layout must not be inferred from carplay's side: carplay's EAP data callback
+ * reads a u16 from its own per-connection wrapper struct to choose one of five
+ * destination sockets, and that is a different object which happens to hold the
+ * same event code.
  *
- *     event 100 (0x64) -> TurnbyTurnCP / TurnbyTurnAA     "Turn by Turn Event"
- *     event 101 (0x65) -> ManeuverUpdateCP / ManeuverUpdateAA
- *     event 102 (0x66) -> Guidance_Route_Check, androidAuto ONLY: the CarPlay
- *                         branch (tech==1) logs and returns without dispatching
- *                         (0x18938..0x18968), so on this build 102 is inert for
- *                         an iPhone.  Dropping it anyway costs nothing and covers
- *                         a build where it is not inert.
+ *     event 100 (0x64)  TurnbyTurnCP / TurnbyTurnAA   "Turn by Turn Event"
+ *     event 101 (0x65)  ManeuverUpdateCP / ManeuverUpdateAA
+ *     event 102 (0x66)  Guidance_Route_Check, androidAuto only.  The CarPlay
+ *                       branch (tech == 1) logs and returns without
+ *                       dispatching (0x18938..0x18968), so on this build 102
+ *                       is inert for an iPhone.  Dropping it costs nothing and
+ *                       covers a build where it is not inert.
  *
- *     (Receive_Parsing @ 0x18860 in simplenav; handlers 0x181d8 / 0x17f78 /
- *      0x17ec8 / 0x17e18 / 0x185f0 are all exported in .dynsym, so this mapping
- *      is read from the binary, not guessed.)
+ * Receive_Parsing is at 0x18860 in simplenav, and its handlers 0x181d8 /
+ * 0x17f78 / 0x17ec8 / 0x17e18 / 0x185f0 are all exported in .dynsym, so the
+ * mapping above is read from the binary rather than guessed.
  *
- * carplay sends exactly one whole record per send() (its guidance paths call
- * send(fd, pkt, len, 0) at 0x25f26c and 0x25f564), so a record can be judged and
- * dropped without reassembly.  Anything that does not look like a record -- a
- * short buffer, an unknown event id, an impossible technology -- is FORWARDED.
- * The gate is fail-open by construction: the only thing it can ever lose is nav
- * text.
+ * carplay sends one whole record per send() (its guidance paths call
+ * send(fd, pkt, len, 0) at 0x25f26c and 0x25f564), so a record can be judged
+ * and dropped without reassembly.  Anything that does not look like a record (a
+ * short buffer, an unknown event id, an impossible technology) is forwarded.
+ * The gate fails open: the only traffic it can lose is navigation text.
  *
- * MODES (live -- read per packet, so they can be A/B'd between phone plugs with
- * inject/target_env.py, no rebuild and no re-injection):
+ * Modes
+ * -----
+ * The mode is read per record, so it can be changed between phone plugs with
+ * inject/target_env.py, without a rebuild and without a re-injection:
  *
  *   MIB3_SHIM_NAVTEXT=off       (default) hooks installed, nothing dropped
- *   MIB3_SHIM_NAVTEXT=filter    drop the events listed in ..._DROP
- *   MIB3_SHIM_NAVTEXT=all       drop every RECORD on that socket (the "is this
- *                               channel the source at all?" experiment).  The
- *                               connect-time handshake is not a record and still
- *                               passes: simplenav reads it as a client name.
- *   MIB3_SHIM_NAVTEXT=capture   drop nothing; log the first records (the probe
- *                               that proves the event ids on your car)
+ *   MIB3_SHIM_NAVTEXT=filter    drop the event ids listed in ..._DROP
+ *   MIB3_SHIM_NAVTEXT=all       drop every record on that socket, which is the
+ *                               "is this channel the source at all?"
+ *                               experiment.  The connect-time handshake is not
+ *                               a record and still passes: simplenav reads it
+ *                               as a client name.
+ *   MIB3_SHIM_NAVTEXT=capture   drop nothing and log the first records; this
+ *                               is the probe that confirms the event ids on a
+ *                               given car.
  *
- *   MIB3_SHIM_NAVTEXT_DROP=100,101,102  (default) which event ids to drop
- *   MIB3_SHIM_NAVTEXT_PATH=/tmp/Simple_Socket     (tests point this elsewhere)
+ *   MIB3_SHIM_NAVTEXT_DROP=100,101,102  (default) the ids filter drops
+ *   MIB3_SHIM_NAVTEXT_PATH=/tmp/Simple_Socket     the target socket
  *
- * The socket is the REAL one in every mode: the hook never replaces the fd,
- * never closes it and never invents a socketpair, so a defect here cannot break
- * CarPlay's navigation plumbing -- at worst it drops a record the cluster was
- * going to print, and `MIB3_SHIM_NAVTEXT=off` stops it on the next packet.
+ * The socket is the real one in every mode: a hook never replaces the fd, never
+ * closes it and never substitutes a socketpair.  A defect in this file cannot
+ * break CarPlay's navigation plumbing; at worst it drops a record the cluster
+ * was going to print, and MIB3_SHIM_NAVTEXT=off stops that on the next record.
  *
- * TESTABILITY
- * -----------
- * This file is compiled twice: into mib3shim.so (aarch64, -nostdlib) and, by
- * harness/run_navtext.sh, into a NATIVE host binary with the host's libc.  The
- * host build drives the same code against a real AF_UNIX socket, which is how
+ * Build and test
+ * --------------
+ * The file is compiled twice: into mib3shim.so (aarch64, -nostdlib) and, by
+ * tests/run_navtext.sh, into a native host binary with the host's libc.  The
+ * host build drives this same code against a real AF_UNIX socket, which is how
  * the classifier, the fd bookkeeping, the live mode changes and the fd-reuse
- * safety are proved on the desk before any car run.
+ * safety are tested before a car run.
  * ==========================================================================*/
 
 typedef unsigned char      nt_u8;
@@ -96,9 +98,10 @@ typedef unsigned short     nt_u16;
 typedef unsigned int       nt_u32;
 typedef unsigned long      nt_u64;
 
-/* Only the libc we need.  The shim is built -nostdlib (no headers), so these are
- * declared by hand; the desk harness defines MIB3NAVTEXT_HOST and gets the
- * host's real headers instead (harness/test_navtext.c). */
+/* Only the libc this file needs.  The shim is built -nostdlib and without
+ * headers, so these are declared by hand; the host build defines
+ * MIB3NAVTEXT_HOST and gets the host's real headers instead
+ * (tests/test_navtext.c). */
 #if defined(MIB3NAVTEXT_HOST)
 #define NT_ERRNO errno
 #else
@@ -112,11 +115,11 @@ extern int  *__errno_location(void);
 
 #define NT_AF_UNIX 1
 
-/* AF_UNIX address.  The SHIPPED layout is Linux aarch64: a 2-byte family at
- * offset 0, then the path.  The desk harness builds this file for macOS, whose
- * struct is {u8 sun_len; u8 sun_family; char sun_path[104]} -- so the host branch
- * exists ONLY to let the harness drive a real socket through the same logic.  The
- * field NAMES stay identical so not one line of the gate differs. */
+/* AF_UNIX address.  The shipped layout is Linux aarch64: a 2-byte family at
+ * offset 0 followed by the path.  The host build targets macOS, whose struct is
+ * { u8 sun_len; u8 sun_family; char sun_path[104] }, so that branch exists only
+ * to let the test drive a real socket through the same logic.  The field names
+ * are identical so that no line of the gate differs between the two. */
 #if defined(MIB3NAVTEXT_HOST) && defined(__APPLE__)
 typedef struct { nt_u8 nlen; nt_u8 family; char path[104]; } nt_sockaddr_un;
 #else
@@ -139,13 +142,14 @@ static volatile int  g_ready;
 
 #define NT_MAX_FD 8
 
-/* modes (see the table at the head of this file) */
+/* Mode values.  The environment strings that select them are listed at the head
+ * of this file. */
 #define NT_MODE_OFF     0
 #define NT_MODE_FILTER  1
 #define NT_MODE_ALL     2
 #define NT_MODE_CAPTURE 3
 
-int mib3_navtext_mode(void);      /* used by the arming log line */
+int mib3_navtext_mode(void);      /* declared for the arming log line below */
 
 /* ---- state --------------------------------------------------------------- */
 static int  g_nfds;                       /* live simplenav fds */
@@ -158,9 +162,9 @@ static int  g_path_len;
 static nt_u64 g_records, g_dropped, g_passed, g_odd;
 static nt_u64 g_connects;                 /* connects seen to the target path */
 
-/* capture-mode budget: the first NT_CAP_LOG_MAX records, PLUS the first record
- * of every event id seen (so a session that opens with a dozen handshake records
- * cannot hide the guidance ids we are there to find). */
+/* capture-mode log budget: the first NT_CAP_LOG_MAX records, plus the first
+ * record of every event id seen, so a session that opens with many handshake
+ * records cannot hide the guidance ids this probe exists to find. */
 static unsigned long g_cap_logged;
 #define NT_CAP_LOG_MAX 12
 static nt_u32 g_evt_seen[4];             /* 128 event ids */
@@ -234,8 +238,9 @@ static int nt_fd_index(int fd)
   return -1;
 }
 
-/* Copy an AF_UNIX address into a zero-padded local so a short or misaligned
- * buffer cannot fault.  Returns 1 and fills `out` (if given) when it IS AF_UNIX. */
+/* Copy an AF_UNIX address into a zero-padded local, so a short or misaligned
+ * buffer cannot fault.  Returns 1 and fills out (when given) if the address is
+ * AF_UNIX. */
 static int nt_unix_path(const void *sa, unsigned int len, char *out, int cap)
 {
   nt_sockaddr_un t;
@@ -256,7 +261,7 @@ static int nt_is_target(const void *sa, unsigned int len)
   int k;
   if (g_path_len <= 0) return 0;
   if (!nt_unix_path(sa, len, p, (int)sizeof(p))) return 0;
-  /* the path must match EXACTLY: "/tmp/Simple_SocketX" is a different socket */
+  /* the path must match exactly: "/tmp/Simple_SocketX" is a different socket */
   for (k = 0; k < g_path_len; k++) if (p[k] != g_path[k]) return 0;
   return p[g_path_len] == 0;
 }
@@ -266,11 +271,12 @@ static void nt_fd_add(int fd)
   char ln[192]; nt_buf b = { ln, (int)sizeof(ln), 0 };
   if (fd < 0 || nt_fd_index(fd) >= 0) return;
   if (g_nfds >= NT_MAX_FD){
-    /* Ring, not a hard stop: if a socket is ever closed through a path we do not
-     * hook (a library calling the syscall directly), the oldest entry is stale
-     * and keeping it would silently stop the gate from ever arming again.  One
-     * fd per session is the expected shape; eight without a close is abnormal
-     * and the newest is the live one. */
+    /* The table is a ring rather than a hard stop.  If a socket is ever
+     * closed through a path this file does not hook (a library calling the
+     * syscall directly), its entry is stale, and keeping it would stop the
+     * gate from arming again for the rest of the boot.  One fd per session is
+     * the expected shape; eight without a close is abnormal, and the newest
+     * is the live one. */
     int k;
     for (k = 0; k + 1 < g_nfds; k++){ g_fds[k] = g_fds[k + 1]; g_fd_base[k] = g_fd_base[k + 1]; }
     g_nfds--;
@@ -288,10 +294,11 @@ static void nt_fd_forget(int fd)
 {
   int i = nt_fd_index(fd), k;
   if (i < 0) return;
-  /* A socket that carried NO record for its whole life is a finding, not a
-   * detail: either guidance never ran, or the records do not leave carplay
-   * through send() on this socket (a write()-based path would look exactly like
-   * this).  Say it out loud instead of leaving an empty log to be misread. */
+  /* A socket that carried no record for its whole life is reported rather
+   * than passed over.  Either guidance never ran, or the records do not leave
+   * carplay through send() on this socket, and a write()-based path would look
+   * exactly like this.  An empty log would otherwise be read as a healthy
+   * gate. */
   if (mib3_navtext_mode() != NT_MODE_OFF && g_records == g_fd_base[i]){
     char ln[200]; nt_buf b = { ln, (int)sizeof(ln), 0 };
     nb_s(&b, "fd="); nb_u(&b, (nt_u64)fd);
@@ -304,12 +311,12 @@ static void nt_fd_forget(int fd)
   g_nfds--;
 }
 
-/* ---- which AF_UNIX sockets does carplay actually connect to? --------------
- * The gate aims at ONE path (/tmp/Simple_Socket).  Rather than trust a comment,
- * every distinct unix path carplay connects to is logged while the gate is armed
- * (mode != off) -- so `MIB3_SHIM_NAVTEXT=capture` answers "is the path what we
- * think it is?" on the car, and MIB3_SHIM_NAVTEXT_PATH fixes a different answer
- * WITHOUT a rebuild.  Four entries is plenty: this process is not a shell. */
+/* ---- which AF_UNIX sockets does carplay connect to? -----------------------
+ * The gate aims at one path (/tmp/Simple_Socket).  While the gate is armed
+ * (mode != off) every distinct unix path carplay connects to is logged, so
+ * MIB3_SHIM_NAVTEXT=capture answers "is the path what we expect" on the car,
+ * and MIB3_SHIM_NAVTEXT_PATH corrects a wrong answer without a rebuild.  Four
+ * entries is enough: this process is not a shell. */
 #define NT_MAX_PATHS 4
 static char g_paths_seen[NT_MAX_PATHS][112];
 static int  g_npaths_seen;
@@ -331,19 +338,20 @@ static void nt_note_path(const char *p)
   nt_log(ln);
 }
 
-/* A connection to the target may already exist when the seams are installed
- * into a RUNNING carplay (injection happens mid-boot, the phone connects later
- * -- but a re-injection mid-session must still find it).  getpeername asks the
- * kernel, which is the only authority that matters here. */
+/* A connection to the target may already exist when the hooks are installed
+ * into a running carplay: injection happens mid-boot and the phone connects
+ * later, but a re-injection mid-session must still find the socket.
+ * getpeername asks the kernel, which is the authority on which fd is that
+ * socket. */
 static void nt_scan_fds(void)
 {
   int fd;
   if (g_path_len <= 0) return;
-  /* 1024, not 256: a mid-session re-injection happens in a process that has been
-   * running for a while, and RLIMIT_NOFILE on this image allows four figures.
-   * Missing the socket here would make `capture` log nothing and send the runbook
-   * down a false "the records do not use send()" conclusion.  getpeername is ~1 us,
-   * so even the whole range costs about a millisecond, once. */
+  /* 1024 rather than 256: a mid-session re-injection happens in a process that
+   * has been running for a while, and RLIMIT_NOFILE on this image allows four
+   * figures.  Missing the socket here would make capture mode log nothing and
+   * would read as "the records do not use send()".  getpeername costs about a
+   * microsecond, so the whole range costs about a millisecond, once. */
   for (fd = 0; fd < 1024; fd++){
     nt_sockaddr_un u;
     unsigned int len = (unsigned int)sizeof(u);
@@ -357,8 +365,8 @@ static void nt_scan_fds(void)
 }
 
 /* ==========================================================================
- * install -- idempotent.  The shim calls it on EVERY hook entry, so a hook can
- * never run before the real functions exist.
+ * install: idempotent.  The shim calls this on every hook entry, so a hook can
+ * never run before the real functions are known.
  * ========================================================================*/
 void mib3_navtext_install(void (*log)(const char *),
                           int (*c)(int, const void *, unsigned int),
@@ -387,7 +395,8 @@ void mib3_navtext_install(void (*log)(const char *),
 }
 
 /* ==========================================================================
- * configuration, read LIVE (so target_env.py can change it between plugs)
+ * configuration, read live so that target_env.py can change it between phone
+ * plugs
  * ========================================================================*/
 int mib3_navtext_mode(void)
 {
@@ -428,11 +437,12 @@ static int nt_wants_event(nt_u32 evt)
 }
 
 /* ==========================================================================
- * THE HOOKS -- thin.  Nothing here blocks, allocates, or logs on a non-target.
+ * The hooks are kept thin: nothing here blocks, allocates or logs for an fd
+ * that is not the target.
  * ========================================================================*/
 
-/* connect(): learn the fd.  The real connect ALWAYS runs and its result is
- * returned unchanged -- the gate never changes whether a socket connects. */
+/* connect(): record the fd.  The real connect always runs and its result is
+ * returned unchanged: the gate never changes whether a socket connects. */
 int mib3_navtext_connect(int fd, const void *sa, unsigned int len)
 {
   int target = 0;
@@ -441,8 +451,8 @@ int mib3_navtext_connect(int fd, const void *sa, unsigned int len)
   if (g_ready && g_path_len > 0){
     char p[112];
     if (nt_unix_path(sa, len, p, (int)sizeof(p))){
-      /* while armed, remember every distinct unix path: this is how the car run
-       * confirms (or corrects) the target without a rebuild */
+      /* while armed, remember every distinct unix path: this is how a car run
+       * confirms, or corrects, the target without a rebuild */
       if (mib3_navtext_mode() != NT_MODE_OFF) nt_note_path(p);
       target = nt_is_target(sa, len);
       if (target) g_connects++;
@@ -453,7 +463,8 @@ int mib3_navtext_connect(int fd, const void *sa, unsigned int len)
   return rc;
 }
 
-/* send(): judge one record.  Fast path (not our socket) is one array scan. */
+/* send(): judge one record.  The fast path for a socket that is not the target
+ * is one scan of the fd table. */
 long mib3_navtext_send(int fd, const void *buf, unsigned long n, int flags)
 {
   if (!g_real_send){ NT_ERRNO = NT_EINVAL; return -1; }
@@ -466,7 +477,7 @@ long mib3_navtext_send(int fd, const void *buf, unsigned long n, int flags)
 
     g_records++;
     if (tech > 1 || evt > 4095){
-      g_odd++;                        /* not a record we understand -> forward */
+      g_odd++;                  /* not a record we understand, so forward it */
     } else if (mode == NT_MODE_CAPTURE){
       if (g_cap_logged < NT_CAP_LOG_MAX || nt_evt_first(evt)){
         char ln[220]; nt_buf b = { ln, (int)sizeof(ln), 0 };
@@ -490,7 +501,7 @@ long mib3_navtext_send(int fd, const void *buf, unsigned long n, int flags)
         nb_s(&b, " dropped="); nb_u(&b, g_dropped);
         nt_log(ln);
       }
-      return (long)n;                 /* the sender sees a clean, full write */
+      return (long)n;             /* the sender sees a clean, full write */
     } else {
       g_passed++;
     }
@@ -498,8 +509,9 @@ long mib3_navtext_send(int fd, const void *buf, unsigned long n, int flags)
   return g_real_send(fd, buf, n, flags);
 }
 
-/* close(): forget the fd, so a later socket that REUSES the number is never
- * mistaken for the nav socket -- the one way this gate could eat other traffic. */
+/* close(): forget the fd, so a later socket that reuses the number is never
+ * mistaken for the nav socket.  That reuse is the only way this gate could
+ * affect unrelated traffic. */
 int mib3_navtext_close(int fd)
 {
   if (!g_real_close){ NT_ERRNO = NT_EINVAL; return -1; }

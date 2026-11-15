@@ -1,38 +1,41 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # ============================================================================
-# run_navtext.sh -- THE CLUSTER NAV-TEXT GATE BENCH.
+# run_navtext.sh -- the bench for the cluster nav-text gate.
 #
-# What the gate is: carplay posts the phone's navigation records to simplenav on
-# /tmp/Simple_Socket; simplenav turns them into the RSI "simplenavigation"
-# service, navsd turns THAT into BAP, and the cluster ECU prints the address line
-# and the distance/arrival-time line around our map.  The gate drops those records
-# at the socket, so the head unit has nothing to send (see src/shim/mib3navtext.c).
+# The gate: carplay posts the phone's navigation records to simplenav on
+# /tmp/Simple_Socket.  simplenav turns them into the RSI "simplenavigation"
+# service, navsd turns that into BAP, and the cluster ECU prints the address
+# line and the distance/arrival-time line around our map.  The gate drops those
+# records at the socket, so the head unit has nothing to send
+# (src/shim/mib3navtext.c).
 #
-# Each assertion is written so it FAILS if the mechanism breaks or goes vacuous:
+# Each assertion fails if the mechanism breaks or becomes vacuous:
 #
-#   N1  the PROOF (needs a firmware dump): simplenav's parser really dispatches on
-#       event id @0 / technology @4 with 100/101/102, and carplay really has exactly
-#       one connect/send/close call slot.  SKIPPED, loudly, without a dump.
-#   N2  the host build of the SHIPPING source compiles -Wall -Wextra clean
+#   N1  the proof (needs a firmware dump): simplenav's parser dispatches on the
+#       event id at offset 0 and the technology at offset 4, with 100/101/102,
+#       and carplay has exactly one connect/send/close call slot.  Skipped, and
+#       reported as skipped, when no dump is present.
+#   N2  the host build of the shipping source compiles -Wall -Wextra clean
 #   N3  hook behaviour against a real AF_UNIX socket: connect unchanged, fd
 #       recorded, one record per send, filter drops exactly the listed ids
-#   N4  ...and it is not vacuous: an unlisted id, a short buffer, a bogus
+#   N4  the above is not vacuous: an unlisted id, a short buffer, a bogus
 #       technology and an unknown id all still reach the listener (fail-open)
-#   N5  live knob: MIB3_SHIM_NAVTEXT is read per record, so `off` restores delivery
-#   N6  fd safety: close() forgets the fd; a REUSED fd number is not eaten
+#   N5  live knob: MIB3_SHIM_NAVTEXT is read per record, so off restores
+#       delivery on the next record
+#   N6  fd safety: close() forgets the fd, and a reused fd number is not dropped
 #   N7  mid-session adoption: a socket connected before injection is found
-#   N8  the aarch64 shim builds, exports the three hooks, and does NOT export
-#       connect/send/close (an exported `connect` would be found by RTLD_DEFAULT
-#       and the shim's own helper socket would recurse into the gate)
+#   N8  the aarch64 shim builds, exports the three hooks, and does not export
+#       connect/send/close.  An exported connect would be found by RTLD_DEFAULT
+#       and the shim's own helper socket would recurse into the gate.
 #   N9  nothing newer than GLIBC_2.23 is required (the unit's libc)
-#   N10 the build is REPRODUCIBLE (same md5 twice)
+#   N10 the build is reproducible (same md5 twice)
 #   N11 the aarch64 glue, by disassembly: delegates to the gate, calls the real
 #       libc function through the resolved pointer, never its own PLT slot
 #   N12 the kit carries the knob and pins this build (up.sh, run_inject.sh,
 #       push_kit.sh, pathb_daemon.sh)
 #
-# Desk only.  No car, no unit.  Usage: bash tests/run_navtext.sh
+# Bench only.  No car and no unit.  Usage: bash tests/run_navtext.sh
 # ============================================================================
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"

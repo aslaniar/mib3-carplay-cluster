@@ -1,29 +1,29 @@
 /* ============================================================================
- * test_navtext.c -- the desk test for the cluster NAV-TEXT GATE.
+ * test_navtext.c -- the bench for the cluster nav-text gate.
  *
- *   sh tests/run_navtext.sh
+ *   bash tests/run_navtext.sh
  *
- * It compiles ../mib3navtext.c -- THE SAME SOURCE the aarch64 shim is built
- * from -- natively, and drives the exported hooks against a REAL AF_UNIX socket
- * pair.  So every assertion below exercises the shipping code path, not a model
- * of it:
+ * The test compiles ../src/shim/mib3navtext.c, the same source the aarch64 shim
+ * is built from, as a native binary, and drives the exported hooks against a
+ * real AF_UNIX socket pair.  Every assertion therefore exercises the shipping
+ * code path rather than a model of it:
  *
  *   * connect() still connects, still returns the real errno, and is recorded
- *   * one record per send(); the event id is the u32 at offset 0, the
+ *   * one record per send(); the event id is the u32 at offset 0 and the
  *     technology the u32 at offset 4 (read from simplenav's Receive_Parsing)
  *   * filter drops exactly the listed event ids and nothing else
- *   * `all` drops every record; `capture` drops none
- *   * MIB3_SHIM_NAVTEXT is read PER PACKET, so a live knob change takes effect
- *     on the next record (that is how the car runbook A/Bs it)
+ *   * all drops every record; capture drops none
+ *   * MIB3_SHIM_NAVTEXT is read per record, so a live knob change takes effect
+ *     on the next record, which is how a car run compares the modes
  *   * anything that is not a well-formed record is forwarded (fail-open):
- *     short buffers, impossible technology, unknown event ids
- *   * close() forgets the fd, so an fd number REUSED by another socket is not
- *     eaten (the only way this gate could damage unrelated traffic)
- *   * --adopt: a socket connected BEFORE the shim existed (the mid-session
+ *     short buffers, an impossible technology, unknown event ids
+ *   * close() forgets the fd, so an fd number reused by another socket is not
+ *     dropped, which is the only way this gate could damage unrelated traffic
+ *   * --adopt: a socket connected before the hooks existed (the mid-session
  *     injection case) is adopted by the getpeername scan
  *
  * Exit status = number of failures.  Nothing here touches the car, the unit or
- * the firmware: it runs entirely on the desk.
+ * the firmware.
  * ==========================================================================*/
 #include <errno.h>
 #include <poll.h>
@@ -38,9 +38,9 @@
 #define MIB3NAVTEXT_HOST 1
 #include "../src/shim/mib3navtext.c"   /* the shipping source, unchanged */
 
-/* The gate's function-pointer types are deliberately ABI-shaped (void*), so the
- * host's typed libc entry points are wrapped rather than cast: a cast here would
- * compile and hide an ABI difference, a wrapper cannot. */
+/* The gate's function-pointer types are deliberately ABI-shaped (void *), so
+ * the host's typed libc entry points are wrapped rather than cast.  A cast
+ * would compile and could hide an ABI difference; a wrapper cannot. */
 static int host_connect(int fd, const void *a, unsigned int l)
 { return connect(fd, (const struct sockaddr *)a, (socklen_t)l); }
 static long host_send(int fd, const void *b, unsigned long n, int f)
@@ -84,7 +84,6 @@ static int accept_with_timeout(int lfd)
   return accept(lfd, NULL, NULL);
 }
 
-/* read one record with a bounded wait */
 static long read_record(int fd, unsigned char *buf, unsigned long cap)
 {
   struct pollfd p;
@@ -106,8 +105,8 @@ static unsigned long make_record(unsigned char *b, unsigned evt, unsigned tech,
                                  unsigned long total)
 {
   if (total < 8) total = 8;
-  memset(b, 0xEE, total);          /* payload filler: must never appear on the wire
-                                    * when the record is dropped */
+  memset(b, 0xEE, total);          /* payload filler, which must not appear
+                                    * on the wire when the record is dropped */
   put_u32(b, evt);
   put_u32(b + 4, tech);
   return total;
@@ -176,7 +175,7 @@ int main(int argc, char **argv)
   mib3_navtext_install(log_sink, host_connect, host_send, host_close);
   ok(1, "install is idempotent and cheap (called on every hook entry)");
 
-  /* 0b) re-install (the shim arms on EVERY hook entry): idempotent ---------- */
+  /* 0b) re-install (the shim arms on every hook entry): idempotent -------- */
   { nt_u64 r2, d2, p2, o2, c2;
     int n2;
     mib3_navtext_stats(&r2, &d2, &p2, &o2, &c2, &n2);
@@ -209,9 +208,9 @@ int main(int argc, char **argv)
 
   /* 2) filter: the three guidance events are dropped ---------------------- */
   setenv("MIB3_SHIM_NAVTEXT", "filter", 1);
-  /* a 3-digit id must not be silently truncated into a droppable one (356 & 0xff
-   * == 100): the reviewer's "the knob does something different from the banner"
-   * class of defect. */
+  /* A 3-digit id must not be silently truncated into a droppable one (356 &
+   * 0xff == 100), which would make the knob do something other than what the
+   * banner says. */
   setenv("MIB3_SHIM_NAVTEXT_DROP", "356", 1);
   n = make_record(pkt, 100, 1, 24);
   ok(mib3_navtext_send(cfd, pkt, (unsigned long)n, 0) == n && read_record(conn, got, sizeof(got)) == n,
@@ -267,8 +266,8 @@ int main(int argc, char **argv)
   ok(mib3_navtext_send(cfd, pkt, (unsigned long)n, 0) == n && read_record(conn, got, sizeof(got)) == n,
      "capture: the record is forwarded unchanged");
 
-  /* 6b) ...and the gate names every unix path carplay connects to, so the car
-   *     run can confirm or correct the target path without a rebuild ------ */
+  /* 6b) The gate also names every unix path carplay connects to, so a car run
+   *     can confirm or correct the target path without a rebuild ----------- */
   { const char *extra[2];
     char p2[128], p3[128];
     int e;
@@ -303,7 +302,7 @@ int main(int argc, char **argv)
      "fail-open: a 6-byte buffer (not a record) is forwarded");
   ok(mib3_navtext_send(cfd, pkt, 0, 0) == 0, "fail-open: a zero-length send is forwarded");
 
-  /* 8) the live knob: off takes effect on the NEXT record ---------------- */
+  /* 8) the live knob: off takes effect on the next record ---------------- */
   setenv("MIB3_SHIM_NAVTEXT", "off", 1);
   n = make_record(pkt, 102, 1, 24);
   ok(mib3_navtext_send(cfd, pkt, (unsigned long)n, 0) == n && read_record(conn, got, sizeof(got)) == n,
@@ -320,9 +319,9 @@ int main(int argc, char **argv)
   { int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
       fd_reuse_target = (sv[0] == cfd) ? sv[0] : sv[1];
-      /* The whole point is a REUSED NUMBER: if the kernel did not hand back the
-       * closed fd, this test would pass while proving nothing (the reviewer's
-       * catch).  Assert the premise, then the behaviour. */
+      /* The subject of this test is a reused number: if the kernel did not hand
+       * back the closed fd the test would pass while proving nothing, so the
+       * premise is asserted before the behaviour. */
       ok(fd_reuse_target == cfd, "the kernel reused the closed fd number (the premise of this test)");
       n = make_record(pkt, 100, 1, 24);
       ok(mib3_navtext_send(fd_reuse_target, pkt, (unsigned long)n, 0) == n,
@@ -354,7 +353,7 @@ int main(int argc, char **argv)
       ok(nfds == before, "a connect() to a different path is not recorded"); }
     close(fd3); }
 
-  /* 12) an ARMED socket that carries no records says so when it closes ------ */
+  /* 12) an armed socket that carries no records says so when it closes ----- */
   { struct sockaddr_un a;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     int acc;
@@ -370,7 +369,7 @@ int main(int argc, char **argv)
        "an armed socket that carried no records warns on close (the 'wrong layer' signal)");
   }
 
-  /* 13) the fd table is a RING: a stale entry can never wedge the gate ------ */
+  /* 13) the fd table is a ring, so a stale entry cannot wedge the gate ----- */
   { int k;
     for (k = 900; k < 912; k++) nt_fd_add(k);
     mib3_navtext_stats(&records, &dropped, &passed, &odd, &connects, &nfds);

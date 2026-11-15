@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""navtext_proof.py -- make the NAV-TEXT GATE's two claims executable.
+"""navtext_proof.py -- makes the nav-text gate's two claims executable.
 
-The gate (shim/mib3navtext.c) drops records on carplay's /tmp/Simple_Socket
-connection based on two facts read out of the SHIPPED binaries:
+The gate (src/shim/mib3navtext.c) drops records on carplay's /tmp/Simple_Socket
+connection, based on two facts read out of the shipped binaries:
 
-  (1) simplenav's Receive_Parsing dispatches on a u32 EVENT ID at offset 0 and a
-      u32 TECHNOLOGY at offset 4, with the guidance events 100/101/102
+  (1) simplenav's Receive_Parsing dispatches on a u32 event id at offset 0 and a
+      u32 technology at offset 4, with the guidance events 100/101/102
       (0x64/0x65/0x66);
-  (2) carplay reaches that socket through its OWN connect/send/close PLT slots --
-      exactly one R_AARCH64_JUMP_SLOT each -- so a GOT patch inside the carplay
+  (2) carplay reaches that socket through its own connect/send/close PLT slots,
+      exactly one R_AARCH64_JUMP_SLOT each, so a GOT patch inside the carplay
       executable is complete and unambiguous.
 
-Both are asserted here against the firmware dump, so a firmware change (or a
-sloppy edit to the gate) fails the bench instead of silently shipping a filter
-that matches nothing.
+Both are asserted here against the firmware dump, so a firmware change, or a
+drift in the addresses this repository quotes, fails the bench instead of
+shipping a filter that matches nothing.
 
   python3 tools/navtext_proof.py [ROOTFS]      exit 0 = both claims hold
 """
@@ -67,12 +67,12 @@ class Elf(object):
         return out
 
     def jumpslots(self, want):
-        """r_offsets of R_AARCH64_JUMP_SLOT relocations whose symbol is `want`.
+        """r_offsets of R_AARCH64_JUMP_SLOT relocations whose symbol is want.
 
         A JUMP_SLOT (type 1026) is a call slot: the GOT word the PLT jumps
-        through.  Finding it by RELOCATION rather than by value scan is what
-        makes the patch deterministic -- two slots can hold the same value once
-        one of them has been repointed.
+        through.  Finding it by relocation rather than by scanning for a value
+        makes the patch deterministic, because two slots can hold the same value
+        once one of them has been repointed.
         """
         dyn = self.secs.get(".dynsym")
         if dyn is None:
