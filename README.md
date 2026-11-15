@@ -21,9 +21,6 @@ Upcoming features:
 | **Shim** | Interposes three CarPlay library seams inside the running `carplay` process, advertises a second display (type 111) for the cluster, receives that stream, decrypts it, and hands access units to a socket. |
 | **Sender** | Re-muxes each access unit into MPEG-TS and paces it onto the cluster's RTP multicast, sending the video through the car's internal Ethernet bus. |
 | **Supervisor** | One resident process/daemon. When the phone starts streaming it takes the cluster's UDP port; when the session ends it hands the port back to the car.  |
-| **Nav-text gate** | The cluster draws its **own** address line and its own distance + arrival-time line around our map. That text is DATA the head unit posts to `simplenav` over `/tmp/Simple_Socket`, not pixels. Three hooks inside `carplay` drop those records, so the car has nothing to print. Runs alongside the phone's map; live knob, instant revert. |
-| **Safe area** | The phone composes the cluster scene inside an advertised safe box. Four areas are declared that differ only in that box, switchable live (`v0`..`v3`), so the vehicle marker and Apple's own labels can be moved clear of the car's bottom chrome (mileage / seatbelt lamps). |
-
 
 ## Requirements
 
@@ -82,41 +79,6 @@ sh /tmp/kit/pathbctl release    # hand the cluster back to the car
 sh /tmp/kit/pathbctl stop       # stop the supervisor
 ```
 
-## The cluster's own address / arrival-time lines
-
-The cluster is not a television: it has its own navigation frame, and it prints an
-address line and a distance + arrival-time line around the map window we send it. No
-scene-URL key, safe area or pixel crop removes those — they are painted *after* our
-pixels arrive. What the head unit actually sends is **text**, down this chain:
-
-```
-carplay ── /tmp/Simple_Socket ──▶ simplenav ──▶ navsd ──▶ BAP ──▶ cluster ECU
-```
-
-`src/shim/mib3navtext.c` cuts the first link. Three GOT hooks inside the carplay
-executable (`connect`, `send`, `close`) learn which fd is that socket, judge one
-whole record per `send()` — a u32 event id at offset 0 (100 turn-by-turn, 101
-maneuver update, 102 route-active) and a u32 technology at offset 4 — and drop the
-guidance ones. The socket is the real socket: nothing is replaced, redirected or
-closed, and anything that does not look like a record is forwarded.
-
-```
-MIB3_SHIM_NAVTEXT=off        default: hooks armed, nothing dropped
-MIB3_SHIM_NAVTEXT=filter     drop the events in MIB3_SHIM_NAVTEXT_DROP (what up.sh sets)
-MIB3_SHIM_NAVTEXT=all        drop every record on that socket
-MIB3_SHIM_NAVTEXT=capture    drop nothing; log the records and every unix path carplay opens
-MIB3_SHIM_NAVTEXT_DROP=100,101,102
-```
-
-Read per record, so `off` restores delivery on the next packet and no rebuild is
-needed. Knobs are set by `up.sh` (before you plug the phone) and re-asserted by the
-supervisor at each session.
-
-**Trade-off, stated plainly:** this also removes the cluster's turn arrow, because that
-arrow is the phone's maneuver data re-published by the car. The map, the phone's own
-card and the guidance on the main screen are unaffected.
-
-Bench: `bash tests/run_navtext.sh`.
 
 ## Acknowledgements
 
