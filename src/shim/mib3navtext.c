@@ -63,7 +63,7 @@
  * Modes
  * -----
  * The mode is read per record, so it can be changed between phone plugs with
- * inject/target_env.py, without a rebuild and without a re-injection:
+ * src/inject/target_env.py, without a rebuild and without a re-injection:
  *
  *   MIB3_SHIM_NAVTEXT=off       (default) hooks installed, nothing dropped
  *   MIB3_SHIM_NAVTEXT=filter    drop the event ids listed in ..._DROP
@@ -388,7 +388,8 @@ void mib3_navtext_install(void (*log)(const char *),
     first = 1;
     g_ready = 1;
   } else {
-    /* a re-install (two threads raced, or the shim was reloaded): refresh only */
+    /* A repeated install (two threads raced, or the shim was reloaded):
+       refresh the resolved pointers only. */
     g_log = log; g_real_connect = c; g_real_send = s; g_real_close = cl;
   }
   if (first) nt_scan_fds();
