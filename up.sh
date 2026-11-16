@@ -133,7 +133,7 @@ knobs() {
              MIB3_SHIM_VA_COUNT=4 \
              MIB3_SHIM_VA_VISIBLE=0 \
              MIB3_SHIM_VA_NOOUTSIDE=1 \
-             MIB3_SHIM_VA_INITIAL=1 \
+             MIB3_SHIM_VA_INITIAL=2 \
              "MIB3_SHIM_VA0=0,0,1280,480,0,0,1280,480" \
              "MIB3_SHIM_VA1=0,0,1280,480,0,0,1280,440" \
              "MIB3_SHIM_VA2=0,0,1280,480,0,0,1280,400" \
