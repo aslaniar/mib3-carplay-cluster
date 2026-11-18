@@ -17,6 +17,7 @@
  * Build: src/shim/build.sh (no libc headers, links the unit's own libc).
  * ==========================================================================*/
 
+#include "../shared/mib3_shared.h"
 #include "instrument_cluster_shim.h"
 
 /* ---------------------------------------------------------------------------
@@ -1977,7 +1978,7 @@ static int connect_delivery_socket(void)
 
     if (!delivery_is_enabled()) return -1;
     if (delivery_descriptor >= 0) return 0;
-    if (!path || !path[0]) path = DELIVERY_DEFAULT_PATH;
+    if (!path || !path[0]) path = MIB3_HELP_SOCK_DEFAULT;
 
     memset(&address, 0, sizeof(address));
     for (index = 0; index < 107 && path[index]; index++) address.path[index] = path[index];
@@ -2060,13 +2061,13 @@ static long write_all_bytes(int descriptor, const void *data, unsigned long leng
 
 static int send_record(const void *data, unsigned long length)
 {
-    unsigned char header[DELIVERY_HEADER_BYTES];
+    unsigned char header[MIB3_HELP_HDRLEN];
     word32 headerPart;
     word64 sequencePart;
     int index;
 
     if (!delivery_is_enabled()) return 0;
-    if (!data || !length || length > DELIVERY_MAX_FRAME) return -1;
+    if (!data || !length || length > MIB3_HELP_MAXLEN) return -1;
 
     if (delivery_descriptor < 0) {
         static long lastConnectSecond = 0;
@@ -2080,7 +2081,7 @@ static int send_record(const void *data, unsigned long length)
         }
     }
 
-    headerPart = DELIVERY_MAGIC;
+    headerPart = MIB3_HELP_MAGIC;
     for (index = 0; index < 4; index++)
         header[index] = (unsigned char)((headerPart >> (index * 8)) & 0xff);
     headerPart = (word32)length;
@@ -2090,8 +2091,8 @@ static int send_record(const void *data, unsigned long length)
     for (index = 0; index < 8; index++)
         header[8 + index] = (unsigned char)((sequencePart >> (index * 8)) & 0xff);
 
-    if (write_all_bytes(delivery_descriptor, header, DELIVERY_HEADER_BYTES,
-                        (int)delivery_wait_milliseconds()) != (long)DELIVERY_HEADER_BYTES) {
+    if (write_all_bytes(delivery_descriptor, header, MIB3_HELP_HDRLEN,
+                        (int)delivery_wait_milliseconds()) != (long)MIB3_HELP_HDRLEN) {
         if (error_would_block()) {
             delivery_consecutive_would_block++;
             if (delivery_consecutive_would_block >= 32
@@ -2184,7 +2185,7 @@ static int convert_access_unit(unsigned char *data, unsigned long length,
 {
     unsigned long cursor = 0;
 
-    if (!data || !length || length > DELIVERY_MAX_FRAME) return -1;
+    if (!data || !length || length > MIB3_HELP_MAXLEN) return -1;
     if (lengthSize < 1 || lengthSize > 4) return -1;
 
     while (length - cursor >= lengthSize) {
@@ -2453,7 +2454,7 @@ static void *receiver_thread(void *argument)
         bodyLength = (unsigned)frameHeader[0] | ((unsigned)frameHeader[1] << 8)
                    | ((unsigned)frameHeader[2] << 16) | ((unsigned)frameHeader[3] << 24);
         opcode = frameHeader[4];
-        if (bodyLength > DELIVERY_MAX_FRAME) {
+        if (bodyLength > MIB3_HELP_MAXLEN) {
             log_number("receiver", "body too large", (word64)bodyLength, 0);
             break;
         }

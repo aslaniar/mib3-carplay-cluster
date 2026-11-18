@@ -377,9 +377,7 @@ static void conn_state(int c)
     state_publish();
 }
 
-#define MIB3_HELP_MAGIC   0x4d334331u
-#define MIB3_HELP_HDRLEN  16u
-#define MIB3_HELP_MAXLEN  (8u << 20)
+#include "../shared/mib3_shared.h"
 
 #define TS_LEN   188
 #define RTP_LEN  12

@@ -258,7 +258,7 @@ static void logkv(const char *tag, const char *key, u64 v, int hex){
   logline(tag, mem);
 }
 
-#include "mib3helper.h"
+#include "../shared/mib3_shared.h"
 
 /* forward: the lossless-hop ms clock lives in the command block below (mono_ms);
  * the A5 stall bound needs ms resolution, time(0) only has seconds. */

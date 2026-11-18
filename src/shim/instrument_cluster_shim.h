@@ -36,14 +36,6 @@ int AirPlayReceiverSessionSetup(void *session,
                                 void **responseDictionaryOut,
                                 int fourthArgument);
 
-extern void mib3_navtext_install(void (*logMessage)(const char *),
-                                 int (*realConnect)(int, const void *, unsigned int),
-                                 long (*realSend)(int, const void *, unsigned long, int),
-                                 int (*realClose)(int));
-extern int mib3_navtext_connect(int, const void *, unsigned int);
-extern long mib3_navtext_send(int, const void *, unsigned long, int);
-extern int mib3_navtext_close(int);
-extern int mib3_navtext_mode(void);
 extern void *dlsym(void *libraryHandle, const char *symbolName);
 extern char *getenv(const char *variableName);
 extern int open(const char *path, int flags, ...);

@@ -72,6 +72,8 @@ extern int    usleep(unsigned int);
 extern long   time(long *);
 extern int    clock_gettime(int, void *);
 
+#include "../shared/mib3_shared.h"
+
 /* ---- tiny libc-free helpers ---------------------------------------------- */
 static usize slen(const char *s){ usize n = 0; while (s && s[n]) n++; return n; }
 static void P(int fd, const char *s){ write(fd, s, slen(s)); }
@@ -382,7 +384,7 @@ static int get_float_milli(const char *j, const char *key, s64 *out){
 
 /* ---- the shim inbox (step emitter) ------------------------------------- */
 static int g_sock = -2;              /* -2 = not tried, -1 = disabled/closed */
-static const char *g_sockpath = "/dev/shm/mib3zoom.sock";
+static const char *g_sockpath = MIB3_CONTROL_SOCK_DEFAULT;
 static void emit_close(void){ if (g_sock >= 0){ close(g_sock); } g_sock = -2; }
 /* sockaddr_un family layout differs: Linux has a 16-bit sun_family at 0, BSD
  * (macOS host build) has sun_len then sun_family.  The unit path is the Linux
