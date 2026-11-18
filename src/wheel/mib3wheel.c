@@ -72,7 +72,7 @@ extern int    usleep(unsigned int);
 extern long   time(long *);
 extern int    clock_gettime(int, void *);
 
-#include "../shared/mib3_shared.h"
+#include "../mib3_shared.h"
 
 /* ---- tiny libc-free helpers ---------------------------------------------- */
 static usize slen(const char *s){ usize n = 0; while (s && s[n]) n++; return n; }

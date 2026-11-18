@@ -377,7 +377,7 @@ static void conn_state(int c)
     state_publish();
 }
 
-#include "../shared/mib3_shared.h"
+#include "../mib3_shared.h"
 
 #define TS_LEN   188
 #define RTP_LEN  12

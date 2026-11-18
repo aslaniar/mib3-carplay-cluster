@@ -17,7 +17,7 @@
  * Build: src/shim/build.sh (no libc headers, links the unit's own libc).
  * ==========================================================================*/
 
-#include "../shared/mib3_shared.h"
+#include "../mib3_shared.h"
 #include "instrument_cluster_shim.h"
 
 /* ---------------------------------------------------------------------------
