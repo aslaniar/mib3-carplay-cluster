@@ -30,7 +30,11 @@
 #ifndef MIB3_TOOLKIT_H
 #define MIB3_TOOLKIT_H
 
-/* --- libc, declared by hand (no headers in a -nostdlib build) ------------- */
+/* --- libc, declared by hand (no headers in a -nostdlib build) -------------
+ * A translation unit that DOES include the system headers defines
+ * MIB3_TOOLKIT_NO_LIBC_DECLS first: declaring write() before <unistd.h> makes
+ * Darwin's aliased prototype an error, and off_t is not long everywhere. */
+#ifndef MIB3_TOOLKIT_NO_LIBC_DECLS
 extern long  write(int, const void *, unsigned long);
 extern long  read(int, void *, unsigned long);
 extern int   open(const char *, int, ...);
@@ -42,6 +46,7 @@ extern long  lseek(int, long, int);
 extern unsigned long strlen(const char *);
 extern int   atoi(const char *);
 extern char *getenv(const char *);
+#endif
 
 #define TK_UNUSED __attribute__((unused))
 

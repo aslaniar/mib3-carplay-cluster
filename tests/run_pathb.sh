@@ -281,13 +281,14 @@ FR=$($PY "$TOOLS/pes_frames.py" "$DG2" --json | $PY -c "import json,sys;print(js
 echo "  $(grep -E 'conn open|conn close' "$OUT/recon.mux.log" | tr '\n' ' ')"
 
 echo; echo "############ T6b: a feed FASTER than the pacer must not lose its tail ############"
-# The pacer holds up to 8 access units.  Closing the connection with them queued
-# used to discard them silently -- measured on a real phone capture: 7 of 2077 AUs
-# never reached the wire and nothing said so.  The reconnect test above cannot see
-# that, because at 40 fps the feed is slower than the pacer and the queue never
-# fills.  So feed as fast as the socket allows and require EVERY AU to arrive.
+# The pacer queue holds up to 64 access units (QUEUE_CAPACITY).  Closing the
+# connection with them queued used to discard them silently -- measured on a real
+# phone capture: 7 of 2077 AUs never reached the wire and nothing said so.  The
+# reconnect test above cannot see that, because at 40 fps the feed is slower than
+# the pacer and the queue never fills.  So feed as fast as the socket allows and
+# require EVERY AU to arrive.
 SOCKF="$OUT/sock.fast"; DGF="$OUT/fast.dgrams"; rm -f "$SOCKF" "$DGF"
-"$NAT" --in "unix:$SOCKF" --out "file:$DGF" --pace-ms 40 2>"$OUT/fast.mux.log" &
+"$NAT" --in "unix:$SOCKF" --out "file:$DGF" 2>"$OUT/fast.mux.log" &
 FP=$!; track $FP
 for _ in $(seq 1 40); do [ -S "$SOCKF" ] && break; sleep 0.05; done
 $PY "$KIT/pathb/fake_shim.py" "$FIX" 5000 "$SOCKF" >"$OUT/fast.feed.log" 2>&1
