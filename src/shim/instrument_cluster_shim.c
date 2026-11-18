@@ -2925,171 +2925,27 @@ int mib3_nt_close(int descriptor)
 }
 
 /* ---------------------------------------------------------------------------
- * SECTION 21 - THE TEARDOWN CRASH GUARD
+ * NOT IMPLEMENTED: the librsic teardown crash guard.
  *
- * The head unit's own fault, unrelated to the cluster picture. On teardown the
- * RSI client destructor frees the wrapped client and sends its unsubscribes;
- * the acknowledgement comes back through the library's dispatch and is
- * delivered to the FREED callback, which dereferences null and SIGSEGVs, and
- * the unit's crash handler reboots.
+ * The head unit's own fault, documented in car-projects/MIB3_RE/
+ * REPORT_REDTEAM_CRASH_2026-10-15.md from a recorded core: carplay's main()
+ * shutdown loop destroys its CCarSSWRsiClient singleton first, seven unsubscribe
+ * acks come back over the still-live radio, and the message pump dispatches one
+ * to a callback that resolves through the freed object's NULL vtable slot.
  *
- * Every symbol below is exported by the head unit's RSI library and every
- * internal call goes through the PLT, so interposing reaches all of it. A
- * process-global flag is set by ANY unsubscribe call; while it is set, message
- * dispatches are dropped, so no message can reach the freed callback. A process
- * restart clears the flag.
+ * It is deliberately NOT guarded here, for two reasons.
  *
- * The flag is all-or-nothing for the rest of the process. That is acceptable on
- * this build because unsubscribes only happen at teardown, which is exactly the
- * dangerous window.
+ * 1. It cannot be guarded by this library. Interposition needs the shim to be
+ *    ahead of librsic in the symbol search order; an injected shim is appended
+ *    last, so librsic's call slots were already bound when it loaded. That is
+ *    the same reason the injector repoints the three seams instead of relying on
+ *    exports. Six exported symbols therefore bought nothing.
+ *
+ * 2. It needs a graceful carplay stop with the radio still up. Nothing in this
+ *    project stops carplay, and at power-off the unit goes down as a whole, so
+ *    the ack has no live path back.
+ *
+ * If it ever does fire the symptom is a unit reboot shortly after power-off.
+ * The workaround, if that day comes, has to happen at the injector: repoint the
+ * broadcast slots the way the seams are repointed.
  * ------------------------------------------------------------------------- */
-
-static int guard_has_tripped = 0;
-static unsigned long guard_trip_count = 0;
-static unsigned long guard_dropped_count = 0;
-
-static int crash_guard_is_armed(void)
-{
-    if (!read_flag_setting("MIB3_SHIM_GUARD", 1)) return 0;
-    return activation_gate_is_open();
-}
-
-/* The next object ONLY - deliberately not the two-tier lookup used elsewhere.
- * "Any object" would find this library's own definition, so the seam would call
- * itself; measured as a hang when the real symbol is absent (the host bench has
- * no RSI library at all). "Next object" returns null instead, which is exactly
- * "there is nothing to forward to". */
-static void *crash_guard_real_symbol(const char *mangledName)
-{
-    return dlsym(LOOKUP_NEXT_OBJECT, mangledName);
-}
-
-
-static void guard_note_trip(const char *what)
-{
-    if (!guard_has_tripped)
-        log_message("crash-guard", "teardown detected - dropping dispatches");
-    guard_has_tripped = 1;
-    guard_trip_count++;
-    log_number("crash-guard", what, (word64)guard_trip_count, 0);
-}
-
-static void guard_count_drop(void)
-{
-    if (guard_has_tripped) {
-        guard_dropped_count++;
-        log_number("crash-guard", "dropped dispatch", (word64)guard_dropped_count, 0);
-    }
-}
-
-static int guard_passes_through(void) { return !crash_guard_is_armed(); }
-
-/* The names below are the exact mangled identity of the head unit's symbols, so
- * they must NOT be extern "C". The C ABI carries the argument registers; the
- * return type is void at every call site in the shipped binary. */
-
-/* WsSubscribeClient::broadcastMessage(const WsClientMessage&) - the fatal seam,
- * called through the PLT from WsSubscribeClient::onMessage. */
-void _ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE(void *self, void *message)
-  __asm__("_ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE");
-void _ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE(void *self, void *message)
-{
-    static void *realFunction;
-    static int alreadyLookedUp;
-    if (!alreadyLookedUp) {
-        realFunction = crash_guard_real_symbol(
-            "_ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE");
-        alreadyLookedUp = 1;
-    }
-    if (guard_passes_through()) {
-        if (realFunction) ((messageDispatchFunction)realFunction)(self, message);
-        return;
-    }
-    guard_count_drop();
-    if (guard_has_tripped) return;          /* the freed callback never sees this */
-    if (realFunction) ((messageDispatchFunction)realFunction)(self, message);
-}
-
-/* WsClientImpl::broadcastOnMessage(const WsClientMessage&) - the parent seam;
- * dropping here also suffices. */
-void _ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE(void *self, void *message)
-  __asm__("_ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE");
-void _ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE(void *self, void *message)
-{
-    static void *realFunction;
-    static int alreadyLookedUp;
-    if (!alreadyLookedUp) {
-        realFunction = crash_guard_real_symbol(
-            "_ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE");
-        alreadyLookedUp = 1;
-    }
-    if (guard_passes_through()) {
-        if (realFunction) ((messageDispatchFunction)realFunction)(self, message);
-        return;
-    }
-    guard_count_drop();
-    if (guard_has_tripped) return;
-    if (realFunction) ((messageDispatchFunction)realFunction)(self, message);
-}
-
-/* the unsubscribe family: flag setters, then the real call */
-
-void _ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb(void *self, void *condition, unsigned char value)
-  __asm__("_ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb");
-void _ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb(void *self, void *condition, unsigned char value)
-{
-    static void *realFunction;
-    static int alreadyLookedUp;
-    if (!alreadyLookedUp) {
-        realFunction = crash_guard_real_symbol(
-            "_ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb");
-        alreadyLookedUp = 1;
-    }
-    if (!guard_passes_through()) guard_note_trip("unsubscribe(string, bool)");
-    if (realFunction) ((unsubscribeWithBoolFunction)realFunction)(self, condition, value);
-}
-
-void _ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb(void *self, void *condition, unsigned char value)
-  __asm__("_ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb");
-void _ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb(void *self, void *condition, unsigned char value)
-{
-    static void *realFunction;
-    static int alreadyLookedUp;
-    if (!alreadyLookedUp) {
-        realFunction = crash_guard_real_symbol(
-            "_ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb");
-        alreadyLookedUp = 1;
-    }
-    if (!guard_passes_through()) guard_note_trip("unsubscribe(condition, bool)");
-    if (realFunction) ((unsubscribeWithBoolFunction)realFunction)(self, condition, value);
-}
-
-void _ZN3SAI17WsSubscribeClient14unsubscribeAllEv(void *self)
-  __asm__("_ZN3SAI17WsSubscribeClient14unsubscribeAllEv");
-void _ZN3SAI17WsSubscribeClient14unsubscribeAllEv(void *self)
-{
-    static void *realFunction;
-    static int alreadyLookedUp;
-    if (!alreadyLookedUp) {
-        realFunction = crash_guard_real_symbol(
-            "_ZN3SAI17WsSubscribeClient14unsubscribeAllEv");
-        alreadyLookedUp = 1;
-    }
-    if (!guard_passes_through()) guard_note_trip("unsubscribeAll");
-    if (realFunction) ((unsubscribeAllFunction)realFunction)(self);
-}
-
-void _ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE(void *self, void *condition)
-  __asm__("_ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE");
-void _ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE(void *self, void *condition)
-{
-    static void *realFunction;
-    static int alreadyLookedUp;
-    if (!alreadyLookedUp) {
-        realFunction = crash_guard_real_symbol(
-            "_ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE");
-        alreadyLookedUp = 1;
-    }
-    if (!guard_passes_through()) guard_note_trip("unsubscribe(string)");
-    if (realFunction) ((unsubscribePlainFunction)realFunction)(self, condition);
-}

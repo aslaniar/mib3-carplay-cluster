@@ -291,12 +291,8 @@ typedef struct {
 
     typedef void *(*versionedLookupFunction)(void *, const char *, const char *);
 
-typedef void (*messageDispatchFunction)(void *, void *);
 
-typedef void (*unsubscribeWithBoolFunction)(void *, void *, unsigned char);
 
-typedef void (*unsubscribeAllFunction)(void *);
 
-typedef void (*unsubscribePlainFunction)(void *, void *);
 
 #endif /* INSTRUMENT_CLUSTER_SHIM_H */
