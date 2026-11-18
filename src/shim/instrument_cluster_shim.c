@@ -6,13 +6,11 @@
  * receive the compressed video the phone sends for it, and hand those frames
  * to a separate process that puts them on the instrument cluster.
  *
- * Read this file top to bottom. It is ordered the way the program runs:
- *
- *     1. the three intercepted entry points        (START HERE)
- *     2. the display advertisement they build
- *     3. the /info dictionary the phone reads
- *     4. the receiver thread that carries the video
- *     5. the supporting layers those depend on
+ * The file is split into numbered sections. The three intercepted entry points
+ * are DECLARED first (section 1); their bodies live with the feature they
+ * implement - the display advertisement in section 11, the /info dictionary in
+ * section 12, the stream setup in section 19. Everything below a body supports
+ * it.
  *
  * Nothing in here draws anything. The only outbound path is a socket.
  *
@@ -955,7 +953,10 @@ static mutableCoreFoundationDictionary build_area_dictionary(const viewAreaRecta
     dictionary_put_integer(safeArea, "originXPixels", (signedWord)rectangle->safeOriginX);
     dictionary_put_integer(safeArea, "originYPixels", (signedWord)rectangle->safeOriginY);
 
-    if (boolean_true_variable)
+    /* The deployment sets MIB3_SHIM_VA_NOOUTSIDE=1, so OMITTING the key is the
+     * default; setting the knob to 0 restores it. The knob is honoured either
+     * way, which is what keeps the shim and up.sh in balance. */
+    if (!read_flag_setting("MIB3_SHIM_VA_NOOUTSIDE", 1) && boolean_true_variable)
         dictionary_put_object(safeArea, "drawUIOutsideSafeArea", *(void **)boolean_true_variable);
 
     dictionary_put_object(area, "safeArea", safeArea);
@@ -1088,7 +1089,7 @@ static void add_cluster_display_fields(void *displayList, int pixelWidth, int pi
             dictionary_put_integer(safeArea, "heightPixels", (signedWord)pixelHeight);
             dictionary_put_integer(safeArea, "originXPixels", 0);
             dictionary_put_integer(safeArea, "originYPixels", 0);
-            if (boolean_true_variable)
+            if (!read_flag_setting("MIB3_SHIM_VA_NOOUTSIDE", 1) && boolean_true_variable)
                 dictionary_put_object(safeArea, "drawUIOutsideSafeArea",
                                       *(void **)boolean_true_variable);
             dictionary_put_object(singleArea, "safeArea", safeArea);
@@ -1220,7 +1221,8 @@ static int complete_display_entry(mutableCoreFoundationDictionary entry,
 {
     coreFoundationObject identifierValue;
 
-    if (!entry || !object_is_dictionary(entry) || !dictionary_set || !dictionary_get) return 0;
+    if (!entry || !object_is_dictionary(entry) || !create_dictionary
+        || !dictionary_set || !dictionary_get) return 0;
     identifierValue = (coreFoundationObject)dictionary_get(entry, keys.uniqueIdentifier);
 
     /* the phone reads "uid" for the panel list; without it the entry is dropped */
@@ -1298,7 +1300,8 @@ static void build_display_panels(mutableCoreFoundationDictionary infoDictionary)
     long displayIndex;
 
     displayList = (coreFoundationObject)dictionary_get(infoDictionary, keys.displays);
-    if (!object_is_array(displayList) || !create_array || !array_callbacks) return;
+    if (!object_is_array(displayList) || !create_array || !array_callbacks
+        || !create_dictionary) return;
 
     panels = create_array(0, 0, array_callbacks);
     if (!panels) return;
@@ -1494,6 +1497,85 @@ void *AirPlayCopyServerInfo(void *server, void *unusedSecondArgument, void *erro
 static void *current_command_session = 0;
 static unsigned current_command_generation = 0;
 
+/* ---- command acknowledgements --------------------------------------------
+ * The completion runs on the phone library's own HTTP thread, AFTER the send
+ * returns, and it may outlive the session that issued it. So it touches no
+ * CoreFoundation object, takes no lock, and does no I/O: it compares a
+ * generation and, for a view-area switch, records the index the phone applied.
+ *
+ * The context pointer is one of a small ring of process-lifetime slots, so
+ * there is nothing to free and no ownership crosses a thread.
+ * ---------------------------------------------------------------------- */
+
+#define COMMAND_ANSWER_SLOT_COUNT 8
+
+typedef struct {
+    volatile unsigned generation;
+    volatile int viewAreaIndex;      /* -1 when the command was not a switch */
+    char typeName[24];
+} commandAnswerSlot;
+
+static commandAnswerSlot answerSlots[COMMAND_ANSWER_SLOT_COUNT];
+static volatile int nextAnswerSlot = 0;
+static volatile long acceptedCommandCount = 0;
+static volatile long refusedCommandCount = 0;
+static volatile long staleAnswerCount = 0;
+
+static commandAnswerSlot *claim_answer_slot(const char *commandType, int viewAreaIndex)
+{
+    int slotIndex = nextAnswerSlot;
+    commandAnswerSlot *slot;
+    int characterIndex = 0;
+
+    nextAnswerSlot = (slotIndex + 1) % COMMAND_ANSWER_SLOT_COUNT;
+    slot = &answerSlots[slotIndex];
+    while (commandType && commandType[characterIndex]
+           && characterIndex < (int)sizeof(slot->typeName) - 1) {
+        slot->typeName[characterIndex] = commandType[characterIndex];
+        characterIndex++;
+    }
+    slot->typeName[characterIndex] = '\0';
+    slot->viewAreaIndex = viewAreaIndex;
+    slot->generation = current_command_generation;
+    return slot;
+}
+
+static void command_acknowledged(int status, void *response, void *context)
+{
+    commandAnswerSlot *slot = (commandAnswerSlot *)context;
+
+    (void)response;             /* deliberately untouched: another thread owns it */
+    if (!slot) return;
+
+    /* a reply from a session that has been replaced must be dropped, never
+     * applied: acting on it would command a session that no longer exists */
+    if (slot->generation != current_command_generation) {
+        staleAnswerCount++;
+        log_number("command-ack/stale", "status", (word64)(word32)status, 0);
+        log_message("command-ack/stale/type", slot->typeName);
+        return;
+    }
+    if (status == 0) acceptedCommandCount++;
+    else             refusedCommandCount++;
+
+    log_number("command-ack", "status (0 = accepted)", (word64)(word32)status, 0);
+    log_message("command-ack/type", slot->typeName);
+
+    if (slot->viewAreaIndex >= 0) {
+        if (status == 0) {
+            /* only now do we believe the display actually moved */
+            current_view_area_index = slot->viewAreaIndex;
+            log_number("view-areas", "applied index",
+                       (word64)(word32)slot->viewAreaIndex, 0);
+        } else {
+            /* refused: the index is left alone, so a refusal cannot strand the
+             * display in a state we merely believe we are in */
+            log_number("view-areas", "refused index",
+                       (word64)(word32)slot->viewAreaIndex, 0);
+        }
+    }
+}
+
 static mutableCoreFoundationDictionary make_parameters_with_display_identifier(void)
 {
     mutableCoreFoundationDictionary parameters;
@@ -1506,8 +1588,9 @@ static mutableCoreFoundationDictionary make_parameters_with_display_identifier(v
     return parameters;
 }
 
-static int send_command(void *session, const char *commandType,
-                        mutableCoreFoundationDictionary parameters)
+static int send_command_with_acknowledgement(void *session, const char *commandType,
+                                            mutableCoreFoundationDictionary parameters,
+                                            int viewAreaIndex)
 {
     mutableCoreFoundationDictionary command;
     int result = -1;
@@ -1533,7 +1616,13 @@ static int send_command(void *session, const char *commandType,
         if (typeKey && paramsKey && typeValue && parameters) {
             dictionary_set(command, typeKey, typeValue);
             dictionary_set(command, paramsKey, parameters);
-            result = send_command_to_phone(session, command, 0, 0);
+            if (read_flag_setting("MIB3_SHIM_CMDACK", 1)) {
+                result = send_command_to_phone(session, command,
+                                               (void *)command_acknowledged,
+                                               claim_answer_slot(commandType, viewAreaIndex));
+            } else {
+                result = send_command_to_phone(session, command, 0, 0);
+            }
         }
         if (release_object) {
             if (typeValue) release_object(typeValue);
@@ -1543,6 +1632,13 @@ static int send_command(void *session, const char *commandType,
     }
     if (release_object) release_object(command);   /* the caller releases after sending */
     return result;
+}
+
+/* send without tracking the phone's verdict */
+static int send_command(void *session, const char *commandType,
+                        mutableCoreFoundationDictionary parameters)
+{
+    return send_command_with_acknowledgement(session, commandType, parameters, -1);
 }
 
 static void command_show_scene(void *session, const char *reason)
@@ -1622,7 +1718,8 @@ static void command_switch_view_area(void *session, int areaIndex, const char *r
     }
     log_number("view-areas", "switch requested", (word64)(word32)areaIndex, 0);
     log_number("view-areas", "switch result",
-               (word64)(word32)send_command(session, "updateViewArea", parameters), 0);
+               (word64)(word32)send_command_with_acknowledgement(
+                   session, "updateViewArea", parameters, areaIndex), 0);
     log_message("view-areas/switch-reason", reason ? reason : "?");
     if (release_object) release_object(parameters);
 }
@@ -1978,6 +2075,43 @@ static void drain_queues(void *session)
 #define DELIVERY_MAX_FRAME    (8u << 20)
 #define DELIVERY_SEND_BUFFER  (4u << 20)
 
+/* MIB3_SHIM_SINK names where frames go. up.sh and the supervisor both set
+ * "helper"; "off" (or 0) disables delivery without touching anything else, and
+ * anything else is refused loudly rather than silently behaving as off. The
+ * default is the consumer, because it is the only delivery path that exists and
+ * a silent no-op is the harder failure to diagnose. */
+#define DELIVERY_MODE_DISABLED  0
+#define DELIVERY_MODE_CONSUMER  1
+
+static int delivery_mode = -1;
+
+static void resolve_delivery_mode(void)
+{
+    char *configured = getenv("MIB3_SHIM_SINK");
+
+    if (delivery_mode >= 0) return;
+    delivery_mode = DELIVERY_MODE_CONSUMER;
+
+    if (configured && configured[0]) {
+        if (configured[0] == 'o' || configured[0] == '0') {
+            delivery_mode = DELIVERY_MODE_DISABLED;
+        } else if (configured[0] == 'h') {
+            delivery_mode = DELIVERY_MODE_CONSUMER;
+        } else {
+            log_message("delivery", "MIB3_SHIM_SINK names a mode that no longer exists "
+                                    "(only off or helper) - staying off");
+            delivery_mode = DELIVERY_MODE_DISABLED;
+        }
+    }
+    log_number("delivery", "mode (0 = off, 1 = consumer)", (word64)(word32)delivery_mode, 0);
+}
+
+static int delivery_is_enabled(void)
+{
+    resolve_delivery_mode();
+    return delivery_mode == DELIVERY_MODE_CONSUMER;
+}
+
 static int delivery_descriptor = -1;
 static frameSequence delivery_sequence = 0;
 static unsigned long delivery_sent_count = 0;
@@ -2011,6 +2145,7 @@ static int connect_delivery_socket(void)
     int descriptor;
     int index;
 
+    if (!delivery_is_enabled()) return -1;
     if (delivery_descriptor >= 0) return 0;
     if (!path || !path[0]) path = DELIVERY_DEFAULT_PATH;
 
@@ -2058,6 +2193,7 @@ static void reconnect_delivery_socket_periodically(void)
     static long lastAttemptSecond = -1;
     long now = time(0);
 
+    if (!delivery_is_enabled()) return;
     if (delivery_descriptor >= 0) return;
     if (now == lastAttemptSecond) return;
     lastAttemptSecond = now;
@@ -2099,6 +2235,7 @@ static int send_record(const void *data, unsigned long length)
     word64 sequencePart;
     int index;
 
+    if (!delivery_is_enabled()) return 0;
     if (!data || !length || length > DELIVERY_MAX_FRAME) return -1;
 
     if (delivery_descriptor < 0) {
@@ -2899,4 +3036,178 @@ int mib3_nt_close(int descriptor)
 {
     arm_navigation_text_gate();
     return mib3_navtext_close(descriptor);
+}
+
+/* ---------------------------------------------------------------------------
+ * SECTION 21 - THE TEARDOWN CRASH GUARD
+ *
+ * The head unit's own fault, unrelated to the cluster picture. On teardown the
+ * RSI client destructor frees the wrapped client and sends its unsubscribes;
+ * the acknowledgement comes back through the library's dispatch and is
+ * delivered to the FREED callback, which dereferences null and SIGSEGVs, and
+ * the unit's crash handler reboots.
+ *
+ * Every symbol below is exported by the head unit's RSI library and every
+ * internal call goes through the PLT, so interposing reaches all of it. A
+ * process-global flag is set by ANY unsubscribe call; while it is set, message
+ * dispatches are dropped, so no message can reach the freed callback. A process
+ * restart clears the flag.
+ *
+ * The flag is all-or-nothing for the rest of the process. That is acceptable on
+ * this build because unsubscribes only happen at teardown, which is exactly the
+ * dangerous window.
+ * ------------------------------------------------------------------------- */
+
+static int guard_has_tripped = 0;
+static unsigned long guard_trip_count = 0;
+static unsigned long guard_dropped_count = 0;
+
+static int crash_guard_is_armed(void)
+{
+    if (!read_flag_setting("MIB3_SHIM_GUARD", 1)) return 0;
+    return activation_gate_is_open();
+}
+
+/* The next object ONLY - deliberately not the two-tier lookup used elsewhere.
+ * "Any object" would find this library's own definition, so the seam would call
+ * itself; measured as a hang when the real symbol is absent (the host bench has
+ * no RSI library at all). "Next object" returns null instead, which is exactly
+ * "there is nothing to forward to". */
+static void *crash_guard_real_symbol(const char *mangledName)
+{
+    return dlsym(LOOKUP_NEXT_OBJECT, mangledName);
+}
+
+typedef void (*messageDispatchFunction)(void *, void *);
+typedef void (*unsubscribeWithBoolFunction)(void *, void *, unsigned char);
+typedef void (*unsubscribeAllFunction)(void *);
+typedef void (*unsubscribePlainFunction)(void *, void *);
+
+static void guard_note_trip(const char *what)
+{
+    if (!guard_has_tripped)
+        log_message("crash-guard", "teardown detected - dropping dispatches");
+    guard_has_tripped = 1;
+    guard_trip_count++;
+    log_number("crash-guard", what, (word64)guard_trip_count, 0);
+}
+
+static void guard_count_drop(void)
+{
+    if (guard_has_tripped) {
+        guard_dropped_count++;
+        log_number("crash-guard", "dropped dispatch", (word64)guard_dropped_count, 0);
+    }
+}
+
+static int guard_passes_through(void) { return !crash_guard_is_armed(); }
+
+/* The names below are the exact mangled identity of the head unit's symbols, so
+ * they must NOT be extern "C". The C ABI carries the argument registers; the
+ * return type is void at every call site in the shipped binary. */
+
+/* WsSubscribeClient::broadcastMessage(const WsClientMessage&) - the fatal seam,
+ * called through the PLT from WsSubscribeClient::onMessage. */
+void _ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE(void *self, void *message)
+  __asm__("_ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE");
+void _ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE(void *self, void *message)
+{
+    static void *realFunction;
+    static int alreadyLookedUp;
+    if (!alreadyLookedUp) {
+        realFunction = crash_guard_real_symbol(
+            "_ZN3SAI17WsSubscribeClient16broadcastMessageERKNS_15WsClientMessageE");
+        alreadyLookedUp = 1;
+    }
+    if (guard_passes_through()) {
+        if (realFunction) ((messageDispatchFunction)realFunction)(self, message);
+        return;
+    }
+    guard_count_drop();
+    if (guard_has_tripped) return;          /* the freed callback never sees this */
+    if (realFunction) ((messageDispatchFunction)realFunction)(self, message);
+}
+
+/* WsClientImpl::broadcastOnMessage(const WsClientMessage&) - the parent seam;
+ * dropping here also suffices. */
+void _ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE(void *self, void *message)
+  __asm__("_ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE");
+void _ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE(void *self, void *message)
+{
+    static void *realFunction;
+    static int alreadyLookedUp;
+    if (!alreadyLookedUp) {
+        realFunction = crash_guard_real_symbol(
+            "_ZN3SAI12WsClientImpl18broadcastOnMessageERKNS_15WsClientMessageE");
+        alreadyLookedUp = 1;
+    }
+    if (guard_passes_through()) {
+        if (realFunction) ((messageDispatchFunction)realFunction)(self, message);
+        return;
+    }
+    guard_count_drop();
+    if (guard_has_tripped) return;
+    if (realFunction) ((messageDispatchFunction)realFunction)(self, message);
+}
+
+/* the unsubscribe family: flag setters, then the real call */
+
+void _ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb(void *self, void *condition, unsigned char value)
+  __asm__("_ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb");
+void _ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb(void *self, void *condition, unsigned char value)
+{
+    static void *realFunction;
+    static int alreadyLookedUp;
+    if (!alreadyLookedUp) {
+        realFunction = crash_guard_real_symbol(
+            "_ZN3SAI17WsSubscribeClient11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb");
+        alreadyLookedUp = 1;
+    }
+    if (!guard_passes_through()) guard_note_trip("unsubscribe(string, bool)");
+    if (realFunction) ((unsubscribeWithBoolFunction)realFunction)(self, condition, value);
+}
+
+void _ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb(void *self, void *condition, unsigned char value)
+  __asm__("_ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb");
+void _ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb(void *self, void *condition, unsigned char value)
+{
+    static void *realFunction;
+    static int alreadyLookedUp;
+    if (!alreadyLookedUp) {
+        realFunction = crash_guard_real_symbol(
+            "_ZN3SAI17WsSubscribeClient11unsubscribeERKNS_20WsSubscribeConditionEb");
+        alreadyLookedUp = 1;
+    }
+    if (!guard_passes_through()) guard_note_trip("unsubscribe(condition, bool)");
+    if (realFunction) ((unsubscribeWithBoolFunction)realFunction)(self, condition, value);
+}
+
+void _ZN3SAI17WsSubscribeClient14unsubscribeAllEv(void *self)
+  __asm__("_ZN3SAI17WsSubscribeClient14unsubscribeAllEv");
+void _ZN3SAI17WsSubscribeClient14unsubscribeAllEv(void *self)
+{
+    static void *realFunction;
+    static int alreadyLookedUp;
+    if (!alreadyLookedUp) {
+        realFunction = crash_guard_real_symbol(
+            "_ZN3SAI17WsSubscribeClient14unsubscribeAllEv");
+        alreadyLookedUp = 1;
+    }
+    if (!guard_passes_through()) guard_note_trip("unsubscribeAll");
+    if (realFunction) ((unsubscribeAllFunction)realFunction)(self);
+}
+
+void _ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE(void *self, void *condition)
+  __asm__("_ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE");
+void _ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE(void *self, void *condition)
+{
+    static void *realFunction;
+    static int alreadyLookedUp;
+    if (!alreadyLookedUp) {
+        realFunction = crash_guard_real_symbol(
+            "_ZN3SAI12WsClientImpl11unsubscribeERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE");
+        alreadyLookedUp = 1;
+    }
+    if (!guard_passes_through()) guard_note_trip("unsubscribe(string)");
+    if (realFunction) ((unsubscribePlainFunction)realFunction)(self, condition);
 }

@@ -6,7 +6,7 @@ The goal is a personal, handwritten rewrite, done to learn the project properly 
 brush up C++. It is not a mechanical port job for an agent to do.
 
 - Original C implementation (reference, works): `src/shim/mib3shim.c` — 4,460 lines, 2,863 code
-- Readable C draft (first pass, passes the benches): `src/shim/instrument_cluster_shim.c` on branch `rewrite/readable-shim` — 2,903 lines, 2,316 code
+- Readable C draft (passes the benches, 5 fidelity fixes applied): `src/shim/instrument_cluster_shim.c` on branch `rewrite/readable-shim` — 3,213 lines
 - This document: the C++ plan, the learning path, and the cleanup debt in the C draft
 
 The C draft is the better thing to port *from*, because it is already ordered by job
@@ -272,38 +272,45 @@ chase it.
 
 ---
 
-## 10. Cleanup debt in the C draft
+## 10. State of the C draft
 
-Fix these before treating `instrument_cluster_shim.c` as the reference to port from.
+**Fixed since the first pass** (commit after `defa5dd`):
 
-**Functional**
+1. **`MIB3_SHIM_VA_NOOUTSIDE` is honoured, and its default is now 1** — omission of
+   `drawUIOutsideSafeArea` is the default, matching what `up.sh` sets. Setting the knob
+   to 0 restores the key. Applied to both the multi-area and single-area builders.
+2. **The view-area index is updated on a confirmed switch.** `current_view_area_index`
+   now moves only when the phone reports status 0, so `next` / `prev` step through the
+   areas instead of returning to the same one.
+3. **The crash guard is ported** (section 21). All six mangled librsic symbols are
+   exported and verified present in the built `.so`.
+4. **Command acknowledgements restored.** `MIB3_SHIM_CMDACK` (default 1) passes a real
+   completion callback; a refused command is now visible in the log, and a refused
+   view-area switch leaves the index untouched.
+5. **`MIB3_SHIM_SINK` is honoured** — `off`/`0` disables delivery, `helper` enables it,
+   anything else is refused loudly and stays off. Default is the consumer.
+6. **Three null-call sites guarded** — `create_dictionary` is now checked in
+   `complete_display_entry` and `build_display_panels`.
+7. **The file header no longer claims an ordering the file does not have.**
 
-1. **The crash guard is missing.** The librsic teardown interposition is not in the C
-   draft. It prevents a real reboot. Port it as its own unit (~120 lines of mangled
-   wrappers, unaffected by the rewrite).
-2. **Unguarded `create_dictionary` calls.** Three sites call it without checking the
-   pointer resolved — a null call if symbol lookup failed: line 1269 (the stream entry
-   inside `complete_display_entry`), and lines 1332 and 1355 inside
-   `build_display_panels`. The other seven call sites are guarded. Either guard these
-   three or assert once after `resolve_all_symbols()`.
+**Still open**
 
-**Structural**
+8. **237 lines of repeated dictionary writes** → the schema table (section 4 of this
+   doc).
+9. **Six near-identical `command_*` functions** → one sender plus a command table.
+10. **The remaining null-check walls.** One `runtime_is_ready()` assertion after
+    resolution would remove most of them.
+11. **359+ blank lines.** Bracing style is inconsistent; pick one.
+12. `log_number("receiver", "authentication failed", 0, 0)` logs nothing useful — log
+    the frame counter and the tag length.
+13. `heightWasGiven` in `resolve_cluster_geometry` is set then read in two branches;
+    simplify.
 
-3. **237 lines of repeated dictionary writes** → the schema table (section 4).
-4. **Six near-identical `command_*` functions** → one sender plus a command table.
-5. **The remaining null-check walls.** One `runtime_is_ready()` assertion after
-   resolution would remove most of them.
-6. **359 blank lines.** Bracing style is inconsistent; pick one.
+Still not ported from the original, and deliberately so: the banner, entry marker,
+telemetry capture, breadcrumbs, dictionary dumper, advert self-check, and the block of
+harness exports. Note that the self-check is the thing that would have caught the
+`VA_NOOUTSIDE` divergence before the car did.
 
-**Cosmetic**
-
-7. The file header claims "read top to bottom, entry points first". Only the
-   *declarations* are first; the seam bodies are at 1150, 1230 and 2790. Either move the
-   bodies or fix the comment.
-8. `log_number("receiver", "authentication failed", 0, 0)` is a useless line — log the
-   frame counter and the tag length instead.
-9. `heightWasGiven` in `resolve_cluster_geometry` is set then read in two branches;
-   simplify.
 
 ---
 
