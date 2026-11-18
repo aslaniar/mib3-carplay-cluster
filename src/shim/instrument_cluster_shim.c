@@ -17,6 +17,8 @@
  * Build: src/shim/build.sh (no libc headers, links the unit's own libc).
  * ==========================================================================*/
 
+#include "instrument_cluster_shim.h"
+
 /* ---------------------------------------------------------------------------
  * SECTION 1 - THE THREE ENTRY POINTS
  *
@@ -29,32 +31,10 @@
  *   AirPlayReceiverSessionSetup       - handle a stream request
  * ------------------------------------------------------------------------- */
 
-int AirPlayInfoArrayAddScreenDisplay(void *displayList,
-                                     const void *displayIdentifier,
-                                     int features,
-                                     int primaryInputDevice,
-                                     int maximumFramesPerSecond,
-                                     int widthInPixels,
-                                     int heightInPixels,
-                                     int widthInMillimetres,
-                                     int heightInMillimetres);
 
-void *AirPlayCopyServerInfo(void *server, void *unusedSecondArgument, void *errorOut);
 
-int AirPlayReceiverSessionSetup(void *session,
-                                void *requestDictionary,
-                                void **responseDictionaryOut,
-                                int fourthArgument);
 
 /* provided by mib3navtext.c */
-extern void mib3_navtext_install(void (*logMessage)(const char *),
-                                 int (*realConnect)(int, const void *, unsigned int),
-                                 long (*realSend)(int, const void *, unsigned long, int),
-                                 int (*realClose)(int));
-extern int mib3_navtext_connect(int, const void *, unsigned int);
-extern long mib3_navtext_send(int, const void *, unsigned long, int);
-extern int mib3_navtext_close(int);
-extern int mib3_navtext_mode(void);
 
 /* ---------------------------------------------------------------------------
  * SECTION 2 - THE C LIBRARY WE BORROW, DECLARED BY HAND
@@ -65,74 +45,15 @@ extern int mib3_navtext_mode(void);
  * linked without a matching sysroot.
  * ------------------------------------------------------------------------- */
 
-extern void *dlsym(void *libraryHandle, const char *symbolName);
-extern char *getenv(const char *variableName);
-extern int open(const char *path, int flags, ...);
-extern long write(int filedescriptor, const void *buffer, unsigned long byteCount);
-extern long read(int filedescriptor, void *buffer, unsigned long byteCount);
-extern int close(int filedescriptor);
-extern void *memset(void *destination, int fillByte, unsigned long byteCount);
-extern void *memcpy(void *destination, const void *source, unsigned long byteCount);
-extern int strcmp(const char *first, const char *second);
-extern long time(long *secondsOut);
-extern int getpid(void);
-extern void *malloc(unsigned long byteCount);
-extern void free(void *memory);
-extern int fsync(int filedescriptor);
-extern int access(const char *path, int mode);
-extern int socket(int domain, int type, int protocol);
-extern int connect(int filedescriptor, const void *address, unsigned int addressLength);
-extern int bind(int filedescriptor, const void *address, unsigned int addressLength);
-extern int listen(int filedescriptor, int backlog);
-extern int accept(int filedescriptor, void *addressOut, unsigned int *addressLengthOut);
-extern int setsockopt(int filedescriptor, int level, int option,
-                      const void *value, unsigned int valueLength);
-extern int getsockopt(int filedescriptor, int level, int option,
-                      void *valueOut, unsigned int *valueLengthInOut);
-extern int getsockname(int filedescriptor, void *addressOut, unsigned int *addressLengthInOut);
-extern long send(int filedescriptor, const void *buffer, unsigned long byteCount, int flags);
-extern int poll(void *pollDescriptorArray, unsigned long count, int timeoutMilliseconds);
-extern int unlink(const char *path);
-extern int setenv(const char *name, const char *value, int overwrite);
-extern int *__errno_location(void);
-extern void *opendir(const char *path);
-extern void *readdir(void *directoryStream);
-extern int closedir(void *directoryStream);
-typedef int (*createThreadFunction)(void **, const void *, void *(*)(void *), void *);
 static createThreadFunction create_thread;
 
-#define ERROR_NUMBER (*__errno_location())
 
-#define FLAG_WRITE_ONLY     1
-#define FLAG_CREATE         0100
-#define FLAG_TRUNCATE       01000
-#define FLAG_APPEND         02000
-#define FLAG_NONBLOCKING    04000
 
-#define LOOKUP_NEXT_OBJECT    ((void *)-1L)
-#define LOOKUP_ANY_OBJECT     ((void *)0)
 
-#define SOCKET_DOMAIN_UNIX     1
-#define SOCKET_DOMAIN_INET6   10
-#define SOCKET_STREAM          1
-#define SOCKET_LEVEL_BASE      1
-#define SOCKET_LEVEL_IPV6     41
-#define SOCKET_OPTION_REUSE_ADDRESS  2
-#define SOCKET_OPTION_SEND_BUFFER    7
-#define SOCKET_OPTION_SEND_TIMEOUT  21
-#define SOCKET_OPTION_IPV6_ONLY_V6   26
 
-#define POLL_READABLE  1
-#define POLL_WRITABLE  4
 
-#define ERROR_INTERRUPTED   4
-#define ERROR_WOULD_BLOCK  11
 
-#define SEND_FLAG_NO_SIGNAL   0x4000
-#define SEND_FLAG_DO_NOT_WAIT 0x40
 
-#define ADDRESS_FAMILY_UNIX   1
-#define ADDRESS_FAMILY_INET6 10
 
 static int error_is_interrupted(void) { return ERROR_NUMBER == ERROR_INTERRUPTED; }
 static int error_would_block(void)   { return ERROR_NUMBER == ERROR_WOULD_BLOCK; }
@@ -141,44 +62,12 @@ static int error_would_block(void)   { return ERROR_NUMBER == ERROR_WOULD_BLOCK;
  * SECTION 3 - THE FOUNDATION DIFFERENCE TYPES AND THE SYMBOLS WE BORROW
  * ------------------------------------------------------------------------- */
 
-typedef unsigned char  byte;
-typedef unsigned int   word32;
-typedef unsigned long  word64;
-typedef long           signedWord;
-typedef unsigned long  frameSequence;
 
 /* The head unit's CoreFoundation implementation. Every object is opaque to us:
  * we only ever hand them back to the functions that created them. */
-typedef const void *coreFoundationString;
-typedef const void *coreFoundationArray;
-typedef void       *mutableCoreFoundationArray;
-typedef const void *coreFoundationDictionary;
-typedef void       *mutableCoreFoundationDictionary;
-typedef const void *coreFoundationObject;
-typedef long        coreFoundationIndex;
 
-#define STRING_ENCODING_UTF8 0x08000100
 
 /* ---- CoreFoundation function shapes we need ---------------------------- */
-typedef coreFoundationString (*createStringFunction)(const void *, const char *, word32);
-typedef unsigned char (*getStringFunction)(coreFoundationString, char *, long, word32);
-typedef long          (*arrayCountFunction)(coreFoundationArray);
-typedef coreFoundationObject (*arrayValueFunction)(coreFoundationArray, long);
-typedef mutableCoreFoundationArray (*createArrayFunction)(const void *, long, const void *);
-typedef void          (*arrayAppendFunction)(mutableCoreFoundationArray, const void *);
-typedef void          (*arrayAppendIntegerFunction)(mutableCoreFoundationArray, signedWord);
-typedef void          (*dictionarySetFunction)(mutableCoreFoundationDictionary,
-                                               const void *, const void *);
-typedef coreFoundationObject (*dictionaryGetFunction)(coreFoundationDictionary, const void *);
-typedef void          (*dictionarySetIntegerFunction)(mutableCoreFoundationDictionary,
-                                                      const void *, signedWord);
-typedef mutableCoreFoundationDictionary (*createDictionaryFunction)(const void *, long,
-                                                                    const void *, const void *);
-typedef signedWord    (*dictionaryGetIntegerFunction)(coreFoundationDictionary,
-                                                      const void *, signedWord);
-typedef word64        (*objectTypeFunction)(coreFoundationObject);
-typedef word64        (*constantTypeFunction)(void);
-typedef void          (*releaseFunction)(coreFoundationObject);
 
 static createStringFunction           create_string_from_characters;
 static getStringFunction              read_string_characters;
@@ -204,15 +93,6 @@ static void *boolean_true_variable;
 static void *boolean_false_variable;
 
 /* ---- the unit's own helpers, borrowed by name -------------------------- */
-typedef int  (*deriveStreamKeyFunction)(void *, int, signedWord, void *, void *);
-typedef void (*cipherInitFunction)(void *, const void *, const void *);
-typedef void (*cipherHeaderFunction)(void *, const void *, unsigned long);
-typedef long (*cipherDecryptFunction)(void *, const void *, long, void *);
-typedef long (*cipherVerifyFunction)(void *, const void *, const void *, int *);
-typedef int  (*aesInitialiseFunction)(void *, const void *, const void *);
-typedef int  (*aesUpdateFunction)(void *, const void *, long, void *);
-typedef int  (*chachaKeyDeriveFunction)(void *, signedWord, int, int, void *);
-typedef int  (*sendCommandFunction)(void *, void *, void *, void *);
 
 static deriveStreamKeyFunction    derive_stream_key_for_screen;
 static cipherInitFunction         chaCha_initialise;
@@ -228,8 +108,6 @@ static void *the_real_session_setup;
 static void *the_real_copy_server_info;
 static char *airplay_library_base;
 
-#define CHACHA_KEY_DERIVE_OFFSET   0x163d8
-#define AIRPLAY_ADD_DISPLAY_OFFSET 0x1f670
 
 /* Symbols are looked up once. "The next object" is right when this library is
  * loaded before the original; "any object" is right when it is injected last,
@@ -297,11 +175,6 @@ static void resolve_all_symbols(void)
  * No stdio: a line is assembled in a fixed stack buffer and written once.
  * ------------------------------------------------------------------------- */
 
-typedef struct {
-    char *characters;
-    unsigned long capacity;
-    unsigned long length;
-} textBuffer;
 
 static void text_buffer_append_character(textBuffer *buffer, char character)
 {
@@ -414,40 +287,6 @@ static word64 read_number_setting(const char *variableName, word64 defaultValue)
  * it creates, because the head unit's dictionary retains its own references.
  * ------------------------------------------------------------------------- */
 
-typedef struct {
-    coreFoundationString identifier;
-    coreFoundationString uniqueIdentifier;
-    coreFoundationString name;
-    coreFoundationString type;
-    coreFoundationString properties;
-    coreFoundationString initialVideoStreams;
-    coreFoundationString adjacentViewAreas;
-    coreFoundationString cornerMasks;
-    coreFoundationString nightMode;
-    coreFoundationString limitedUserInterface;
-    coreFoundationString limitedUserInterfaceElements;
-    coreFoundationString displayPanels;
-    coreFoundationString extendedFeatures;
-    coreFoundationString displays;
-    coreFoundationString viewAreas;
-    coreFoundationString initialViewArea;
-    coreFoundationString initialAddress;
-    coreFoundationString safeArea;
-    coreFoundationString originXInPixels;
-    coreFoundationString originYInPixels;
-    coreFoundationString widthInPixels;
-    coreFoundationString heightInPixels;
-    coreFoundationString widthInMillimetres;
-    coreFoundationString heightInMillimetres;
-    coreFoundationString maximumFramesPerSecond;
-    coreFoundationString streams;
-    coreFoundationString dataPort;
-    coreFoundationString streamConnectionIdentifier;
-    coreFoundationString instrumentClusterName;
-    coreFoundationString altScreenFeature;
-    coreFoundationString viewAreasFeature;
-    coreFoundationString showsInstruments;
-} cachedKeyStrings;
 
 static cachedKeyStrings keys;
 static int key_strings_are_cached = 0;
@@ -500,67 +339,158 @@ static void cache_key_strings(void)
 
 static int object_is_dictionary(coreFoundationObject value)
 {
-    return value && object_type && dictionary_type_identifier
-        && object_type(value) == dictionary_type_identifier();
+    return value && object_type(value) == dictionary_type_identifier();
 }
 
 static int object_is_array(coreFoundationObject value)
 {
-    return value && object_type && array_type_identifier
-        && object_type(value) == array_type_identifier();
+    return value && object_type(value) == array_type_identifier();
+}
+
+/* Every key this file writes, created once at startup and never released. A key
+ * that is NOT named here is created on demand and released by the caller, which
+ * is what the "must release" flag on acquire_key() is for.
+ *
+ * Twenty of the twenty-eight keys addressed through the helpers below are in
+ * this table, so the common path allocates nothing. */
+static const struct {
+    const char *text;
+    coreFoundationString *storage;
+} knownKeys[] = {
+    { "uid",                 &keys.identifier },
+    { "uuid",                &keys.uniqueIdentifier },
+    { "name",                &keys.name },
+    { "type",                &keys.type },
+    { "properties",          &keys.properties },
+    { "initialVideoStreams", &keys.initialVideoStreams },
+    { "adjacentViewAreas",   &keys.adjacentViewAreas },
+    { "cornerMasks",         &keys.cornerMasks },
+    { "nightMode",           &keys.nightMode },
+    { "limitedUI",           &keys.limitedUserInterface },
+    { "limitedUIElements",   &keys.limitedUserInterfaceElements },
+    { "displayPanels",       &keys.displayPanels },
+    { "extendedFeatures",    &keys.extendedFeatures },
+    { "displays",            &keys.displays },
+    { "viewAreas",           &keys.viewAreas },
+    { "initialViewArea",     &keys.initialViewArea },
+    { "initialURL",          &keys.initialAddress },
+    { "safeArea",            &keys.safeArea },
+    { "originXPixels",       &keys.originXInPixels },
+    { "originYPixels",       &keys.originYInPixels },
+    { "widthPixels",         &keys.widthInPixels },
+    { "heightPixels",        &keys.heightInPixels },
+    { "widthPhysical",       &keys.widthInMillimetres },
+    { "heightPhysical",      &keys.heightInMillimetres },
+    { "maxFPS",              &keys.maximumFramesPerSecond },
+    { "streams",             &keys.streams },
+    { "dataPort",            &keys.dataPort },
+    { "streamConnectionID",  &keys.streamConnectionIdentifier },
+};
+
+
+static coreFoundationString cached_key_for(const char *text)
+{
+    int index;
+
+    if (!text || !key_strings_are_cached) return 0;
+    for (index = 0; index < KNOWN_KEY_COUNT; index++) {
+        if (knownKeys[index].text[0] != text[0]) continue;      /* cheap reject */
+        if (!strcmp(text, knownKeys[index].text)) return *knownKeys[index].storage;
+    }
+    return 0;
+}
+
+/* Returns a key for `text`. When *mustRelease stays 0 the key is cached for the
+ * life of the process and the caller must NOT release it. */
+static coreFoundationString acquire_key(const char *text, int *mustRelease)
+{
+    coreFoundationString key = cached_key_for(text);
+
+    if (key) { *mustRelease = 0; return key; }
+    *mustRelease = 1;
+    return make_string(text);
+}
+
+static void release_borrowed_key(coreFoundationString key, int mustRelease)
+{
+    if (mustRelease && key) release_object(key);
+}
+
+/* Every symbol the dictionary and array work needs, verified once at each entry
+ * point. The helpers below therefore assume a live runtime instead of testing
+ * it again on all sixty-nine call paths, which is what made the old version
+ * unreadable. */
+static int runtime_is_ready(void)
+{
+    resolve_all_symbols();
+    cache_key_strings();
+    return create_string_from_characters && create_array && array_append
+        && create_dictionary && dictionary_set && dictionary_set_integer
+        && dictionary_get && dictionary_get_integer && release_object
+        && array_callbacks && dictionary_key_callbacks && dictionary_value_callbacks
+        && key_strings_are_cached;
 }
 
 static void dictionary_put_integer(mutableCoreFoundationDictionary dictionary,
                                    const char *keyText, signedWord value)
 {
-    coreFoundationString key = make_string(keyText);
-    if (!dictionary || !key || !dictionary_set_integer) return;
-    dictionary_set_integer(dictionary, key, value);
-    if (release_object) release_object(key);
+    int mustRelease = 0;
+    coreFoundationString key = acquire_key(keyText, &mustRelease);
+
+    if (dictionary && key) dictionary_set_integer(dictionary, key, value);
+    release_borrowed_key(key, mustRelease);
 }
 
 static void dictionary_put_text(mutableCoreFoundationDictionary dictionary,
                                 const char *keyText, const char *valueText)
 {
-    coreFoundationString key = make_string(keyText);
+    int mustRelease = 0;
+    coreFoundationString key = acquire_key(keyText, &mustRelease);
     coreFoundationString value = make_string(valueText);
-    if (dictionary && key && value && dictionary_set) dictionary_set(dictionary, key, value);
-    if (release_object) { if (value) release_object(value); if (key) release_object(key); }
+
+    if (dictionary && key && value) dictionary_set(dictionary, key, value);
+    if (value) release_object(value);
+    release_borrowed_key(key, mustRelease);
 }
 
 static void dictionary_put_object(mutableCoreFoundationDictionary dictionary,
                                   const char *keyText, const void *value)
 {
-    coreFoundationString key = make_string(keyText);
-    if (dictionary && key && value && dictionary_set) dictionary_set(dictionary, key, value);
-    if (release_object && key) release_object(key);
+    int mustRelease = 0;
+    coreFoundationString key = acquire_key(keyText, &mustRelease);
+
+    if (dictionary && key && value) dictionary_set(dictionary, key, value);
+    release_borrowed_key(key, mustRelease);
 }
 
 static void *dictionary_read_by_name(coreFoundationDictionary dictionary, const char *keyText)
 {
-    coreFoundationString key = make_string(keyText);
-    void *value = 0;
-    if (dictionary && key && dictionary_get) value = (void *)dictionary_get(dictionary, key);
-    if (release_object && key) release_object(key);
+    int mustRelease = 0;
+    coreFoundationString key = acquire_key(keyText, &mustRelease);
+    void *value = (dictionary && key) ? (void *)dictionary_get(dictionary, key) : 0;
+
+    release_borrowed_key(key, mustRelease);
     return value;
 }
 
 static signedWord dictionary_read_integer(coreFoundationDictionary dictionary,
                                           const char *keyText, signedWord defaultValue)
 {
-    coreFoundationString key = make_string(keyText);
-    signedWord value = defaultValue;
-    if (dictionary && key && dictionary_get && dictionary_get_integer) {
-        if (dictionary_get(dictionary, key))
-            value = dictionary_get_integer(dictionary, key, 0);
-    }
-    if (release_object && key) release_object(key);
+    int mustRelease = 0;
+    coreFoundationString key = acquire_key(keyText, &mustRelease);
+    /* ONE lookup, not two. The head unit's getter takes the default and returns
+     * it when the key is absent; the older code looked the key up separately
+     * first and passed a hardcoded 0, so the caller's default never reached it. */
+    signedWord value = (dictionary && key)
+        ? dictionary_get_integer(dictionary, key, defaultValue)
+        : defaultValue;
+
+    release_borrowed_key(key, mustRelease);
     return value;
 }
 
 static mutableCoreFoundationArray make_empty_array(void)
 {
-    if (!create_array || !array_callbacks) return 0;
     return create_array(0, 0, array_callbacks);
 }
 
@@ -571,7 +501,6 @@ static mutableCoreFoundationArray make_empty_array(void)
  * it is driven outside carplay (the benches do exactly that).
  * ------------------------------------------------------------------------- */
 
-typedef struct { long seconds; long nanoseconds; } timestampStorage;
 
 static long (*clock_gettime_symbol)(int, void *);
 static long (*syscall_symbol)(long, ...);
@@ -649,12 +578,6 @@ static int activation_gate_is_open(void)
  * Every other section asks here.
  * ------------------------------------------------------------------------- */
 
-typedef struct {
-    int widthInPixels;
-    int heightInPixels;
-    int widthInMillimetres;
-    int heightInMillimetres;
-} clusterGeometry;
 
 static int round_up_to_multiple_of_eight(int value)
 {
@@ -722,16 +645,7 @@ static void resolve_cluster_geometry(clusterGeometry *geometry)
  *   else    : layout zero, which is a blank cluster
  * ------------------------------------------------------------------------- */
 
-typedef struct {
-    int originX, originY, width, height;
-    int safeOriginX, safeOriginY, safeWidth, safeHeight;
-} viewAreaRectangle;
 
-#define MILLIMETRES_PER_SCALE_UNIT 153
-#define WIDE_CLASS_WIDTH           660
-#define CENTRED_CLASS_HEIGHT       383
-#define ETA_CLASS_HEIGHT           202
-#define REFERENCE_DENSITY          670          /* pixels per millimetre * 1000 at 1x */
 
 static int classifier_scale_milli(int pixelWidth, int millimetreWidth)
 {
@@ -1011,7 +925,6 @@ static char cluster_display_identifier[64];
 static char cluster_scene_address[160];
 static int cluster_was_advertised = 0;
 
-#define DEFAULT_CLUSTER_SCENE "maps:/car/instrumentcluster/map"
 
 static int display_list_already_has_cluster(void *displayList)
 {
@@ -1143,9 +1056,9 @@ int AirPlayInfoArrayAddScreenDisplay(void *displayList,
     if (!read_flag_setting("MIB3_SHIM_ADD", 1)) return realResult;
     if (!activation_gate_is_open()) return realResult;
 
-    cache_key_strings();
-    if (!key_strings_are_cached) {
-        log_message("advertisement", "the dictionary keys are unavailable");
+    if (!runtime_is_ready()) {
+        log_message("advertisement", "the CoreFoundation runtime is unavailable - "
+                                      "passing the call through untouched");
         return realResult;
     }
 
@@ -1480,8 +1393,12 @@ void *AirPlayCopyServerInfo(void *server, void *unusedSecondArgument, void *erro
         infoDictionary = ((void *(*)(void *, void *, void *))the_real_copy_server_info)(
                             server, unusedSecondArgument, errorOut);
 
-    if (infoDictionary && read_flag_setting("MIB3_SHIM_INFO", 1) && activation_gate_is_open())
-        complete_info_dictionary((mutableCoreFoundationDictionary)infoDictionary);
+    if (infoDictionary && read_flag_setting("MIB3_SHIM_INFO", 1) && activation_gate_is_open()) {
+        if (runtime_is_ready())
+            complete_info_dictionary((mutableCoreFoundationDictionary)infoDictionary);
+        else
+            log_message("info", "the CoreFoundation runtime is unavailable");
+    }
 
     return infoDictionary;
 }
@@ -1507,13 +1424,7 @@ static unsigned current_command_generation = 0;
  * there is nothing to free and no ownership crosses a thread.
  * ---------------------------------------------------------------------- */
 
-#define COMMAND_ANSWER_SLOT_COUNT 8
 
-typedef struct {
-    volatile unsigned generation;
-    volatile int viewAreaIndex;      /* -1 when the command was not a switch */
-    char typeName[24];
-} commandAnswerSlot;
 
 static commandAnswerSlot answerSlots[COMMAND_ANSWER_SLOT_COUNT];
 static volatile int nextAnswerSlot = 0;
@@ -1766,14 +1677,7 @@ static void command_set_appearance(void *session, int isMap,
  * keeps the listener from ever touching a session that has been torn down.
  * ------------------------------------------------------------------------- */
 
-#define QUEUE_CAPACITY 16
 
-typedef struct {
-    volatile int entries[QUEUE_CAPACITY];
-    volatile int writeIndex;
-    volatile int readIndex;
-    volatile int droppedCount;
-} workQueue;
 
 static workQueue zoomStepQueue;
 static workQueue viewAreaQueue;
@@ -1799,8 +1703,6 @@ static int queue_pop(workQueue *queue, int *valueOut)
     return 1;
 }
 
-#define VIEW_AREA_REQUEST_NEXT (-2)
-#define VIEW_AREA_REQUEST_PREVIOUS (-3)
 
 /* one line grammar: "+1" / "-1" zoom, "v2" / "next" / "prev" view area,
  * "a map 1 0" appearance. Anything unrecognised is logged and ignored. */
@@ -2069,19 +1971,12 @@ static void drain_queues(void *session)
  * until the next one.
  * ------------------------------------------------------------------------- */
 
-#define DELIVERY_MAGIC        0x4d334331u
-#define DELIVERY_HEADER_BYTES 16u
-#define DELIVERY_DEFAULT_PATH "/dev/shm/mib3cluster.sock"
-#define DELIVERY_MAX_FRAME    (8u << 20)
-#define DELIVERY_SEND_BUFFER  (4u << 20)
 
 /* MIB3_SHIM_SINK names where frames go. up.sh and the supervisor both set
  * "helper"; "off" (or 0) disables delivery without touching anything else, and
  * anything else is refused loudly rather than silently behaving as off. The
  * default is the consumer, because it is the only delivery path that exists and
  * a silent no-op is the harder failure to diagnose. */
-#define DELIVERY_MODE_DISABLED  0
-#define DELIVERY_MODE_CONSUMER  1
 
 static int delivery_mode = -1;
 
@@ -2485,21 +2380,9 @@ static int open_data_listener(int *portOut, int *generationOut)
  * itself across reconnects.
  * ------------------------------------------------------------------------- */
 
-typedef struct {
-    int listenerDescriptor;
-    int listenerGeneration;
-    void *session;
-    unsigned char key[32];
-    int cipherKind;                  /* 0 none, 1 aes counter, 2 chacha */
-    signedWord frameCounter;
-    int aesHasBeenInitialised;
-} receiverContext;
 
 static volatile unsigned newest_receiver_generation = 0;
 
-#define CIPHER_NONE        0
-#define CIPHER_AES_COUNTER 1
-#define CIPHER_CHACHA      2
 
 static word64 last_frame_milliseconds = 0;
 static word64 last_recovery_point_milliseconds = 0;
@@ -2809,6 +2692,10 @@ static int setup_cluster_stream(void *session, void *streamDictionary, void *res
     receiverContext *context;
 
     if (!session || !streamDictionary || !response) return -1;
+    if (!runtime_is_ready()) {
+        log_message("setup", "the CoreFoundation runtime is unavailable");
+        return -1;
+    }
 
     connectionIdentifier = dictionary_read_integer((coreFoundationDictionary)streamDictionary,
                                                    "streamConnectionID", 0);
@@ -2978,7 +2865,6 @@ static void navigation_text_log(const char *message)
 
 static void *resolve_real_libc_symbol(const char *symbolName, void *linkedSymbol)
 {
-    typedef void *(*versionedLookupFunction)(void *, const char *, const char *);
     static versionedLookupFunction versionedLookup;
     static int alreadyTried = 0;
     void *resolved = 0;
@@ -3078,10 +2964,6 @@ static void *crash_guard_real_symbol(const char *mangledName)
     return dlsym(LOOKUP_NEXT_OBJECT, mangledName);
 }
 
-typedef void (*messageDispatchFunction)(void *, void *);
-typedef void (*unsubscribeWithBoolFunction)(void *, void *, unsigned char);
-typedef void (*unsubscribeAllFunction)(void *);
-typedef void (*unsubscribePlainFunction)(void *, void *);
 
 static void guard_note_trip(const char *what)
 {
