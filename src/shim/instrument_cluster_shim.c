@@ -32,81 +32,22 @@
  * ------------------------------------------------------------------------- */
 
 
-
-
-/* provided by mib3navtext.c */
-
 /* ---------------------------------------------------------------------------
- * SECTION 2 - THE C LIBRARY WE BORROW, DECLARED BY HAND
+ * SECTION 2 - ERRNO PREDICATES
  *
  * The head unit's C library is older than any toolchain available here, so the
- * build does not include its headers. The declarations below are exactly what
- * those headers would have said. See src/shim/build.sh for how the library is
- * linked without a matching sysroot.
+ * build includes no headers; its declarations and every borrowed symbol live in
+ * instrument_cluster_shim.h. What remains here is the two predicates naming the
+ * errno values the socket code branches on.
  * ------------------------------------------------------------------------- */
 
-static createThreadFunction create_thread;
-
-
-
-
-
-
-
-
+/* The head unit's CoreFoundation is untyped and owns nothing, so every borrowed
+ * function and every object pointer this file touches is declared in the header
+ * and filled in exactly once, by resolve_all_symbols(). Nothing is declared
+ * here, which is why this section is now only the two error predicates. */
 
 static int error_is_interrupted(void) { return ERROR_NUMBER == ERROR_INTERRUPTED; }
 static int error_would_block(void)   { return ERROR_NUMBER == ERROR_WOULD_BLOCK; }
-
-/* ---------------------------------------------------------------------------
- * SECTION 3 - THE FOUNDATION DIFFERENCE TYPES AND THE SYMBOLS WE BORROW
- * ------------------------------------------------------------------------- */
-
-
-/* The head unit's CoreFoundation implementation. Every object is opaque to us:
- * we only ever hand them back to the functions that created them. */
-
-
-/* ---- CoreFoundation function shapes we need ---------------------------- */
-
-static createStringFunction           create_string_from_characters;
-static getStringFunction              read_string_characters;
-static arrayCountFunction             array_count;
-static arrayValueFunction             array_value_at;
-static createArrayFunction            create_array;
-static arrayAppendFunction            array_append;
-static arrayAppendIntegerFunction     array_append_integer;
-static dictionarySetFunction          dictionary_set;
-static dictionaryGetFunction          dictionary_get;
-static dictionarySetIntegerFunction   dictionary_set_integer;
-static createDictionaryFunction       create_dictionary;
-static dictionaryGetIntegerFunction   dictionary_get_integer;
-static objectTypeFunction             object_type;
-static constantTypeFunction           array_type_identifier;
-static constantTypeFunction           dictionary_type_identifier;
-static releaseFunction                release_object;
-
-static void *array_callbacks;
-static void *dictionary_key_callbacks;
-static void *dictionary_value_callbacks;
-static void *boolean_true_variable;
-static void *boolean_false_variable;
-
-/* ---- the unit's own helpers, borrowed by name -------------------------- */
-
-static deriveStreamKeyFunction    derive_stream_key_for_screen;
-static cipherInitFunction         chaCha_initialise;
-static cipherHeaderFunction       chaCha_authenticate_header;
-static cipherDecryptFunction      chaCha_decrypt;
-static cipherVerifyFunction       chaCha_verify;
-static aesInitialiseFunction      aes_counters_initialise;
-static aesUpdateFunction          aes_counters_advance;
-static sendCommandFunction        send_command_to_phone;
-
-static void *the_real_add_screen_display;
-static void *the_real_session_setup;
-static void *the_real_copy_server_info;
-static char *airplay_library_base;
 
 
 /* Symbols are looked up once. "The next object" is right when this library is
@@ -644,8 +585,6 @@ static void resolve_cluster_geometry(clusterGeometry *geometry)
  *   centred : safe height >  383 * scale   -> a centred card
  *   else    : layout zero, which is a blank cluster
  * ------------------------------------------------------------------------- */
-
-
 
 static int classifier_scale_milli(int pixelWidth, int millimetreWidth)
 {
@@ -1424,8 +1363,6 @@ static unsigned current_command_generation = 0;
  * there is nothing to free and no ownership crosses a thread.
  * ---------------------------------------------------------------------- */
 
-
-
 static commandAnswerSlot answerSlots[COMMAND_ANSWER_SLOT_COUNT];
 static volatile int nextAnswerSlot = 0;
 static volatile long acceptedCommandCount = 0;
@@ -1676,8 +1613,6 @@ static void command_set_appearance(void *session, int isMap,
  * session for the length of the stream, drains and sends. That rule is what
  * keeps the listener from ever touching a session that has been torn down.
  * ------------------------------------------------------------------------- */
-
-
 
 static workQueue zoomStepQueue;
 static workQueue viewAreaQueue;
@@ -2924,28 +2859,4 @@ int mib3_nt_close(int descriptor)
     return mib3_navtext_close(descriptor);
 }
 
-/* ---------------------------------------------------------------------------
- * NOT IMPLEMENTED: the librsic teardown crash guard.
- *
- * The head unit's own fault, documented in car-projects/MIB3_RE/
- * REPORT_REDTEAM_CRASH_2026-10-15.md from a recorded core: carplay's main()
- * shutdown loop destroys its CCarSSWRsiClient singleton first, seven unsubscribe
- * acks come back over the still-live radio, and the message pump dispatches one
- * to a callback that resolves through the freed object's NULL vtable slot.
- *
- * It is deliberately NOT guarded here, for two reasons.
- *
- * 1. It cannot be guarded by this library. Interposition needs the shim to be
- *    ahead of librsic in the symbol search order; an injected shim is appended
- *    last, so librsic's call slots were already bound when it loaded. That is
- *    the same reason the injector repoints the three seams instead of relying on
- *    exports. Six exported symbols therefore bought nothing.
- *
- * 2. It needs a graceful carplay stop with the radio still up. Nothing in this
- *    project stops carplay, and at power-off the unit goes down as a whole, so
- *    the ack has no live path back.
- *
- * If it ever does fire the symptom is a unit reboot shortly after power-off.
- * The workaround, if that day comes, has to happen at the injector: repoint the
- * broadcast slots the way the seams are repointed.
- * ------------------------------------------------------------------------- */
+

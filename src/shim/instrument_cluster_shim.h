@@ -295,4 +295,47 @@ typedef struct {
 
 
 
+/* ---- the borrowed symbols ------------------------------------------------
+ * Every function pointer and object pointer the implementation fills in from
+ * dlsym(). They are DEFINED here rather than merely declared because this
+ * header is included by exactly one translation unit. If a second file ever
+ * includes it these become duplicate state and must move back into a single .c
+ * as extern declarations.
+ * ---------------------------------------------------------------------- */
+
+static createThreadFunction create_thread;
+static createStringFunction           create_string_from_characters;
+static getStringFunction              read_string_characters;
+static arrayCountFunction             array_count;
+static arrayValueFunction             array_value_at;
+static createArrayFunction            create_array;
+static arrayAppendFunction            array_append;
+static arrayAppendIntegerFunction     array_append_integer;
+static dictionarySetFunction          dictionary_set;
+static dictionaryGetFunction          dictionary_get;
+static dictionarySetIntegerFunction   dictionary_set_integer;
+static createDictionaryFunction       create_dictionary;
+static dictionaryGetIntegerFunction   dictionary_get_integer;
+static objectTypeFunction             object_type;
+static constantTypeFunction           array_type_identifier;
+static constantTypeFunction           dictionary_type_identifier;
+static releaseFunction                release_object;
+static void *array_callbacks;
+static void *dictionary_key_callbacks;
+static void *dictionary_value_callbacks;
+static void *boolean_true_variable;
+static void *boolean_false_variable;
+static deriveStreamKeyFunction    derive_stream_key_for_screen;
+static cipherInitFunction         chaCha_initialise;
+static cipherHeaderFunction       chaCha_authenticate_header;
+static cipherDecryptFunction      chaCha_decrypt;
+static cipherVerifyFunction       chaCha_verify;
+static aesInitialiseFunction      aes_counters_initialise;
+static aesUpdateFunction          aes_counters_advance;
+static sendCommandFunction        send_command_to_phone;
+static void *the_real_add_screen_display;
+static void *the_real_session_setup;
+static void *the_real_copy_server_info;
+static char *airplay_library_base;
+
 #endif /* INSTRUMENT_CLUSTER_SHIM_H */
