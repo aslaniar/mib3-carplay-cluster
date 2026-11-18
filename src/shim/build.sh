@@ -30,7 +30,7 @@ echo "linking against: $LIBC  $LIBDL"
 
 $CC --target=aarch64-linux-gnu -O2 -fPIC -fvisibility=default -nostdlib \
     -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-unused-but-set-variable \
-    --ld-path="$LLD" -shared -o "$BIN/mib3shim.so" mib3shim.c mib3navtext.c "$LIBC" "$LIBDL"
+    --ld-path="$LLD" -shared -o "$BIN/mib3shim.so" instrument_cluster_shim.c mib3navtext.c "$LIBC" "$LIBDL"
 echo "built $BIN/mib3shim.so ($(wc -c < "$BIN/mib3shim.so") bytes)"
 
 ABI_REPO="$REPO"; . "$REPO/tools/abi_check.sh"
