@@ -496,7 +496,11 @@ knobs_once(){   # once per carplay process, never per session (it is a ptrace)
     #                 Four areas are declared so the safe height can be
     #                 compared live from the control inbox (v0..v3, next,
     #                 prev) without a replug.  The keeper is VA_INITIAL=2,
-    #                 whose safe box sits 20 px higher than area 1's.
+    #                 whose safe box sits 20 px higher than area 1's; its top
+    #                 edge is then dropped 10 px (safe y=10) because the phone
+    #                 composed the scene too high on the panel.  Only the
+    #                 origin moves: the box keeps its 1280x400 size, so the
+    #                 phone's card class is unchanged.
     #                 Only the safe box changes: the visible frame stays the
     #                 full panel (VA_VISIBLE=0), because shrinking it is what
     #                 got the 111 stream rejected at activation.  The earlier
@@ -519,7 +523,7 @@ knobs_once(){   # once per carplay process, never per session (it is a ptrace)
                MIB3_SHIM_VA_INITIAL=2 \
                "MIB3_SHIM_VA0=0,0,1280,480,0,0,1280,480" \
                "MIB3_SHIM_VA1=0,0,1280,480,0,0,1280,440" \
-               "MIB3_SHIM_VA2=0,0,1280,480,0,0,1280,400" \
+               "MIB3_SHIM_VA2=0,0,1280,480,0,10,1280,400" \
                "MIB3_SHIM_VA3=0,0,1280,480,0,0,1280,360" \
                "MIB3_SHIM_URL=maps:/car/instrumentcluster/map?showETA=no&maneuverLayout=topAligned&showSpeedLimit=no" \
                MIB3_SHIM_CMDACK=1 \
@@ -527,7 +531,7 @@ knobs_once(){   # once per carplay process, never per session (it is a ptrace)
       /usr/bin/python /tmp/kit/target_env.py "$_cp" "$_kv" >/dev/null 2>&1
     done
     KNOBS_PID=$_cp
-    log "prepare: shim knobs set for carplay pid $_cp (sink=helper fps=60 navtext=filter safearea=v2(400) VA_INITIAL=2, MHI2 scene)"
+    log "prepare: shim knobs set for carplay pid $_cp (sink=helper fps=60 navtext=filter safearea=v2(400@y10) VA_INITIAL=2, MHI2 scene)"
   fi
 }
 

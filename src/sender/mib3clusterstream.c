@@ -10,11 +10,20 @@
  * muxes it to MPEG-2 TS and sends it as RTP/PT=33 over UDP/IPv6 multicast. The
  * shim already holds the phone's decrypted access units; this programme
  * re-muxes those existing units into the exact container the cluster expects
- * and sends them to the same group and port. Path B is one UDP socket.
+ * and sends them to the same group and port.
+ *
+ * THE MODEL. A unit is muxed the moment it arrives and every datagram is given
+ * a deadline inside that unit's slot. The pipe is therefore both the jitter
+ * buffer and the intra-frame release: depth is how far ahead the schedule runs,
+ * and a phase governor trims the output rate so it stays near the target. A
+ * burst is drained by shortening the next slots, never by growing a queue, and
+ * a release-time floor stops a stalled reader from turning into a clump.
  *
  *   OUT  --dst <ipv6>[%iface]  (default ff14::2:4%eth0.5)   --src <ipv6>
  *        --port <n> (default 42800)   --sport <n>   --out file:<path>
  *   IN   --in <file> | --in unix:<path>   --in-fmt annexb|avcc
+ *   DIAG --trace <path>   (one tab-separated event per arrival/schedule/emission;
+ *                          the offline replay in tests/replay reads it)
  *
  * The wire format, the pacing model and the supervisor hand-over are documented
  * with their measurements:
@@ -30,10 +39,6 @@
  *           mib3clusterstream.c <rootfs>/lib64/libc.so.6
  * ==========================================================================*/
 
-/* unit_compat first: it provides every libc symbol the toolkit's printers use.
- * toolkit.h declares that set by hand for the small tools that include it alone,
- * and those declarations collide with the real headers (Darwin aliases write(),
- * and <string.h> turns memset into a macro), so it is told to skip them here. */
 #include "unit_compat.h"        /* the only header here that includes anything   */
 #define MIB3_TOOLKIT_NO_LIBC_DECLS 1
 #include "toolkit.h"            /* the on-unit printing primitives               */
@@ -52,8 +57,8 @@ int main(int argc, char **arguments);
 
 /* ------------------------------------------------------------- 2. logging
  * One formatter, two sinks: stderr (log_message) and the supervisor's state
- * file (format_line straight into a buffer). The toolkit supplies the write;
- * a line is assembled first so a multi-field line is ONE write, not fifteen. */
+ * file (format_line straight into a buffer). The toolkit supplies the write; a
+ * line is assembled first so a multi-field line is ONE write, not fifteen. */
 
 static void append_character(char *out, usize_t capacity, usize_t *used, char character)
 {
@@ -157,11 +162,37 @@ void log_message(const char *format, ...)
     Pe(line);
 }
 
+/* The offline replay's event log (--trace). One tab-separated line per event,
+ * written as it happens; a datagram capture carries no timestamps, so this is
+ * the only place the harness can see WHEN a unit was scheduled and released.
+ * Disabled by default; when off it is one predictable branch. */
+void trace_message(Runtime *runtime, const char *format, ...)
+{
+    char line[LOG_LINE_BYTES];
+    va_list arguments;
+    usize_t used;
+
+    if (runtime->traceFd < 0) return;
+    va_start(arguments, format);
+    used = format_arguments(line, sizeof line, format, arguments);
+    va_end(arguments);
+    append_character(line, sizeof line, &used, '\n');
+    (void)write(runtime->traceFd, line, used);
+}
+
+void trace_close(Runtime *runtime)
+{
+    if (runtime->traceFd >= 0) {
+        close(runtime->traceFd);
+        runtime->traceFd = -1;
+    }
+}
+
 /* ------------------------------------------------------------------ 3. clocks
- * Two clocks on purpose: the release loop, the PTS step, the arrival meter and
- * everything settled before 2026-10-30 use milliseconds; the emitter uses
- * nanoseconds because a datagram deadline is ~3.2 ms out and a millisecond
- * quantisation would be 30% of the spacing. */
+ * Two clocks on purpose: the schedule, the media clock and every report use
+ * milliseconds; the pipe uses nanoseconds because a datagram deadline is a few
+ * milliseconds out and a millisecond quantisation would be a large share of the
+ * spacing. */
 
 static u64 current_time_ms(void)
 {
@@ -177,9 +208,7 @@ static u64 current_time_ns(void)
     return (u64)timespec_seconds(now) * 1000000000ull + (u64)timespec_nanoseconds(now);
 }
 
-/* ------------------------------------------------------------------- 4. rings
- * One implementation for the arrival cadence, the emission cadence, the latency
- * samples and the timing histogram's peak window. */
+/* ------------------------------------------------------------------- 4. rings */
 
 void ring_reset(Ring *ring)
 {
@@ -226,137 +255,135 @@ int ring_values_within(const Ring *ring, u64 newest, u64 window)
     return count;
 }
 
+/* Diagnostic buffers: the rings point into these, so they outlive any Runtime. */
+static u64 g_cadenceArrivalValues[CADENCE_RING_CAPACITY];
+static u64 g_cadenceEmissionValues[CADENCE_RING_CAPACITY];
+static u64 g_latencyValues[LATENCY_RING_CAPACITY];
+static u64 g_timingValues[TIMING_RING_CAPACITY];
+
 /* -------------------------------------------------- 5. supervisor's state line
  * One line, rewritten by rename so a reader never sees a blank. Counters rather
  * than a flag because on wireless CarPlay the phone's socket outlives the
  * session: what a session is, is pictures arriving. See
  * docs/development/pathb-supervisor-handover.md. */
 
-static Supervisor g_supervisor;
-/* The output settings and the control channel are process-wide and defined here
- * because the session loop and the control path both reach them. */
-static OutputSettings g_output;
-static ControlChannel g_control;
-
-void supervisor_publish(int force)
+void supervisor_publish(Runtime *runtime, int force)
 {
+    Supervisor *supervisor = &runtime->supervisor;
     char line[STATE_LINE_BYTES];
     char temporary[STATE_PATH_BYTES + 8];
     long written;
     usize_t length;
     int descriptor;
 
-    if (!g_supervisor.path[0]) return;
-    if (!force && current_time_ms() - g_supervisor.lastPublishMs < SUPERVISOR_PUBLISH_INTERVAL_MS) return;
+    if (!supervisor->path[0]) return;
+    if (!force && current_time_ms() - supervisor->lastPublishMs < SUPERVISOR_PUBLISH_INTERVAL_MS) return;
 
-    g_supervisor.sequence++;
+    supervisor->sequence++;
     length = format_line(line, sizeof line,
                          "conn=%d ready=%d bound=%d au=%ld out=%ld ms=%ld seq=%lu\n",
-                         g_supervisor.connection, g_supervisor.ready, g_supervisor.bound,
-                         (long)g_supervisor.accessUnitsIn, (long)g_supervisor.accessUnitsOut,
-                         (long)current_time_ms(), (unsigned long)g_supervisor.sequence);
+                         supervisor->connection, supervisor->ready, supervisor->bound,
+                         (long)supervisor->accessUnitsIn, (long)supervisor->accessUnitsOut,
+                         (long)current_time_ms(), (unsigned long)supervisor->sequence);
 
-    format_line(temporary, sizeof temporary, "%s.tmp", g_supervisor.path);
+    format_line(temporary, sizeof temporary, "%s.tmp", supervisor->path);
     descriptor = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (descriptor >= 0) {
         written = write(descriptor, line, length);
         close(descriptor);
-        if (written == (long)length) rename(temporary, g_supervisor.path);
+        if (written == (long)length) rename(temporary, supervisor->path);
         else unlink(temporary);
     }
-    g_supervisor.lastPublishMs = current_time_ms();
+    supervisor->lastPublishMs = current_time_ms();
 }
 
-void supervisor_set_connection(int connected)
+void supervisor_set_connection(Runtime *runtime, int connected)
 {
-    g_supervisor.connection = connected ? 1 : 0;
-    if (!connected) g_supervisor.ready = 0;
-    supervisor_publish(1);
+    runtime->supervisor.connection = connected ? 1 : 0;
+    if (!connected) runtime->supervisor.ready = 0;
+    supervisor_publish(runtime, 1);
 }
 
-void supervisor_set_ready(int ready)
+void supervisor_set_ready(Runtime *runtime, int ready)
 {
-    g_supervisor.ready = ready ? 1 : 0;
+    runtime->supervisor.ready = ready ? 1 : 0;
 }
 
-void supervisor_set_bound(int port)
+void supervisor_set_bound(Runtime *runtime, int port)
 {
-    g_supervisor.bound = port;
+    runtime->supervisor.bound = port;
 }
 
 /* ------------------------------------------------------- 6. emission timing
  * --stats-timing records the monotonic timestamp of every write and reports the
- * distribution at exit. A datagram capture can prove WHAT was sent; it carries
- * no timestamps, so this is the only way to prove WHEN. Off by default. */
+ * distribution at exit. A datagram capture carries no timestamps, so this is the
+ * only way to prove WHEN the wire was busy. Off by default. */
 
-static u64 g_timingValues[TIMING_RING_CAPACITY];
-static TimingStats g_timing;
-static int g_timingEnabled;
-
-void timing_note_write(void)
+void timing_note_write(Runtime *runtime)
 {
     static const u64 edges[TIMING_HISTOGRAM_BUCKETS - 1] = {
         500000ull, 1000000ull, 2000000ull, 4000000ull, 8000000ull, 16000000ull,
         20000000ull, 40000000ull, 80000000ull, 160000000ull, 320000000ull
     };
+    TimingStats *timing = &runtime->timing;
     u64 now;
     int bucket = 0;
 
-    if (!g_timingEnabled) return;
+    if (!runtime->timingEnabled) return;
     now = current_time_ns();
-    if (g_timing.ignore) { g_timing.lastNs = now; return; }
-    if (g_timing.lastNs) {
-        u64 gap = now - g_timing.lastNs;
-        if (gap > g_timing.longestNs) g_timing.longestNs = gap;
+    if (timing->ignore) { timing->lastNs = now; return; }
+    if (timing->lastNs) {
+        u64 gap = now - timing->lastNs;
+        if (gap > timing->longestNs) timing->longestNs = gap;
         if (gap > TIMING_LONG_GAP_NS) {
-            g_timing.gapsOver20Ms++;
+            timing->gapsOver20Ms++;
             /* Name the long gaps while they happen: on the car this says which
              * datagram the wire went quiet at. Capped so a pathological run
              * cannot flood the log. */
-            if (g_timing.gapsOver20Ms <= TIMING_LONG_GAP_REPORT_LIMIT) {
+            if (timing->gapsOver20Ms <= TIMING_LONG_GAP_REPORT_LIMIT) {
                 log_message("timing: idle %ld us before write %ld (gap %ld)",
-                            (long)(gap / 1000), (long)g_timing.writes, (long)g_timing.gapsOver20Ms);
+                            (long)(gap / 1000), (long)timing->writes, (long)timing->gapsOver20Ms);
             }
         }
         while (bucket < TIMING_HISTOGRAM_BUCKETS - 1 && gap > edges[bucket]) bucket++;
-        g_timing.histogram[bucket]++;
+        timing->histogram[bucket]++;
     }
-    g_timing.lastNs = now;
-    g_timing.writes++;
+    timing->lastNs = now;
+    timing->writes++;
 
-    ring_push(&g_timing.ring, now);
-    {   /* peak density: datagrams inside ANY 25 ms window. The unit's own peak
-         * is 61, measured on the same interface, so the numbers compare. */
-        int density = ring_values_within(&g_timing.ring, now, TIMING_PEAK_WINDOW_NS);
-        if ((u64)density > g_timing.peakPer25Ms) g_timing.peakPer25Ms = (u64)density;
+    ring_push(&timing->ring, now);
+    {   /* peak density: datagrams inside ANY 25 ms window. The unit's own peak is
+         * 61 on the same interface, so the numbers compare. */
+        int density = ring_values_within(&timing->ring, now, TIMING_PEAK_WINDOW_NS);
+        if ((u64)density > timing->peakPer25Ms) timing->peakPer25Ms = (u64)density;
     }
 }
 
-void timing_report(void)
+void timing_report(Runtime *runtime)
 {
     static const char *labels[TIMING_HISTOGRAM_BUCKETS] = {
         "<0.5ms", "<1ms", "<2ms", "<4ms", "<8ms", "<16ms",
         "<20ms", "<40ms", "<80ms", "<160ms", "<320ms", ">=320ms"
     };
-    if (!g_timingEnabled) return;
+    TimingStats *timing = &runtime->timing;
+
+    if (!runtime->timingEnabled) return;
     log_message("timing: writes=%ld  longest-gap=%ld us  gaps>20ms=%ld  peak-dg/25ms=%ld",
-                (long)g_timing.writes, (long)(g_timing.longestNs / 1000),
-                (long)g_timing.gapsOver20Ms, (long)g_timing.peakPer25Ms);
+                (long)timing->writes, (long)(timing->longestNs / 1000),
+                (long)timing->gapsOver20Ms, (long)timing->peakPer25Ms);
     log_message("timing: inter-datagram gap histogram (count per bucket)");
     for (int i = 0; i < TIMING_HISTOGRAM_BUCKETS; i++) {
-        if (!g_timing.histogram[i]) continue;
-        log_message("  timing:   %s %ld", labels[i], (long)g_timing.histogram[i]);
+        if (!timing->histogram[i]) continue;
+        log_message("  timing:   %s %ld", labels[i], (long)timing->histogram[i]);
     }
 }
 
-void timing_reset(void)
+void timing_reset(Runtime *runtime)
 {
-    u64 *values = g_timing.ring.values;
-    int capacity = g_timing.ring.capacity;
-    memset(&g_timing, 0, sizeof g_timing);
-    g_timing.ring.values = values;
-    g_timing.ring.capacity = capacity;
-    ring_reset(&g_timing.ring);
+    Ring ring = runtime->timing.ring;
+    memset(&runtime->timing, 0, sizeof runtime->timing);
+    runtime->timing.ring = ring;
+    ring_reset(&runtime->timing.ring);
 }
 
 /* ------------------------------------------------------------ 7. wire format
@@ -497,15 +524,16 @@ int write_pes_header(u8 *out, u64 presentationTicks)
 /* -------------------------------------------------------- 8. mux and release
  * The muxer assembles a COMPLETE access unit in one pass at one instant, so the
  * PSI and PCR decisions that depend on the wall clock are made exactly as they
- * always were. The emitter then releases the buffered datagrams one at a time,
- * on byte-proportional deadlines. Nothing sleeps inside the write path. */
+ * always were. The pipe then holds each datagram until its deadline. */
 
-void stream_write_datagram(Stream *stream, const u8 *datagram, int bytes)
+void stream_write_datagram(Runtime *runtime, const u8 *datagram, int bytes)
 {
+    Stream *stream = &runtime->stream;
     long written;
+
     if (stream->outFd < 0) return;
     written = write(stream->outFd, datagram, (usize_t)bytes);
-    timing_note_write();
+    timing_note_write(runtime);
     if (written != (long)bytes) {
         stream->mux.writeFailures++;
         if (stream->mux.writeFailures <= 3 || (stream->mux.writeFailures & 0xFF) == 0)
@@ -513,57 +541,81 @@ void stream_write_datagram(Stream *stream, const u8 *datagram, int bytes)
     }
 }
 
-/* Grow the three buffered-datagram arrays. The committed capacity only advances
- * when the last allocation succeeded, so a partial failure cannot leave the
- * capacity ahead of a short array. */
-int emitter_reserve(Emitter *emitter)
+/* Drop the datagrams already emitted and move the pending ones to the front, so
+ * the arrays are reused without a ring index. The pending set is normally a frame
+ * or two, so the move is trivial and `count` keeps its obvious meaning. */
+static void pipe_compact(Pipe *pipe)
+{
+    int pending;
+    if (pipe->cursor == 0) return;
+    pending = pipe->count - pipe->cursor;
+    if (pending > 0) {
+        memmove(pipe->bytes, pipe->bytes + (usize_t)pipe->cursor * (usize_t)pipe->stride,
+                (usize_t)pending * (usize_t)pipe->stride);
+        memmove(pipe->datagrams, pipe->datagrams + pipe->cursor,
+                (usize_t)pending * sizeof(Datagram));
+    }
+    pipe->count = pending;
+    pipe->cursor = 0;
+}
+
+int pipe_reserve(Pipe *pipe, int wanted)
 {
     int newCapacity;
     u8 *bytes;
-    u32 *lengths;
-    u32 *cumulative;
+    Datagram *datagrams;
 
-    if (emitter->count < emitter->capacity) return 1;
-    newCapacity = emitter->capacity ? emitter->capacity * 2 : 64;
-    if (newCapacity > 2048) return 0;
+    if (pipe->count + wanted <= pipe->capacity) return 1;
+    newCapacity = pipe->capacity ? pipe->capacity : 64;
+    while (newCapacity < pipe->count + wanted) {
+        if (newCapacity >= PIPE_CAPACITY) return 0;
+        newCapacity *= 2;
+    }
+    if (newCapacity > PIPE_CAPACITY) newCapacity = PIPE_CAPACITY;
 
-    bytes = (u8 *)realloc(emitter->bytes, (usize_t)newCapacity * (usize_t)emitter->stride);
+    bytes = (u8 *)realloc(pipe->bytes, (usize_t)newCapacity * (usize_t)pipe->stride);
     if (!bytes) return 0;
-    emitter->bytes = bytes;
-    lengths = (u32 *)realloc(emitter->lengths, (usize_t)newCapacity * sizeof(u32));
-    if (!lengths) return 0;
-    emitter->lengths = lengths;
-    cumulative = (u32 *)realloc(emitter->cumulative, (usize_t)newCapacity * sizeof(u32));
-    if (!cumulative) return 0;
-    emitter->cumulative = cumulative;
-    emitter->capacity = newCapacity;
+    pipe->bytes = bytes;
+    datagrams = (Datagram *)realloc(pipe->datagrams, (usize_t)newCapacity * sizeof(Datagram));
+    if (!datagrams) return 0;
+    pipe->datagrams = datagrams;
+    pipe->capacity = newCapacity;
     return 1;
 }
 
-void emitter_buffer(Stream *stream, int bytes)
+/* Deadline of the datagram that just closed: the midpoint of its byte range
+ * inside the frame's slot, proportional to payload bytes actually delivered. */
+static u64 pipe_datagram_deadline(Pipe *pipe)
 {
-    Emitter *emitter = &stream->emitter;
+    u64 total = pipe->unitPayloadTotal ? pipe->unitPayloadTotal : 1;
+    u64 low = pipe->unitPayloadFlushed;
+    u64 high = pipe->unitPayloadDone;
+    u64 middle;
 
-    if (!emitter_reserve(emitter)) {
-        /* Never lose a datagram to a memory shortage: send it now and stop
-         * pretending to pace this unit. Counted, so a silent degradation cannot
-         * masquerade as a paced stream. */
-        stream_write_datagram(stream, stream->mux.datagram, bytes);
-        emitter->slotMs = 0;
-        emitter->statisticsOutOfMemory++;
-        return;
-    }
-    memcpy(emitter->bytes + (usize_t)emitter->count * (usize_t)emitter->stride,
-           stream->mux.datagram, (usize_t)bytes);
-    emitter->lengths[emitter->count] = (u32)bytes;
-    emitter->cumulative[emitter->count] =
-        (u32)(emitter->payloadDone > 0xFFFFFFFFull ? 0xFFFFFFFFull : emitter->payloadDone);
-    emitter->count++;
+    if (high > total) high = total;
+    if (low > high) low = high;
+    middle = low + (high - low) / 2;
+    pipe->unitPayloadFlushed = pipe->unitPayloadDone;
+    return pipe->unitStartNs + (pipe->unitLengthNs * middle) / total;
 }
 
-void mux_flush(Stream *stream)
+void pipe_append_datagram(Runtime *runtime, int bytes)
 {
-    Mux *mux = &stream->mux;
+    Pipe *pipe = &runtime->stream.pipe;
+    int slot = pipe->count;
+
+    memcpy(pipe->bytes + (usize_t)slot * (usize_t)pipe->stride,
+           runtime->stream.mux.datagram, (usize_t)bytes);
+    pipe->datagrams[slot].length = (u32)bytes;
+    pipe->datagrams[slot].deadlineNs = pipe_datagram_deadline(pipe);
+    pipe->datagrams[slot].arrivalNs = pipe->unitArrivalNs;
+    pipe->count++;
+}
+
+void mux_flush(Runtime *runtime)
+{
+    Mux *mux = &runtime->stream.mux;
+    Pipe *pipe = &runtime->stream.pipe;
     u32 timestamp;
     int total;
 
@@ -583,20 +635,20 @@ void mux_flush(Stream *stream)
     mux->datagram[10] = (u8)(mux->ssrc >> 8);
     mux->datagram[11] = (u8)mux->ssrc;
     mux->sequence++;
-    if (stream->emitter.slotMs) emitter_buffer(stream, total);
-    else                        stream_write_datagram(stream, mux->datagram, total);
+    if (pipe->unitPaced) pipe_append_datagram(runtime, total);
+    else                 stream_write_datagram(runtime, mux->datagram, total);
     mux->packetsInDatagram = 0;
 }
 
-void mux_push(Stream *stream, const u8 *packet)
+void mux_push(Runtime *runtime, const u8 *packet)
 {
-    Mux *mux = &stream->mux;
+    Mux *mux = &runtime->stream.mux;
     memcpy(mux->datagram + RTP_HEADER_BYTES + mux->packetsInDatagram * TRANSPORT_PACKET_BYTES,
            packet, TRANSPORT_PACKET_BYTES);
-    if (++mux->packetsInDatagram >= mux->packetsPerDatagram) mux_flush(stream);
+    if (++mux->packetsInDatagram >= mux->packetsPerDatagram) mux_flush(runtime);
 }
 
-void mux_push_null(Stream *stream)
+void mux_push_null(Runtime *runtime)
 {
     u8 packet[TRANSPORT_PACKET_BYTES];
     packet[0] = TRANSPORT_PACKET_SYNC;
@@ -604,33 +656,39 @@ void mux_push_null(Stream *stream)
     packet[2] = 0xFF;
     packet[3] = 0x10;                                   /* payload only */
     memset(packet + 4, 0xFF, TRANSPORT_PACKET_BYTES - 4);
-    mux_push(stream, packet);
+    mux_push(runtime, packet);
 }
 
 /* End every access unit on a datagram boundary. The unit's own sender never
  * straddles units (except at PSI insertions) and pads with null packets; without
  * this, a unit whose packet count was not a multiple of the datagram's left its
  * tail buffered until the next unit arrived. */
-void mux_end_access_unit(Stream *stream)
+void mux_end_access_unit(Runtime *runtime)
 {
-    while (stream->mux.packetsInDatagram != 0) mux_push_null(stream);
+    while (runtime->stream.mux.packetsInDatagram != 0) mux_push_null(runtime);
 }
 
-void mux_access_unit(Stream *stream, const u8 *unit, int bytes, u64 presentationTicks)
+void mux_access_unit(Runtime *runtime, const u8 *unit, int bytes, u64 presentationTicks)
 {
-    Mux *mux = &stream->mux;
+    Mux *mux = &runtime->stream.mux;
+    Pipe *pipe = &runtime->stream.pipe;
     u8 packet[TRANSPORT_PACKET_BYTES];
     u8 pes[PAYLOAD_BYTES_PLAIN + 32];
     u64 now = current_time_ms();
     int wantPcr, headerBytes, room, first, offset;
 
-    mux->rtpTimestamp = (u32)presentationTicks;          /* RFC 2250: media time */
+    /* RFC 2250 section 2: for a transport stream the RTP timestamp is a
+     * transmission-time clock tied to the PCR, not the presentation time. Here
+     * the PCR, the PTS and the start of the unit's slot are one instant, so the
+     * PTS is that clock. Keeping that identity is a decision, not a coincidence:
+     * see docs/development/pathb-wire-format.md. */
+    mux->rtpTimestamp = (u32)presentationTicks;
 
     if (mux->programAssociationLastMs == 0 || now - mux->programAssociationLastMs >= PSI_REPEAT_INTERVAL_MS) {
         pack_program_association(packet, mux->transportStreamId, mux->pmtPid, mux->continuityPat++ & 0x0F);
-        mux_push(stream, packet);
+        mux_push(runtime, packet);
         pack_program_map(packet, mux->pmtPid, mux->pcrPid, mux->elementaryPid, mux->continuityPmt++ & 0x0F);
-        mux_push(stream, packet);
+        mux_push(runtime, packet);
         mux->programAssociationLastMs = now;
     }
 
@@ -644,11 +702,10 @@ void mux_access_unit(Stream *stream, const u8 *unit, int bytes, u64 presentation
     if (wantPcr) mux->programClockLastMs = now;
 
     /* Payload bytes are counted BEFORE the push that may close a datagram, so a
-     * datagram records the unit bytes it actually carried and the emitter's
-     * deadline is proportional to real progress rather than to a guess. PSI
-     * packets contribute nothing (they are container, not payload). */
-    stream->emitter.payloadDone += (u64)(unsigned)first;
-    mux_push(stream, packet);
+     * datagram records the unit bytes it actually carried and its deadline is
+     * proportional to real progress. PSI packets contribute nothing. */
+    pipe->unitPayloadDone += (u64)(unsigned)first;
+    mux_push(runtime, packet);
 
     offset = first;
     while (offset < bytes) {
@@ -657,115 +714,121 @@ void mux_access_unit(Stream *stream, const u8 *unit, int bytes, u64 presentation
         if (chunk == PAYLOAD_BYTES_UNENCODABLE) chunk = PAYLOAD_BYTES_WITH_RAI;
         pack_transport_packet(packet, mux->elementaryPid, 0, mux->continuityEs++ & 0x0F,
                               unit + offset, chunk, 0, 0, 0);
-        stream->emitter.payloadDone += (u64)(unsigned)chunk;
-        mux_push(stream, packet);
+        pipe->unitPayloadDone += (u64)(unsigned)chunk;
+        mux_push(runtime, packet);
         offset += chunk;
     }
-    mux_end_access_unit(stream);
+    mux_end_access_unit(runtime);
 }
 
-/* ------------------------------------------------------- 9. release deadlines
- * deadline(i) = slotStart + slotMs * (payload bytes through datagram i / unit
- * size), at the MIDPOINT of the datagram's byte range. Using the end pushed
- * every unit's tail to the last microsecond of its slot and raced the next arm. */
+/* --------------------------------------------------------- 9. the pipe's clock
+ * The pipe IS the schedule: every datagram carries the instant it may go out, and
+ * the poll timeout is the next of those instants. Release is bounded per call so
+ * the reader is never held off, and nothing sleeps inside the write path. */
 
-u64 emitter_deadline_ns(const Emitter *emitter, int index)
+int pipe_release_due(Runtime *runtime, u64 nowNs)
 {
-    u64 total = emitter->payloadBytes ? emitter->payloadBytes : 1;
-    u64 low = (index > 0) ? emitter->cumulative[index - 1] : 0;
-    u64 high = emitter->cumulative[index];
-    u64 middle;
-
-    if (high > total) high = total;
-    if (low > high) low = high;
-    middle = low + (high - low) / 2;
-    return emitter->slotStartNs + (emitter->slotMs * 1000000ull * middle) / total;
-}
-
-int emitter_release_due(Stream *stream, u64 nowNs)
-{
-    Emitter *emitter = &stream->emitter;
+    Pipe *pipe = &runtime->stream.pipe;
     int released = 0;
 
-    if (emitter->cursor >= emitter->count) {
-        emitter->count = emitter->cursor = 0;
-        emitter->slotMs = 0;
-        return 0;
-    }
-    /* DUE FIRST: a datagram whose deadline has arrived is normal traffic even if
-     * that deadline is the last microsecond of the slot. */
-    while (emitter->cursor < emitter->count && released < EMITTER_BURST_DATAGRAMS) {
-        if (nowNs < emitter_deadline_ns(emitter, emitter->cursor)) break;
-        stream_write_datagram(stream,
-                              emitter->bytes + (usize_t)emitter->cursor * (usize_t)emitter->stride,
-                              (int)emitter->lengths[emitter->cursor]);
-        emitter->cursor++;
+    while (pipe->cursor < pipe->count && released < PIPE_BURST_DATAGRAMS) {
+        Datagram *datagram = &pipe->datagrams[pipe->cursor];
+        nowNs = current_time_ns();
+        if (nowNs < datagram->deadlineNs) break;
+#if PATHB_PACE_VARIANT >= 3
+        /* THE WIRE-RATE FLOOR. A reader stall (a large access unit arriving) can
+         * leave a batch of deadlines overdue; writing them back to back is the
+         * clump the receiver's ring drops on. The floor is the same 2000 B/ms
+         * ceiling the slots use, applied at the point of emission, so a stalled
+         * reader costs latency and never density. */
+        {
+            u64 minimal = (u64)datagram->length * 1000000ull / OUTPUT_RATE_CEILING_BYTES_PER_MS;
+            if (pipe->lastEmissionNs && nowNs < pipe->lastEmissionNs + minimal) break;
+        }
+#endif
+        stream_write_datagram(runtime,
+                              pipe->bytes + (usize_t)pipe->cursor * (usize_t)pipe->stride,
+                              (int)datagram->length);
+#if PATHB_PACE_VARIANT >= 3
+        pipe->lastEmissionNs = nowNs;
+#endif
+        {
+            u64 depth = pipe->nextSlotStartNs > nowNs ? pipe->nextSlotStartNs - nowNs : 0;
+            trace_message(runtime, "E\t%lu\t%u\t%lu\t%lu\t%lu\t%lu\t%lu",
+                          nowNs, (unsigned)datagram->length, datagram->deadlineNs,
+                          datagram->arrivalNs,
+                          nowNs > datagram->arrivalNs ? (nowNs - datagram->arrivalNs) / 1000000ull : 0,
+                          depth / 1000000ull,
+                          runtime->session.paceIntervalMs);
+        }
+        if (!pipe->latencyRecorded) {
+            /* How long this picture waited in OUR buffer: the share of "it takes
+             * a second to react" that belongs to us. One sample per unit. */
+            u64 ageMs = nowNs > datagram->arrivalNs ? (nowNs - datagram->arrivalNs) / 1000000ull : 0;
+            ring_push(&runtime->session.latency.samples, ageMs);
+            if (ageMs > runtime->session.latency.maximum) runtime->session.latency.maximum = ageMs;
+            pipe->latencyRecorded = 1;
+        }
+        pipe->cursor++;
         released++;
     }
-    /* OVERRUN EXTENDS THE SLOT, IT NEVER DUMPS. Collapsing the remainder to
-     * immediate emission re-created exactly the clump that causes the artifacts:
-     * a 192 KB frame went out as 169 datagrams inside one 25 ms window. */
-    if (emitter->cursor < emitter->count && emitter->slotMs &&
-        nowNs > emitter->slotStartNs + emitter->slotMs * 1000000ull) {
-        u64 total, done, remaining, extra;
-        if (!emitter->overrunCounted) { emitter->statisticsOverruns++; emitter->overrunCounted = 1; }
-        total = emitter->payloadBytes ? emitter->payloadBytes : 1;
-        done = (emitter->cursor > 0) ? emitter->cumulative[emitter->cursor - 1] : 0;
-        remaining = (done < total) ? (total - done) : 0;
-        extra = (remaining * emitter->slotMs) / total;
-        if (!extra) extra = 1;
-        emitter->slotStartNs = nowNs;                   /* same rate, more time */
-        emitter->slotMs = extra;
-    }
-    if (emitter->cursor >= emitter->count) {
-        emitter->count = emitter->cursor = 0;
-        emitter->slotMs = 0;
-        emitter->overrunCounted = 0;
+    if (pipe->cursor >= pipe->count) {
+        pipe->count = pipe->cursor = 0;
         return 0;
     }
     return 1;
 }
 
-/* Push the remainder out now. Used at connection close and when a new unit is
- * armed while the previous one is still in flight (only when the release clock
- * has fallen behind). Unit order and boundaries are preserved. */
-void emitter_release_all(Stream *stream, int counted)
+/* Push the remainder out now. Used at connection close: closing with datagrams
+ * still scheduled silently discarded the phone's last pictures. */
+void pipe_release_all(Runtime *runtime)
 {
-    Emitter *emitter = &stream->emitter;
-    if (emitter->cursor >= emitter->count) {
-        emitter->count = emitter->cursor = 0;
-        emitter->slotMs = 0;
-        return;
+    Pipe *pipe = &runtime->stream.pipe;
+    while (pipe->cursor < pipe->count) {
+        Datagram *datagram = &pipe->datagrams[pipe->cursor];
+        stream_write_datagram(runtime,
+                              pipe->bytes + (usize_t)pipe->cursor * (usize_t)pipe->stride,
+                              (int)datagram->length);
+        pipe->cursor++;
     }
-    if (counted) emitter->statisticsOverruns++;
-    while (emitter->cursor < emitter->count) {
-        stream_write_datagram(stream,
-                              emitter->bytes + (usize_t)emitter->cursor * (usize_t)emitter->stride,
-                              (int)emitter->lengths[emitter->cursor]);
-        emitter->cursor++;
-    }
-    emitter->count = emitter->cursor = 0;
-    emitter->slotMs = 0;
-    emitter->overrunCounted = 0;
+    pipe->count = pipe->cursor = 0;
 }
 
-u64 emitter_poll_timeout_ns(Stream *stream)
+/* How long the loop may block: the next datagram's deadline, capped at the
+ * loop's historical 2 ms cadence so EOF detection keeps its timing. */
+u64 pipe_poll_timeout_ns(Runtime *runtime)
 {
-    Emitter *emitter = &stream->emitter;
+    Pipe *pipe = &runtime->stream.pipe;
     u64 now, due;
-    if (emitter->cursor >= emitter->count) return EMITTER_POLL_CAP_NS;
+
+    if (pipe->cursor >= pipe->count) return PIPE_POLL_CAP_NS;
+    due = pipe->datagrams[pipe->cursor].deadlineNs;
+#if PATHB_PACE_VARIANT >= 3
+    /* The release-time floor is also a wake-up time; without this the loop
+     * spins on ppoll(0) until the floor clears. */
+    if (pipe->lastEmissionNs) {
+        u64 minimal = (u64)pipe->datagrams[pipe->cursor].length
+                    * 1000000ull / OUTPUT_RATE_CEILING_BYTES_PER_MS;
+        if (pipe->lastEmissionNs + minimal > due) due = pipe->lastEmissionNs + minimal;
+    }
+#endif
     now = current_time_ns();
-    if (emitter->slotMs && now > emitter->slotStartNs + emitter->slotMs * 1000000ull) return 0;
-    due = emitter_deadline_ns(emitter, emitter->cursor);
     if (due <= now) return 0;
-    return (due - now) < EMITTER_POLL_CAP_NS ? (due - now) : EMITTER_POLL_CAP_NS;
+    return (due - now) < PIPE_POLL_CAP_NS ? (due - now) : PIPE_POLL_CAP_NS;
+}
+
+/* How far ahead the schedule runs: the standing depth of the buffer, in ns. */
+u64 pipe_pending_ns(Runtime *runtime)
+{
+    Pipe *pipe = &runtime->stream.pipe;
+    if (!pipe->nextSlotStartNs) return 0;
+    {   u64 now = current_time_ns();
+        return pipe->nextSlotStartNs > now ? pipe->nextSlotStartNs - now : 0; }
 }
 
 /* ------------------------------------------------- 10. the access-unit walk
  * One pass over a unit answers everything: is it a parameter-set record, does it
- * carry VCL, is there an IDR, where does the last SPS start. The previous source
- * walked every unit three times, three different ways, to answer the same
- * questions. */
+ * carry VCL, is there an IDR, where does the last SPS start. */
 
 int nal_next(const u8 *data, usize_t length, usize_t *cursor, NalUnit *unit)
 {
@@ -808,10 +871,9 @@ void access_unit_inspect(const u8 *data, usize_t length, AccessUnitInfo *info)
 
 /* ------------------------------------- 11. parameter-set folding (socket input)
  * The shim stamps the sequence header ahead of every unit as its own record. A
- * record-per-PES muxer would therefore emit two PES per frame, and every stream
- * this ECU decodes carries the parameter sets inside the same unit as the
- * slice. A VCL-free record is held and prepended to the next record that
- * carries VCL. See docs/development/pathb-pacing-and-timing.md. */
+ * record-per-PES muxer would emit two PES per frame, and every stream this ECU
+ * decodes carries the parameter sets inside the same unit as the slice. A
+ * VCL-free record is held and prepended to the next record that carries VCL. */
 
 static int parameter_set_put(ParameterSet *set, const u8 *data, usize_t length)
 {
@@ -958,29 +1020,17 @@ int read_all(int descriptor, u8 **buffer, usize_t *length)
 }
 
 /* -------------------------------------------------------- 13. the media clock
- * A steady clock, not a wall clock: timestamps advance by a bounded constant
+ * A steady clock, not a wall clock: the timeline advances by a bounded constant
  * step per unit, slewed against wall time, so a phone silence is never a PCR
- * discontinuity. See docs/development/pathb-pacing-and-timing.md. */
+ * discontinuity. Kept independent of the slot schedule: see
+ * docs/development/pathb-pacing-and-timing.md. */
 
-static u32 g_spreadPercent = DEFAULT_SPREAD_PERCENT;
-
-void session_publish_access_unit(Session *session, const u8 *unit, usize_t length)
+static void clock_advance(Runtime *runtime, u64 *presentationTicks)
 {
-    Stream *stream = &session->stream;
-    MediaClock *clock = &session->clock;
-    u64 step, presentationTicks;
+    MediaClock *clock = &runtime->session.clock;
+    Mux *mux = &runtime->stream.mux;
+    u64 step = clock->stepTicks;
 
-    {   /* emission-rhythm sample: called once per unit from every path, so it
-         * sees what actually left. */
-        u64 now = current_time_ms();
-        if (session->cadence.lastEmissionMs && now >= session->cadence.lastEmissionMs &&
-            now - session->cadence.lastEmissionMs <= 1000)
-            ring_push(&session->cadence.emission, now - session->cadence.lastEmissionMs);
-        session->cadence.lastEmissionMs = now;
-    }
-    g_supervisor.accessUnitsOut++;
-
-    step = clock->stepTicks;
     if (step < MEDIA_STEP_FLOOR_TICKS) step = MEDIA_STEP_FLOOR_TICKS;
     if (step > MEDIA_STEP_CEILING_TICKS) step = MEDIA_STEP_CEILING_TICKS;
 
@@ -988,14 +1038,14 @@ void session_publish_access_unit(Session *session, const u8 *unit, usize_t lengt
      * and re-anchor instead of racing when the error is a pause, not drift. */
     if (!clock->wallBaseMs) {
         clock->wallBaseMs = current_time_ms();
-        clock->ptsBaseTicks = stream->mux.presentationTimeTicks;
+        clock->ptsBaseTicks = mux->presentationTimeTicks;
     } else {
         u64 wall = current_time_ms() - clock->wallBaseMs;
-        u64 media = (stream->mux.presentationTimeTicks - clock->ptsBaseTicks) / TICKS_PER_MILLISECOND;
+        u64 media = (mux->presentationTimeTicks - clock->ptsBaseTicks) / TICKS_PER_MILLISECOND;
         long error = (long)wall - (long)media;
         if (error > MEDIA_DRIFT_REBASE_MS || error < -MEDIA_DRIFT_REBASE_MS) {
             clock->wallBaseMs = current_time_ms();
-            clock->ptsBaseTicks = stream->mux.presentationTimeTicks;
+            clock->ptsBaseTicks = mux->presentationTimeTicks;
         } else if (error > MEDIA_DRIFT_DEADBAND_MS || error < -MEDIA_DRIFT_DEADBAND_MS) {
             long adjustment = (long)(step / MEDIA_SLEW_DIVISOR);
             long correction = (error > 0) ? adjustment : -adjustment;
@@ -1006,108 +1056,90 @@ void session_publish_access_unit(Session *session, const u8 *unit, usize_t lengt
             step = (u64)((long)step + correction);
         }
     }
-    stream->mux.presentationTimeTicks += step;
-    presentationTicks = stream->mux.presentationTimeTicks;
+    mux->presentationTimeTicks += step;
+    *presentationTicks = mux->presentationTimeTicks;
+}
 
-    /* One unit in flight, always: if the previous release is still running the
-     * clock has fallen behind, so push its remainder out and count it. */
-    if (!clock->slotMs) stream->emitter.statisticsSkipped++;
-    if (stream->emitter.count) {
-        emitter_release_due(stream, current_time_ns());
-        if (stream->emitter.count) emitter_release_all(stream, 1);
+/* ----------------------------------------------------------- 14. the session */
+
+void runtime_initialise(Runtime *runtime, Options *options)
+{
+    memset(runtime, 0, sizeof *runtime);
+    runtime->options = *options;
+    runtime->spreadPercent = options->spreadPercent;
+    runtime->timingEnabled = options->statisticsTiming;
+    runtime->traceFd = -1;
+
+    if (options->tracePath && *options->tracePath) {
+        runtime->traceFd = open(options->tracePath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (runtime->traceFd < 0) log_message("--trace: cannot open %s", options->tracePath);
     }
-    stream->emitter.count = stream->emitter.cursor = 0;
-    stream->emitter.overrunCounted = 0;
-    stream->emitter.slotStartNs = current_time_ns();
 
-    /* The spread budget is a fraction of the interval, so a unit finishes before
-     * the next is due and there is a cushion for a scheduler hitch. */
-    stream->emitter.slotMs = clock->slotMs ? (clock->slotMs * g_spreadPercent) / 100u : 0;
-    if (clock->slotMs && stream->emitter.slotMs < 1) stream->emitter.slotMs = 1;
+    runtime->session.jitterMs = options->jitterMs;
+    runtime->session.noFold = options->noFold;
+    runtime->session.noIdrGate = options->noIdrGate;
 
-    /* Rate ceiling: never faster than the reference sender, whatever the clock
-     * wants. This is what makes a late unit SPREAD instead of CLUMP. */
-    {
-        u64 floorMs = (u64)length / OUTPUT_RATE_CEILING_BYTES_PER_MS;
-        if (floorMs < 1) floorMs = 1;
-        if (stream->emitter.slotMs < floorMs) stream->emitter.slotMs = floorMs;
+    runtime->session.cadence.arrival.values = g_cadenceArrivalValues;
+    runtime->session.cadence.arrival.capacity = CADENCE_RING_CAPACITY;
+    runtime->session.cadence.emission.values = g_cadenceEmissionValues;
+    runtime->session.cadence.emission.capacity = CADENCE_RING_CAPACITY;
+    runtime->session.latency.samples.values = g_latencyValues;
+    runtime->session.latency.samples.capacity = LATENCY_RING_CAPACITY;
+    runtime->timing.ring.values = g_timingValues;
+    runtime->timing.ring.capacity = TIMING_RING_CAPACITY;
+
+    if (options->statePath && *options->statePath && strcmp(options->statePath, "off") != 0) {
+        usize_t length = strlen(options->statePath);
+        if (length < sizeof runtime->supervisor.path) {
+            memcpy(runtime->supervisor.path, options->statePath, length);
+            runtime->supervisor.path[length] = 0;
+        } else {
+            log_message("--conn-state: path too long, publisher disabled");
+        }
     }
-    stream->emitter.payloadBytes = (u64)length;
-    stream->emitter.payloadDone = 0;
-
-    mux_access_unit(stream, unit, (int)length, presentationTicks);
-    clock->frames++;
-}
-
-/* ----------------------------------------------------------- 14. the session
- * The queue is the buffer, the adopted rate is the clock, and the depth
- * controller holds depth by nudging the rate. A correction only fires when the
- * queue is more than 20% off target: near the target its noise was being
- * multiplied straight into the interval, and the interval is what the eye reads
- * as judder. */
-
-static u64 g_cadenceArrivalValues[CADENCE_RING_CAPACITY];
-static u64 g_cadenceEmissionValues[CADENCE_RING_CAPACITY];
-static u64 g_latencyValues[LATENCY_RING_CAPACITY];
-
-void session_initialise(Session *session, Options *options)
-{
-    memset(session, 0, sizeof *session);
-    session->clock.stream = &session->stream;
-    session->jitter.minimum = 2;
-    session->jitter.maximum = 10;
-    session->jitterMs = options->jitterMs;
-    session->noFold = options->noFold;
-    session->noIdrGate = options->noIdrGate;
-    session->cadence.arrival.values = g_cadenceArrivalValues;
-    session->cadence.arrival.capacity = CADENCE_RING_CAPACITY;
-    session->cadence.emission.values = g_cadenceEmissionValues;
-    session->cadence.emission.capacity = CADENCE_RING_CAPACITY;
-    session->latency.samples.values = g_latencyValues;
-    session->latency.samples.capacity = LATENCY_RING_CAPACITY;
-}
-
-static void queue_clear(Session *session)
-{
-    session->queue.head = 0;
-    session->queue.count = 0;
-}
-
-static void queue_release(Session *session)
-{
-    for (int slot = 0; slot < QUEUE_CAPACITY; slot++) {
-        free(session->queue.bytes[slot]);
-        session->queue.bytes[slot] = 0;
-        session->queue.capacity[slot] = 0;
-        session->queue.length[slot] = 0;
+    if (options->controlPath && *options->controlPath) {
+        usize_t length = strlen(options->controlPath);
+        if (length < sizeof runtime->control.path) {
+            memcpy(runtime->control.path, options->controlPath, length);
+            runtime->control.path[length] = 0;
+        } else {
+            log_message("--ctl: path too long, control channel disabled");
+        }
     }
-    queue_clear(session);
 }
 
-void session_reset(Session *session)
+void session_reset(Runtime *runtime)
 {
-    queue_clear(session);
+    Session *session = &runtime->session;
+    Pipe *pipe = &runtime->stream.pipe;
+
     parameter_set_reset(&session->parameters);
-    session->stream.mux.programAssociationLastMs = 0;
+    runtime->stream.mux.programAssociationLastMs = 0;
+    pipe->nextSlotStartNs = 0;
+    pipe->lastEmissionNs = 0;
+    pipe->count = pipe->cursor = 0;
     session->headerPending = 1;
     session->streaming = 0;
-    session->nextEmitMs = 0;
     session->lastArrivalMs = 0;
     session->arrivalGaps = 0;
     session->rateWindowStartMs = 0;
     session->rateWindowCount = 0;
+    session->estimateMs = 0;
+    session->estimateBandWindows = 0;
+    session->paceIntervalMs = FALLBACK_INTERVAL_MS;
+    session->paceBaseRate = 1000.0 / (double)FALLBACK_INTERVAL_MS;
+    session->paceIntegral = 0.0;
+    session->paceControlMs = 0;
+    session->paceTrim = 0.0;
+    session->paceDepthAvg = 0.0;
+    session->paceArrivalRate = 0.0;
+    session->paceArrivalCount = 0;
+    session->paceBankMs = 0;
+    session->paceLastStarveMs = 0;
+    session->paceHoleCounted = 0;
+    session->paceLowTicks = 0;
+    session->paceHighTicks = 0;
     session->cadenceReportMs = 0;
-
-    session->jitter.rateMs = 0;
-    session->jitter.target = 0;
-    session->jitter.bandWindows = 0;
-    session->jitter.started = 0;
-    session->jitter.connectedAtMs = 0;
-    session->jitter.starvedAtMs = 0;
-    session->jitter.lastGrowMs = 0;
-    session->jitter.lastShrinkMs = 0;
-    session->jitter.starvations = 0;
-    session->jitter.depthDrains = 0;
 
     ring_reset(&session->cadence.arrival);
     ring_reset(&session->cadence.emission);
@@ -1116,227 +1148,543 @@ void session_reset(Session *session)
     session->latency.maximum = 0;
     session->latency.lastReportMs = 0;
 
-    session->previousOverruns = 0;
-    session->previousSkipped = 0;
-    session->previousDeferred = 0;
+    session->previousLate = 0;
+    session->previousCatchUps = 0;
+    session->previousDropped = 0;
     session->previousAccessUnitsIn = 0;
     session->previousAccessUnitsOut = 0;
 }
 
-/* The release clock. Releasing at the adopted rate holds whatever depth exists,
- * so depth is maintained by nudging the rate; the growth and shrink of the
- * target respond to evidence, not to a timer. */
-void session_release_tick(Session *session)
+/* Mux one unit and give it a slot.
+ *
+ * The schedule is the rate, not a depth: in advance, assign it the next free
+ * slot; if the schedule has fallen behind, its slot starts now and the late
+ * frames catch up by themselves. The only depth control is the bound: when the
+ * schedule runs further ahead than the latency allowance, all pending deadlines
+ * are pulled forward together, which preserves their spacing exactly (no clump)
+ * while shortening the buffer. */
+void session_emit_access_unit(Runtime *runtime, const u8 *unit, usize_t length)
 {
-    Stream *stream = &session->stream;
-    Emitter *emitter = &stream->emitter;
-    JitterBuffer *jitter = &session->jitter;
-    u64 now = current_time_ms();
-    u64 interval;
+    Stream *stream = &runtime->stream;
+    Pipe *pipe = &stream->pipe;
+    Session *session = &runtime->session;
+    u64 nowNs, nowMs, presentationTicks, intervalNs, slotNs, startNs, advanceNs;
 
-    /* ---- arrival rate meter: count arrivals over a window, never average gaps.
-     * A mean of gaps is dominated by the many short ones and ignores the holes;
-     * measured 65 ms while the stream sustained 74.6 ms. */
-    if (session->rateWindowCount && session->rateWindowStartMs) {
-        u64 window = now - session->rateWindowStartMs;
-        if (window >= CLOCK_RATE_WINDOW_MS) {
-            u64 measured = window / session->rateWindowCount;
-            if (!jitter->rateMs) {
-                jitter->rateMs = measured;
+    nowNs = current_time_ns();
+    nowMs = nowNs / 1000000ull;
+
+    {   /* emission-rhythm sample: this is the instant the unit started leaving. */
+        if (session->cadence.lastEmissionMs && nowMs >= session->cadence.lastEmissionMs &&
+            nowMs - session->cadence.lastEmissionMs <= 1000)
+            ring_push(&session->cadence.emission, nowMs - session->cadence.lastEmissionMs);
+        session->cadence.lastEmissionMs = nowMs;
+    }
+    runtime->supervisor.accessUnitsOut++;
+
+    clock_advance(runtime, &presentationTicks);
+
+    /* Make room for the whole frame BEFORE muxing it, so a full pipe drops a
+     * frame rather than leaving half of one on the wire. */
+    pipe_compact(pipe);
+    if (!pipe_reserve(pipe, (int)(length / PAYLOAD_BYTES_PLAIN) + 4)) {
+        pipe->statisticsDropped++;
+        trace_message(runtime, "C\t%lu\tdrop\t%lu", nowMs, (u64)length);
+        return;
+    }
+
+    /* The interval is the loop's output. The estimate is only its seed. */
+    intervalNs = session->paceIntervalMs * 1000000ull;
+#if PATHB_PACE_VARIANT >= 3
+    /* THE DEPTH BUDGET. A unit may not schedule the stream further ahead than
+     * the budget. If it would, this unit gets a shorter slot: the burst is
+     * drained by rate, and the schedule never grows into a queue. The budget
+     * rides the ratcheted bank, so it is a latency cap that loosens only while
+     * the source is being silenced. */
+    {
+        u64 bankMs = session->paceBankMs ? session->paceBankMs : (u64)session->jitterMs;
+        u64 depthNs = pipe->nextSlotStartNs > nowNs ? pipe->nextSlotStartNs - nowNs : 0;
+        u64 budgetNs = (bankMs + PACE_DEPTH_BUDGET_MS) * 1000000ull;
+        if (depthNs >= budgetNs)
+            intervalNs = (u64)MINIMUM_INTERVAL_MS * 1000000ull;
+        else if (depthNs + intervalNs > budgetNs)
+            intervalNs = budgetNs - depthNs;
+    }
+#endif
+    if (!session->jitterMs) {
+        /* --no-jit: the unspaced control. Every datagram goes out at once. */
+        pipe->unitPaced = 0;
+        pipe->statisticsUnpaced++;
+        startNs = nowNs;
+        slotNs = 0;
+        pipe->nextSlotStartNs = 0;
+    } else {
+        pipe->unitPaced = 1;
+        slotNs = intervalNs * runtime->spreadPercent / 100u;
+        {   /* Rate ceiling: a frame may never leave faster than the reference
+             * sender, however urgently the schedule wants it gone. */
+            u64 ceilingNs = (u64)length * 1000000ull / OUTPUT_RATE_CEILING_BYTES_PER_MS;
+            if (ceilingNs > slotNs) slotNs = ceilingNs;
+        }
+        if (!slotNs) slotNs = intervalNs;
+
+        if (!pipe->nextSlotStartNs) {
+            /* First unit after the gate opened: start one buffer depth in, so the
+             * phone's first hole does not starve the wire immediately. */
+            startNs = nowNs + (u64)session->jitterMs * 1000000ull;
+        } else {
+#if PATHB_PACE_VARIANT >= 3
+            /* The budget has already bounded the schedule; the shift is only a
+             * last-resort safety net, so it sits above the budget. */
+            u64 bankMs = session->paceBankMs ? session->paceBankMs : (u64)session->jitterMs;
+            u64 highWaterMs = bankMs + PACE_DEPTH_BUDGET_MS + 50u;
+#else
+            u64 highWaterMs = session->jitterMs > (int)LATENCY_CAP_MS
+                            ? (u64)session->jitterMs : (u64)LATENCY_CAP_MS;
+#endif
+            u64 highWaterNs = highWaterMs * 1000000ull;
+            u64 lag = pipe->nextSlotStartNs > nowNs ? pipe->nextSlotStartNs - nowNs : 0;
+
+            if (lag > highWaterNs) {
+                u64 shift = lag - highWaterNs;
+                for (int index = pipe->cursor; index < pipe->count; index++) {
+                    u64 deadline = pipe->datagrams[index].deadlineNs;
+                    pipe->datagrams[index].deadlineNs =
+                        deadline > shift + nowNs ? deadline - shift : nowNs;
+                }
+                pipe->nextSlotStartNs = pipe->nextSlotStartNs > shift
+                                      ? pipe->nextSlotStartNs - shift : nowNs;
+                pipe->statisticsCatchUps++;
+                trace_message(runtime, "C\t%lu\tcatchup\t%lu\t%lu",
+                              nowMs, shift / 1000000ull, lag / 1000000ull);
+            }
+            if (pipe->nextSlotStartNs <= nowNs) pipe->statisticsLate++;
+            startNs = pipe->nextSlotStartNs > nowNs ? pipe->nextSlotStartNs : nowNs;
+        }
+        advanceNs = intervalNs > slotNs ? intervalNs : slotNs;
+        pipe->nextSlotStartNs = startNs + advanceNs;
+    }
+
+    pipe->unitStartNs = startNs;
+    pipe->unitLengthNs = slotNs;
+    pipe->unitArrivalNs = nowNs;
+    pipe->unitPayloadTotal = (u64)length;
+    pipe->unitPayloadDone = 0;
+    pipe->unitPayloadFlushed = 0;
+    pipe->latencyRecorded = 0;
+
+    trace_message(runtime, "U\t%lu\t%lu\t%lu\t%lu\t%lu",
+                  nowNs, (u64)length, startNs, slotNs, session->paceIntervalMs);
+    mux_access_unit(runtime, unit, (int)length, presentationTicks);
+    session->clock.frames++;
+}
+
+/* The interval estimate and the reports. The interval is measured by COUNTING
+ * arrivals over a window, never by averaging gaps: a mean is dominated by the
+ * many short ones and reads 15% too fast. It moves only when it must -- inside
+ * +/-10% it is left alone, outside it the new value has to hold for two windows
+ * and is then blended, so the interval the eye reads as judder cannot jump. */
+/* The rate loop. Depth is the integral of (source rate - output rate): it is the
+ * phase error of a phase-locked loop whose oscillator is the output rate. One PI
+ * filter on that single error sets the rate -- P supplies the damping, I removes
+ * the steady-state bias. The arrival-count estimate is only the feedforward term
+ * the loop starts from; it does not have to be accurate, only close.
+ *
+ *   error     = target - depth                    (ms, positive = too shallow)
+ *   rate      = baseRate - kp*error - ki*integral (frames per second)
+ *   integral += error * dt                        (ms * s)
+ *
+ * The integrator is frozen while the pipe is empty. A pause is not a rate error,
+ * and winding up on silence makes the first frame after it far too slow. */
+static void pace_control(Runtime *runtime, u64 now)
+{
+    Session *session = &runtime->session;
+    double error, rate, dt;
+
+    if (!session->jitterMs) return;                  /* --no-jit: unpaced */
+    if (!session->paceControlMs) { session->paceControlMs = now; return; }
+    if (now - session->paceControlMs < PACE_PERIOD_MS) return;
+
+    dt = (double)(now - session->paceControlMs) / 1000.0;
+    session->paceControlMs = now;
+
+    /* Arrival feedforward: how fast the source is actually delivering right now.
+     * Counted per tick, never averaged from gaps: a gap mean ignores the holes
+     * and reads the burst, not the stream. */
+    {
+        double instant = session->paceArrivalCount / (dt > 0.01 ? dt : 0.01);
+        session->paceArrivalRate = session->paceArrivalRate
+            ? session->paceArrivalRate * 0.75 + instant * 0.25
+            : instant;
+        session->paceArrivalCount = 0;
+    }
+
+    error = (double)session->jitterMs - (double)(pipe_pending_ns(runtime) / 1000000ull);
+    (void)error;
+
+#if PATHB_PACE_VARIANT == 0
+    /* No rate feedback: the estimate is the only authority. */
+    rate = session->paceBaseRate;
+
+#elif PATHB_PACE_VARIANT == 1
+    /* The clamped proportional term. The clamp bounds the correction at 15%, so
+     * a biased estimate leaves a standing depth error the loop cannot remove. */
+    rate = session->paceBaseRate - PACE_GAIN_PROPORTIONAL * error;
+    if (rate < session->paceBaseRate * 0.85) rate = session->paceBaseRate * 0.85;
+    if (rate > session->paceBaseRate * 1.15) rate = session->paceBaseRate * 1.15;
+
+#elif PATHB_PACE_VARIANT == 2
+    /* The PI-on-depth build. Integral action against a signal that is zero
+     * during every phone silence winds up while the pipe is empty and unwinds
+     * into the next burst. */
+    if (runtime->stream.pipe.count > 0) {
+        session->paceIntegral += error * dt;
+        if (session->paceIntegral >  PACE_INTEGRAL_LIMIT) session->paceIntegral =  PACE_INTEGRAL_LIMIT;
+        if (session->paceIntegral < -PACE_INTEGRAL_LIMIT) session->paceIntegral = -PACE_INTEGRAL_LIMIT;
+    }
+    rate = session->paceBaseRate
+         - PACE_GAIN_PROPORTIONAL * error
+         - PACE_GAIN_INTEGRAL * session->paceIntegral;
+
+#else
+    /* THE PRODUCTION CONTROLLER.
+     *
+     * Depth is a phase, so it is corrected by a small rate trim -- but the rate
+     * itself comes from how often units actually arrive, never from the phase.
+     * Three rules follow, and they are the whole design:
+     *
+     *  1. The phase signal is FILTERED (2 s). Correcting the burst cycle itself
+     *     is what makes the adopted interval swing; the interval is the judder
+     *     the eye sees, so the loop must not chase a clump.
+     *  2. While the pipe is empty the rate is nominal and the trim is frozen.
+     *     Emptiness is not a rate error: nothing has arrived to schedule, and
+     *     slowing down here is what turned the next burst into an overshoot.
+     *  3. The depth budget (enforced when a unit is scheduled) is what drains a
+     *     burst: a unit that would push the schedule past the budget gets a
+     *     shorter slot, not a longer queue.
+     *
+     * The slow integrator the car rejected is replaced by the phase governor
+     * above: small steps, only on a sustained phase error, never while the pipe
+     * is empty. It trims the estimate's bias without winding up on a pause. */
+    {
+        int empty = runtime->stream.pipe.count == 0;
+        double nominal;
+        double depth_ms = (double)(pipe_pending_ns(runtime) / 1000000ull);
+        double rate, relative;
+
+        /* THE BANK RATCHET (see the header block). The trigger is the SOURCE
+         * going quiet past the cadence -- the arrival clock, not the pipe:
+         * detecting the pipe emptying fires a bank-length into the hole and
+         * only catches the deepest ones. One step per hole, relax on calm. */
+        if (!session->paceBankMs) session->paceBankMs = (u64)session->jitterMs;
+        {
+            u64 quiet = session->lastArrivalMs ? now - session->lastArrivalMs : 0;
+            if (quiet >= PACE_HOLE_MS) {
+                if (!session->paceHoleCounted) {
+                    session->paceHoleCounted = 1;
+                    session->paceLastStarveMs = now;
+                    if (session->paceBankMs < PACE_BANK_MAX_MS) {
+                        session->paceBankMs += PACE_BANK_STEP_MS;
+                        trace_message(runtime, "C\t%lu\tbank\t%lu\t%lu", now,
+                                      session->paceBankMs, quiet);
+                    }
+                }
             } else {
-                u64 low = jitter->rateMs - jitter->rateMs / CLOCK_HYSTERESIS_PERCENT;
-                u64 high = jitter->rateMs + jitter->rateMs / CLOCK_HYSTERESIS_PERCENT;
-                if (measured >= low && measured <= high) {
-                    jitter->bandWindows = 0;
-                } else if (++jitter->bandWindows >= CLOCK_BAND_WINDOWS) {
-                    jitter->rateMs = (jitter->rateMs + measured) / 2;
-                    jitter->bandWindows = 0;
+                session->paceHoleCounted = 0;
+                if (session->paceBankMs > (u64)session->jitterMs
+                    && session->paceLastStarveMs
+                    && now - session->paceLastStarveMs >= PACE_CALM_MS) {
+                    session->paceBankMs -= PACE_RELAX_MS;
+                    if (session->paceBankMs < (u64)session->jitterMs)
+                        session->paceBankMs = (u64)session->jitterMs;
+                    session->paceLastStarveMs = now;   /* one relax per calm period */
+                    trace_message(runtime, "C\t%lu\trelax\t%lu\t%lu", now,
+                                  session->paceBankMs, quiet);
                 }
             }
-            if (jitter->rateMs < MINIMUM_INTERVAL_MS) jitter->rateMs = MINIMUM_INTERVAL_MS;
-            if (jitter->rateMs > MAXIMUM_INTERVAL_MS) jitter->rateMs = MAXIMUM_INTERVAL_MS;
+        }
+
+        /* THE PHASE GOVERNOR. The count estimate is only a starting point: it
+         * can be biased, and after a rate change it is stale. The filtered phase
+         * cannot be biased -- if depth has sat below 70% of the bank for two
+         * seconds the base rate is too fast, whatever the count says. One small
+         * step per two seconds, skipped while the pipe is empty, bounded in
+         * authority: this replaces the integrator that wound up on the car. */
+#if PATHB_PACE_VARIANT >= 3
+        if (!empty) {
+            double low = (double)session->paceBankMs * PACE_GOVERNOR_LOW_PERCENT / 100.0;
+            double high = (double)session->paceBankMs * PACE_GOVERNOR_HIGH_PERCENT / 100.0;
+            if (session->paceDepthAvg > 0.0 && session->paceDepthAvg < low)
+                session->paceLowTicks++;
+            else
+                session->paceLowTicks = 0;
+            if (session->paceDepthAvg > high)
+                session->paceHighTicks++;
+            else
+                session->paceHighTicks = 0;
+        }
+        if (session->paceLowTicks >= PACE_GOVERNOR_TICKS) {
+            /* A starved phase steps harder: under a fifth of the bank for two
+             * seconds means the count estimate has not admitted the source's
+             * real rate at all, and every 100 ms spent too fast is wire
+             * starvation the ECU sees. */
+            double step = (session->paceDepthAvg
+                           < (double)session->paceBankMs * PACE_GOVERNOR_STARVE_PERCENT / 100.0)
+                          ? PACE_GOVERNOR_DOWN_HARD : PACE_GOVERNOR_DOWN;
+            session->paceLowTicks = 0;
+            session->paceBaseRate *= step;
+            if (session->paceBaseRate < 1.0) session->paceBaseRate = 1.0;
+            session->estimateMs = (u64)(1000.0 / session->paceBaseRate + 0.5);
+            if (session->estimateMs < MINIMUM_INTERVAL_MS) session->estimateMs = MINIMUM_INTERVAL_MS;
+            if (session->estimateMs > MAXIMUM_INTERVAL_MS) session->estimateMs = MAXIMUM_INTERVAL_MS;
+            session->rateWindowStartMs = now;
+            session->rateWindowCount = 0;
+            trace_message(runtime, "C\t%lu\tslow\t%lu\t%lu", now,
+                          (u64)(session->paceBaseRate * 1000.0),
+                          (u64)(session->paceDepthAvg + 0.5));
+        } else if (session->paceHighTicks >= PACE_GOVERNOR_TICKS) {
+            session->paceHighTicks = 0;
+            session->paceBaseRate *= PACE_GOVERNOR_UP;
+            if (session->paceBaseRate > 100.0) session->paceBaseRate = 100.0;
+            session->estimateMs = (u64)(1000.0 / session->paceBaseRate + 0.5);
+            if (session->estimateMs < MINIMUM_INTERVAL_MS) session->estimateMs = MINIMUM_INTERVAL_MS;
+            if (session->estimateMs > MAXIMUM_INTERVAL_MS) session->estimateMs = MAXIMUM_INTERVAL_MS;
+            session->rateWindowStartMs = now;
+            session->rateWindowCount = 0;
+            trace_message(runtime, "C\t%lu\tfast\t%lu\t%lu", now,
+                          (u64)(session->paceBaseRate * 1000.0),
+                          (u64)(session->paceDepthAvg + 0.5));
+        }
+#endif
+
+        nominal = session->paceBaseRate;
+
+        if (!empty) {
+            /* Asymmetric phase filter: fall fast (order the refill at once),
+             * rise slowly (never speed up into the silence that follows a
+             * burst -- that is the measured 550 ms starvation mechanism). */
+            double bank = (double)session->paceBankMs;
+            double tau = depth_ms < bank
+                       ? (double)PACE_DEPTH_TAU_LOW_MS
+                       : (double)PACE_DEPTH_TAU_HIGH_MS;
+            double alpha = dt * 1000.0 / tau;
+            if (alpha > 1.0) alpha = 1.0;
+            if (session->paceDepthAvg <= 0.0) session->paceDepthAvg = bank;
+            session->paceDepthAvg = session->paceDepthAvg * (1.0 - alpha) + depth_ms * alpha;
+        }
+
+        relative = (session->paceDepthAvg - (double)session->paceBankMs)
+                 / (double)session->paceBankMs;
+        if (relative >  PACE_DEPTH_DEADBAND_PERCENT / 100.0)
+            relative -= PACE_DEPTH_DEADBAND_PERCENT / 100.0;
+        else if (relative < -PACE_DEPTH_DEADBAND_PERCENT / 100.0)
+            relative += PACE_DEPTH_DEADBAND_PERCENT / 100.0;
+        else
+            relative = 0.0;
+
+        session->paceTrim = empty ? 0.0
+            : PACE_TRIM_GAIN * relative;
+        {
+            double limit = PACE_TRIM_LIMIT;
+            if (session->paceDepthAvg
+                < (double)session->paceBankMs * PACE_TRIM_DEEP_PERCENT / 100.0)
+                limit = PACE_TRIM_DEEP_LIMIT;
+            if (session->paceTrim >  limit) session->paceTrim =  limit;
+            if (session->paceTrim < -limit) session->paceTrim = -limit;
+        }
+
+        rate = nominal * (1.0 + session->paceTrim);
+        if (rate < nominal * 0.30) rate = nominal * 0.30;   /* refill floor    */
+        if (rate > nominal * 1.60) rate = nominal * 1.60;   /* trim ceiling     */
+        {
+            /* Speed up at once (a burst must be met); slow down at a bounded
+             * pace, fast enough that a refill completes between two holes. */
+            u64 wanted = (u64)(1000.0 / rate + 0.5);
+            u64 slowest;
+            if (wanted < MINIMUM_INTERVAL_MS) wanted = MINIMUM_INTERVAL_MS;
+            if (wanted > MAXIMUM_INTERVAL_MS) wanted = MAXIMUM_INTERVAL_MS;
+            /* Until the first count window has closed (or the governor has
+             * taught us something), the source rate is unknown: bias the
+             * opening pace SLOW. Too slow costs depth, which the budget drains
+             * at the wire floor; too fast starves the wire, which nothing
+             * downstream can repair. */
+            if (!session->estimateMs && wanted < PACE_STARTUP_INTERVAL_MS)
+                wanted = PACE_STARTUP_INTERVAL_MS;
+            slowest = session->paceIntervalMs
+                    + session->paceIntervalMs * PACE_RATE_SLEW_PERCENT / 100u + 1;
+            if (wanted > slowest) wanted = slowest;
+            session->paceIntervalMs = wanted;
+            trace_message(runtime, "P\t%lu\t%lu\t%lu\t%lu\t%lu\t%d\t%lu\t%lu\t%lu\t%lu",
+                          now,
+                          pipe_pending_ns(runtime) / 1000000ull,
+                          session->paceIntervalMs,
+                          session->estimateMs ? session->estimateMs : FALLBACK_INTERVAL_MS,
+                          (u64)(session->paceBaseRate * 1000.0 + 0.5),
+                          runtime->stream.pipe.count,
+                          (u64)(session->paceArrivalRate * 1000.0 + 0.5),
+                          (u64)((session->paceTrim + 1.0) * 1000.0 + 0.5),
+                          (u64)(session->paceDepthAvg + 0.5),
+                          session->paceBankMs);
+        }
+        return;
+    }
+#endif
+
+    if (rate < 1000.0 / (double)MAXIMUM_INTERVAL_MS) rate = 1000.0 / (double)MAXIMUM_INTERVAL_MS;
+    if (rate > 1000.0 / (double)MINIMUM_INTERVAL_MS) rate = 1000.0 / (double)MINIMUM_INTERVAL_MS;
+
+    {
+        u64 wanted = (u64)(1000.0 / rate + 0.5);
+        if (wanted < MINIMUM_INTERVAL_MS) wanted = MINIMUM_INTERVAL_MS;
+        if (wanted > MAXIMUM_INTERVAL_MS) wanted = MAXIMUM_INTERVAL_MS;
+#if PATHB_PACE_VARIANT >= 3
+        /* Accelerate immediately (a burst must be met), decelerate gently (a
+         * rate that can jump back and forth is the limit cycle). */
+        {
+            u64 previous = session->paceIntervalMs;
+            u64 slowest = previous + previous * PACE_RATE_SLEW_PERCENT / 100u + 1;
+            if (wanted > slowest) wanted = slowest;
+        }
+#endif
+        session->paceIntervalMs = wanted;
+    }
+
+    trace_message(runtime, "P\t%lu\t%lu\t%lu\t%lu\t%lu\t%d\t%lu\t%lu",
+                  now,
+                  pipe_pending_ns(runtime) / 1000000ull,
+                  session->paceIntervalMs,
+                  session->estimateMs ? session->estimateMs : FALLBACK_INTERVAL_MS,
+                  (u64)(session->paceBaseRate * 1000.0 + 0.5),
+                  runtime->stream.pipe.count,
+                  (u64)(session->paceArrivalRate * 1000.0 + 0.5),
+                  (u64)((session->paceTrim + 1.0) * 1000.0 + 0.5));
+}
+
+/* The estimate and the reports. The estimate is measured by COUNTING arrivals
+ * over a window, never by averaging gaps: a mean is dominated by the many short
+ * ones. It is the loop's feedforward term, so it is smoothed but not trusted. */
+void session_maintain(Runtime *runtime)
+{
+    Session *session = &runtime->session;
+    u64 now = current_time_ms();
+
+    if (session->rateWindowCount && session->rateWindowStartMs) {
+        u64 window = now - session->rateWindowStartMs;
+        u64 windowMs = CLOCK_RATE_WINDOW_MS;
+#if PATHB_PACE_VARIANT >= 3
+        /* A hole every ~2 s makes a 4 s count window alternate between one hole
+         * and two; that is a rate estimate that swings by 25% with nothing
+         * changing. Eight seconds averages four holes, and the jump path below
+         * still adopts a genuine step immediately. */
+        windowMs = 8000;
+#endif
+        if (window >= windowMs) {
+            u64 measured = window / session->rateWindowCount;
+            if (!session->estimateMs) {
+#if PATHB_PACE_VARIANT >= 3
+                /* The first window is the least trustworthy one: at session
+                 * open it averages the phone's ramp with its steady rate. Bias
+                 * it slow for the same reason the opening pace is clamped --
+                 * excess depth is drained by the budget, starvation is not
+                 * repairable. */
+                if (measured < PACE_STARTUP_INTERVAL_MS) measured = PACE_STARTUP_INTERVAL_MS;
+#endif
+                session->estimateMs = measured;
+            } else {
+                u64 low = session->estimateMs - session->estimateMs / CLOCK_HYSTERESIS_PERCENT;
+                u64 high = session->estimateMs + session->estimateMs / CLOCK_HYSTERESIS_PERCENT;
+                if (measured >= low && measured <= high) {
+                    session->estimateBandWindows = 0;
+                } else if (++session->estimateBandWindows >= CLOCK_BAND_WINDOWS) {
+#if PATHB_PACE_VARIANT >= 3
+                    /* A genuine rate change is adopted, not blended: half of a
+                     * 3x step is still half wrong, and the loop then spends
+                     * seconds chasing it. Anything smaller still has to hold
+                     * for two windows. */
+                    session->estimateMs = measured;
+#else
+                    session->estimateMs = (session->estimateMs + measured) / 2;
+#endif
+                    session->estimateBandWindows = 0;
+                } else {
+#if PATHB_PACE_VARIANT >= 3
+                    /* The one-window jump path is for SLOW-DOWNS only. A window
+                     * that says "faster" may just be straddling a burst (the
+                     * opening 57 fps ramp averaged into the steady rate is
+                     * exactly that), and pacing too fast drains the wire --
+                     * the one error nothing downstream can repair. A speed-up
+                     * waits for the two-window path; if it is real, the cost is
+                     * depth, which the budget drains at the wire floor. */
+                    u64 difference = measured > session->estimateMs
+                                   ? measured - session->estimateMs
+                                   : session->estimateMs - measured;
+                    if (measured > session->estimateMs
+                        && difference * 100u > session->estimateMs * PACE_ESTIMATE_JUMP_PERCENT) {
+                        session->estimateMs = measured;
+                        session->estimateBandWindows = 0;
+                    }
+#endif
+                }
+            }
+            if (session->estimateMs < MINIMUM_INTERVAL_MS) session->estimateMs = MINIMUM_INTERVAL_MS;
+            if (session->estimateMs > MAXIMUM_INTERVAL_MS) session->estimateMs = MAXIMUM_INTERVAL_MS;
+            session->paceBaseRate = 1000.0 / (double)session->estimateMs;
             session->rateWindowStartMs = now;
             session->rateWindowCount = 0;
         }
     }
 
-    /* Seed the target from the gap estimate only: the first units arrive before a
-     * rate window has closed, and grow/shrink corrects it within seconds. */
-    if (!jitter->target) {
-        u64 estimate = session->clock.sensorTicks
-                     ? session->clock.sensorTicks / TICKS_PER_MILLISECOND
-                     : FALLBACK_INTERVAL_MS;
-        if (estimate < MINIMUM_INTERVAL_MS) estimate = MINIMUM_INTERVAL_MS;
-        if (estimate > MAXIMUM_INTERVAL_MS) estimate = MAXIMUM_INTERVAL_MS;
-        jitter->target = (int)((u64)(session->jitterMs ? session->jitterMs : 250) / estimate);
-    }
-    if (jitter->target < 2) jitter->target = 2;
-    if (jitter->target > jitter->maximum) jitter->target = jitter->maximum;
-
-    interval = jitter->rateMs ? jitter->rateMs : FALLBACK_INTERVAL_MS;
-    if (jitter->target > 0) {
-        u64 target = (u64)jitter->target;
-        u64 band = target * DEPTH_BAND_PERCENT / 100u;
-        u64 highBand = target + band;
-        u64 lowBand = target > band ? target - band : 1;
-        if ((u64)session->queue.count > highBand) {
-            u64 scaled = (jitter->rateMs ? jitter->rateMs : FALLBACK_INTERVAL_MS)
-                       * target / (u64)session->queue.count;
-            if (scaled < 2) scaled = 2;
-            interval = scaled;
-        } else if ((u64)session->queue.count < lowBand) {
-            interval = interval + interval / DEPTH_RATE_ADJUST_DIVISOR + 1;
-        }
-    }
-    if (session->queue.count > 0 &&
-        (now - session->queue.arrivalMs[session->queue.head]) > LATENCY_CAP_MS)
-        interval = 2;
-
-    if (!session->streaming) { jitter->started = 0; jitter->connectedAtMs = 0; }
-    if (session->streaming && !jitter->connectedAtMs) jitter->connectedAtMs = now;
-    if (!session->nextEmitMs) session->nextEmitMs = now;
-
-    /* PRE-ROLL: fill to the target before the first emit, bounded in wall time so
-     * a slow-starting phone cannot hold the picture off the screen for ever. */
-    if (session->jitterMs && session->queue.count > 0 && !jitter->started &&
-        session->queue.count >= jitter->target) {
-        jitter->started = 1;
-        log_message("jit: pre-roll reached target %d AU(s) ~%ld ms, interval %ld ms",
-                    jitter->target,
-                    (long)((jitter->rateMs ? jitter->rateMs : FALLBACK_INTERVAL_MS) * (u64)jitter->target),
-                    (long)(jitter->rateMs ? jitter->rateMs : FALLBACK_INTERVAL_MS));
-    }
-    if (!session->jitterMs) jitter->started = 1;
+    pace_control(runtime, now);
 
     if (now - session->latency.lastReportMs >= LATENCY_REPORT_INTERVAL_MS &&
         session->latency.samples.count) {
         u64 p50, p95, maximum;
         ring_percentiles(&session->latency.samples, &p50, &p95, &maximum);
         session->latency.lastReportMs = now;
-        log_message("lat: ours p50=%ld p95=%ld max=%ld ms  qn=%d tgt=%d iv=%ld ms",
-                    (long)p50, (long)p95, (long)maximum,
-                    session->queue.count, jitter->target,
-                    (long)(jitter->rateMs ? jitter->rateMs : FALLBACK_INTERVAL_MS));
+        log_message("lat: ours p50=%ld p95=%ld max=%ld ms  depth=%ld ms  interval=%ld ms",
+                    (long)p50, (long)p95, (long)session->latency.maximum,
+                    (long)(pipe_pending_ns(runtime) / 1000000ull),
+                    (long)session->paceIntervalMs);
     }
 
-    /* ---- cadence window: what rhythm are we delivering, and what did it cost */
     if (now - session->cadenceReportMs >= CADENCE_REPORT_INTERVAL_MS) {
         u64 arrival50, arrival95, arrivalMax, emission50, emission95, emissionMax;
-        u64 overrunDelta = emitter->statisticsOverruns - session->previousOverruns;
-        u64 skipDelta = emitter->statisticsSkipped - session->previousSkipped;
-        u64 deferDelta = emitter->statisticsDeferredArms - session->previousDeferred;
-        u64 inDelta = g_supervisor.accessUnitsIn - session->previousAccessUnitsIn;
-        u64 outDelta = g_supervisor.accessUnitsOut - session->previousAccessUnitsOut;
+        Pipe *pipe = &runtime->stream.pipe;
+        u64 lateDelta = pipe->statisticsLate - session->previousLate;
+        u64 catchUpDelta = pipe->statisticsCatchUps - session->previousCatchUps;
+        u64 dropDelta = pipe->statisticsDropped - session->previousDropped;
+        u64 inDelta = runtime->supervisor.accessUnitsIn - session->previousAccessUnitsIn;
+        u64 outDelta = runtime->supervisor.accessUnitsOut - session->previousAccessUnitsOut;
 
         ring_percentiles(&session->cadence.arrival, &arrival50, &arrival95, &arrivalMax);
         ring_percentiles(&session->cadence.emission, &emission50, &emission95, &emissionMax);
         log_message("cad: arr p50=%ld p95=%ld max=%ld | emi p50=%ld p95=%ld max=%ld"
-                    " | au=%ld out=%ld seqgap=%ld lost=%ld ovr=%ld skip=%ld defer=%ld"
-                    " | qn=%d tgt=%d iv=%ld ms",
+                    " | au=%ld out=%ld seqgap=%ld lost=%ld late=%ld catchup=%ld drop=%ld"
+                    " | depth=%ld ms  interval=%ld ms  base=%ld ms",
                     (long)arrival50, (long)arrival95, (long)arrivalMax,
                     (long)emission50, (long)emission95, (long)emissionMax,
                     (long)inDelta, (long)outDelta,
                     (long)session->cadence.sequenceGaps, (long)session->cadence.lostFrames,
-                    (long)overrunDelta, (long)skipDelta, (long)deferDelta,
-                    session->queue.count, jitter->target,
-                    (long)(jitter->rateMs ? jitter->rateMs : FALLBACK_INTERVAL_MS));
-        session->previousOverruns = emitter->statisticsOverruns;
-        session->previousSkipped = emitter->statisticsSkipped;
-        session->previousDeferred = emitter->statisticsDeferredArms;
-        session->previousAccessUnitsIn = g_supervisor.accessUnitsIn;
-        session->previousAccessUnitsOut = g_supervisor.accessUnitsOut;
+                    (long)lateDelta, (long)catchUpDelta, (long)dropDelta,
+                    (long)(pipe_pending_ns(runtime) / 1000000ull),
+                    (long)session->paceIntervalMs,
+                    (long)(session->estimateMs ? session->estimateMs : FALLBACK_INTERVAL_MS));
+        session->previousLate = pipe->statisticsLate;
+        session->previousCatchUps = pipe->statisticsCatchUps;
+        session->previousDropped = pipe->statisticsDropped;
+        session->previousAccessUnitsIn = runtime->supervisor.accessUnitsIn;
+        session->previousAccessUnitsOut = runtime->supervisor.accessUnitsOut;
         session->cadenceReportMs = now;
         ring_reset(&session->cadence.arrival);
         ring_reset(&session->cadence.emission);
     }
-
-    if (session->jitterMs && !jitter->started && jitter->connectedAtMs &&
-        now - jitter->connectedAtMs >= (u64)session->jitterMs) {
-        jitter->started = 1;
-        log_message("jit: pre-roll TIMED OUT with %d of %d AU(s)",
-                    session->queue.count, jitter->target);
-    }
-
-    if (session->streaming && jitter->started && session->queue.count > 0 &&
-        now >= session->nextEmitMs) {
-        if (emitter->count) {
-            emitter_release_due(stream, current_time_ns());
-            if (emitter->count) {
-                emitter->statisticsDeferredArms++;
-                session->nextEmitMs = now + (interval > 2 ? interval / 2 : 1);
-            }
-        }
-        if (!emitter->count) {
-            /* CATCH-UP MEANS "FASTER", NOT "UNSPACED": emitting a whole unit at
-             * once because the queue is over target is what produced the clump. */
-            session->clock.slotMs = !session->jitterMs ? 0
-                : ((jitter->target && session->queue.count > jitter->target + 3)
-                       ? (interval > 2 ? interval / 2 : interval)
-                       : interval);
-            {   /* Latency this unit spent in OUR buffer: the share of "it takes a
-                 * second to react" that belongs to us. */
-                u64 latency = now - session->queue.arrivalMs[session->queue.head];
-                ring_push(&session->latency.samples, latency);
-                if (latency > session->latency.maximum) session->latency.maximum = latency;
-            }
-            session_publish_access_unit(session,
-                                        session->queue.bytes[session->queue.head],
-                                        session->queue.length[session->queue.head]);
-            session->clock.slotMs = 0;
-            session->queue.head = (session->queue.head + 1) % QUEUE_CAPACITY;
-            session->queue.count--;
-            session->nextEmitMs = now + interval;
-        }
-    } else if (session->streaming && jitter->started && session->queue.count == 0 &&
-               now >= session->nextEmitMs) {
-        /* A hole the buffer could not cover is the only honest evidence that it
-         * is too shallow. */
-        jitter->starvations++;
-        jitter->starvedAtMs = now;
-        session->nextEmitMs = now + interval;
-        if (now - jitter->lastGrowMs > JITTER_GROW_INTERVAL_MS && jitter->target < jitter->maximum) {
-            jitter->target++;
-            jitter->lastGrowMs = now;
-            log_message("jit: grow -> %d AU(s) after a starved tick (total %ld)",
-                        jitter->target, (long)jitter->starvations);
-        }
-    } else if (session->streaming && jitter->started && jitter->target > jitter->minimum &&
-               now - jitter->starvedAtMs > JITTER_STARVE_SETTLE_MS &&
-               now - jitter->lastShrinkMs > JITTER_SHRINK_INTERVAL_MS) {
-        /* ...and give the latency back once the phone behaves. */
-        jitter->target--;
-        jitter->lastShrinkMs = now;
-        log_message("jit: shrink -> %d AU(s) after 4 s without starvation", jitter->target);
-    }
-
-    /* DEPTH BOUND: drain ahead of the clock rather than let the queue walk up
-     * towards the ceiling, which would be seconds of latency. Still spread. */
-    if (session->queue.count > QUEUE_DRAIN_ABOVE) {
-        session->clock.slotMs = !session->jitterMs ? 0 : (interval > 2 ? interval / 2 : interval);
-        while (session->queue.count > QUEUE_DRAIN_ABOVE) {
-            session_publish_access_unit(session,
-                                        session->queue.bytes[session->queue.head],
-                                        session->queue.length[session->queue.head]);
-            session->queue.head = (session->queue.head + 1) % QUEUE_CAPACITY;
-            session->queue.count--;
-            jitter->depthDrains++;
-        }
-        session->clock.slotMs = 0;
-    }
-}
-
-static long socket_readable_bytes(int descriptor)
-{
-    int available = 0;
-    if (ioctl(descriptor, (unsigned long)FIONREAD, &available) < 0) return -1;
-    return (long)available;
 }
 
 /* One record from the shim. Returns 0 when the connection is finished (EOF, a
  * short read, a malformed frame) and 1 to continue. */
-int session_read_record(Session *session, int descriptor)
+int session_read_record(Runtime *runtime, int descriptor)
 {
-    Stream *stream = &session->stream;
+    Stream *stream = &runtime->stream;
+    Session *session = &runtime->session;
     u8 header[MIB3_HELP_HDRLEN];
     u32 magic, length;
     u64 sequence;
@@ -1393,9 +1741,9 @@ int session_read_record(Session *session, int descriptor)
         return 0;
     }
 
-    /* Arrival accounting: the evidence the pacer acts on, and the rhythm nothing
-     * used to measure. A one-second cap keeps a genuine pause out of the
-     * distribution -- a silence is not a frame interval. */
+    /* Arrival accounting: the evidence the interval estimate acts on, and the
+     * rhythm nothing used to measure. A one-second cap keeps a genuine pause out
+     * of the distribution -- a silence is not a frame interval. */
     {
         u64 now = current_time_ms();
         if (session->lastArrivalMs && now - session->lastArrivalMs > ARRIVAL_GAP_THRESHOLD_MS)
@@ -1427,6 +1775,9 @@ int session_read_record(Session *session, int descriptor)
     }
 
     access_unit_inspect(session->record, (usize_t)length, &info);
+    trace_message(runtime, "A\t%lu\t%lu\t%lu\t%d\t%d\t%d",
+                  current_time_ns(), sequence, (u64)length,
+                  info.hasIdr, info.hasVcl, info.hasSps);
 
     /* Fold a VCL-free record into the next frame. */
     if (!session->noFold) {
@@ -1440,11 +1791,11 @@ int session_read_record(Session *session, int descriptor)
 
     /* Count every unit the shim hands us, bound or not: in monitor mode this is
      * how the supervisor learns a session exists at all. */
-    g_supervisor.accessUnitsIn++;
+    runtime->supervisor.accessUnitsIn++;
     if (stream->outFd < 0) {
         /* Queueing while unbound would only build stale latency for a port we do
          * not own; drop it and keep the configuration. */
-        supervisor_publish(0);
+        supervisor_publish(runtime, 0);
         return 1;
     }
 
@@ -1453,6 +1804,7 @@ int session_read_record(Session *session, int descriptor)
      * that carry their headers on every keyframe. */
     if (!session->rateWindowStartMs) session->rateWindowStartMs = session->lastArrivalMs;
     session->rateWindowCount++;
+    session->paceArrivalCount++;
 
     /* START GATE: hold until parameters and an IDR are both in hand. The ECU's
      * map app does not retry within an acquisition it cannot decode. */
@@ -1465,8 +1817,9 @@ int session_read_record(Session *session, int descriptor)
             return 1;
         }
         session->streaming = 1;
-        supervisor_set_ready(1);
-        supervisor_publish(1);
+        supervisor_set_ready(runtime, 1);
+        supervisor_publish(runtime, 1);
+        trace_message(runtime, "G\t%lu\t%lu", current_time_ns(), session->held);
         log_message("gate: IDR in hand after %ld held AU(s) -- starting the stream",
                     (long)session->held);
     }
@@ -1488,89 +1841,44 @@ int session_read_record(Session *session, int descriptor)
     if (parameterBytes) memcpy(session->folded, session->parameters.bytes, parameterBytes);
     memcpy(session->folded + parameterBytes, session->record, (usize_t)length);
 
-    if (session->queue.count == QUEUE_CAPACITY) {        /* full: bound latency */
-        session_publish_access_unit(session,
-                                    session->queue.bytes[session->queue.head],
-                                    session->queue.length[session->queue.head]);
-        session->queue.head = (session->queue.head + 1) % QUEUE_CAPACITY;
-        session->queue.count--;
-    }
-    {
-        int slot = (session->queue.head + session->queue.count) % QUEUE_CAPACITY;
-        if (total > session->queue.capacity[slot]) {
-            u8 *grown = (u8 *)realloc(session->queue.bytes[slot], total);
-            if (!grown) { log_message("oom"); return 0; }
-            session->queue.bytes[slot] = grown;
-            session->queue.capacity[slot] = total;
-        }
-        memcpy(session->queue.bytes[slot], session->folded, total);
-        session->queue.length[slot] = total;
-        session->queue.arrivalMs[slot] = session->lastArrivalMs;
-        session->queue.count++;
-    }
-
-    /* BACKLOG GUARD: pending bytes on the socket are the real backlog signal. A
-     * burst is measured to knock the cluster into its placeholder, so draining
-     * forward to the next IDR is better than flooding it with stale pictures. */
-    if (!session->noIdrGate && session->queue.count > 3) {
-        long pending = socket_readable_bytes(descriptor);
-        if (pending > (long)MAX_PENDING_BYTES) {
-            session->backlogAccessUnits += (u64)session->queue.count;
-            queue_clear(session);
-            session->streaming = 0;
-            supervisor_set_ready(0);
-            supervisor_publish(1);
-            session->backlogDrains++;
-            log_message("gate: backlog %ld bytes -- drained %ld AUs forward to the next IDR",
-                        pending, (long)session->backlogAccessUnits);
-        }
-    }
+    session_emit_access_unit(runtime, session->folded, total);
     return 1;
 }
 
-void session_finish(Session *session, int descriptor)
+void session_finish(Runtime *runtime, int descriptor)
 {
-    Stream *stream = &session->stream;
-    int drained = 0;
+    Stream *stream = &runtime->stream;
+    Pipe *pipe = &stream->pipe;
+    Session *session = &runtime->session;
+    int drained;
 
     close(descriptor);
     /* THE DISCONNECT EVENT, published before the drain: the drain can push
      * already-accepted frames onto the wire, and an event that trails the last
      * byte it describes is a worse event. */
-    supervisor_set_connection(0);
+    supervisor_set_connection(runtime, 0);
 
-    /* DRAIN WHAT WE ALREADY ACCEPTED: closing with frames queued silently
-     * discarded the phone's last pictures. Bounded by QUEUE_CAPACITY. */
-    g_timing.ignore = 1;                                 /* teardown is not the stream */
-    while (session->queue.count > 0) {
-        session_publish_access_unit(session,
-                                    session->queue.bytes[session->queue.head],
-                                    session->queue.length[session->queue.head]);
-        session->queue.head = (session->queue.head + 1) % QUEUE_CAPACITY;
-        session->queue.count--;
-        drained++;
-    }
-    emitter_release_all(stream, 0);
-    mux_flush(stream);                                   /* no partial datagram */
+    /* DRAIN WHAT IS ALREADY SCHEDULED: closing with datagrams still pending
+     * silently discarded the phone's last pictures. */
+    runtime->timing.ignore = 1;                          /* teardown is not the stream */
+    drained = pipe->count - pipe->cursor;
+    pipe_release_all(runtime);
+    mux_flush(runtime);                                  /* no partial datagram */
     log_message("conn close frame=%ld", (long)session->clock.frames);
-    if (drained) log_message("  pacer: drained-at-close=%d", drained);
-    g_timing.ignore = 0;
+    log_message("  pacer: drained-at-close=%d", drained);
+    runtime->timing.ignore = 0;
 
-    log_message("  arrival-gaps>250ms=%ld  depth-drains=%ld  spread-overruns=%ld"
-                "  spread-skipped=%ld  deferred-arms=%ld",
-                (long)session->arrivalGaps, (long)session->jitter.depthDrains,
-                (long)stream->emitter.statisticsOverruns,
-                (long)stream->emitter.statisticsSkipped,
-                (long)stream->emitter.statisticsDeferredArms);
-    if (stream->emitter.statisticsOutOfMemory)
-        log_message("  PACING-FELL-BACK-TO-IMMEDIATE=%ld", (long)stream->emitter.statisticsOutOfMemory);
-    timing_report();                                     /* this session's wire shape */
-    timing_reset();
+    log_message("  arrival-gaps>250ms=%ld  late-frames=%ld  catch-ups=%ld  dropped-frames=%ld",
+                (long)session->arrivalGaps, (long)pipe->statisticsLate,
+                (long)pipe->statisticsCatchUps, (long)pipe->statisticsDropped);
+    if (pipe->statisticsUnpaced)
+        log_message("  UNPACED frames=%ld", (long)pipe->statisticsUnpaced);
+    timing_report(runtime);                              /* this session's wire shape */
+    timing_reset(runtime);
 
-    if (session->held || session->backlogDrains) {
-        log_message("  gate: held=%ld  backlog drains=%ld  backlog AUs discarded=%ld  streaming=%d",
-                    (long)session->held, (long)session->backlogDrains,
-                    (long)session->backlogAccessUnits, session->streaming);
+    if (session->held) {
+        log_message("  gate: held=%ld  streaming=%d",
+                    (long)session->held, session->streaming);
     }
 }
 
@@ -1589,16 +1897,17 @@ static int host_ppoll(PollDescriptor *descriptors, usize_t count, const UnitTime
 #define PPOLL_(descriptors, count, timeout) host_ppoll((descriptors), (count), (timeout))
 #endif
 
-void session_run(Session *session, int listener)
+void session_run(Runtime *runtime, int listener)
 {
-    Stream *stream = &session->stream;
+    Stream *stream = &runtime->stream;
+    Session *session = &runtime->session;
 
-    log_message("buffer: jitter=%d ms (adaptive: grows on starvation, shrinks when idle)"
-                "  intra-frame release=ON (poll/ppoll, byte-proportional)", session->jitterMs);
+    log_message("pipe: start depth=%d ms  intra-frame release=ON (poll/ppoll,"
+                " byte-proportional, one schedule)", session->jitterMs);
     log_message("  spread=%lu%% of each unit's interval (the remainder is cushion so the"
                 " next frame can start on time -- 100 = no cushion)",
-                (unsigned long)g_spreadPercent);
-    supervisor_publish(1);                               /* nothing connected yet */
+                (unsigned long)runtime->spreadPercent);
+    supervisor_publish(runtime, 1);                      /* nothing connected yet */
 
     for (;;) {
         int connection = -1;
@@ -1619,16 +1928,16 @@ void session_run(Session *session, int listener)
                 connection = accept(listener, 0, 0);
         }
         {
-            int action = control_poll();
-            if (action == 1) output_bind(session, g_control.requestedPort);
-            else if (action == 2) output_unbind(session);
+            int action = control_poll(runtime);
+            if (action == 1) output_bind(runtime, runtime->control.requestedPort);
+            else if (action == 2) output_unbind(runtime);
         }
-        supervisor_publish(0);
+        supervisor_publish(runtime, 0);
         if (connection < 0) continue;
 
         /* THE CONNECT EVENT, before a single unit is read. */
-        supervisor_set_connection(1);
-        session_reset(session);
+        supervisor_set_connection(runtime, 1);
+        session_reset(runtime);
         log_message("conn open  frame=%ld", (long)session->clock.frames);
 
         for (;;) {
@@ -1636,7 +1945,7 @@ void session_run(Session *session, int listener)
             {
                 PollDescriptor pollDescriptor;
                 UnitTime timeout;
-                u64 wait = emitter_poll_timeout_ns(stream);
+                u64 wait = pipe_poll_timeout_ns(runtime);
                 int ready;
                 timespec_seconds(timeout) = (long)(wait / 1000000000ull);
                 timespec_nanoseconds(timeout) = (long)(wait % 1000000000ull);
@@ -1650,32 +1959,38 @@ void session_run(Session *session, int listener)
             /* Published on EVERY tick: while the port was only published from the
              * unbound branch the supervisor saw no access unit for its whole
              * grace and flapped the cluster. */
-            supervisor_publish(0);
+            supervisor_publish(runtime, 0);
 
             {   /* The supervisor's hand on the port: a bind starts from a clean
-                 * queue and a fresh IDR, an unbind leaves no half-emitted frame. */
-                int action = control_poll();
+                 * schedule and a fresh IDR, an unbind leaves nothing in flight. */
+                int action = control_poll(runtime);
                 if (action == 1) {
-                    output_bind(session, g_control.requestedPort);
+                    output_bind(runtime, runtime->control.requestedPort);
                     if (stream->outFd >= 0) {
                         stream->mux.programAssociationLastMs = 0;
                         session->streaming = 0;
                         session->headerPending = 1;
-                        queue_clear(session);
+                        stream->pipe.nextSlotStartNs = 0;
+                        stream->pipe.lastEmissionNs = 0;
+                        stream->pipe.count = stream->pipe.cursor = 0;
                     }
                 } else if (action == 2) {
-                    output_unbind(session);
+                    output_unbind(runtime);
                     session->streaming = 0;
-                    queue_clear(session);
+                    stream->pipe.nextSlotStartNs = 0;
+                    stream->pipe.lastEmissionNs = 0;
+                    stream->pipe.count = stream->pipe.cursor = 0;
                 }
             }
 
-            session_release_tick(session);
-            emitter_release_due(stream, current_time_ns());
+            session_maintain(runtime);
 
-            if (readable && !session_read_record(session, connection)) break;
+            /* Read before releasing, so a unit that arrives now can start leaving
+             * in this same iteration. */
+            if (readable && !session_read_record(runtime, connection)) break;
+            pipe_release_due(runtime, current_time_ns());
         }
-        session_finish(session, connection);
+        session_finish(runtime, connection);
     }
 }
 
@@ -1684,11 +1999,11 @@ void session_run(Session *session, int listener)
 static const u8 *g_fileUnits[FILE_ACCESS_UNIT_LIMIT];
 static int g_fileUnitLengths[FILE_ACCESS_UNIT_LIMIT];
 
-static void play_file(Session *session, Options *options, int unitCount)
+static void play_file(Runtime *runtime, Options *options, int unitCount)
 {
-    Stream *stream = &session->stream;
-    u64 gapsSent = 0;
+    Stream *stream = &runtime->stream;
 
+    stream->pipe.unitPaced = 0;                          /* file mode is unpaced */
     for (u64 frame = 0;; frame++) {
         const u8 *unit = g_fileUnits[frame % (u64)unitCount];
         int bytes = g_fileUnitLengths[frame % (u64)unitCount];
@@ -1704,7 +2019,7 @@ static void play_file(Session *session, Options *options, int unitCount)
                 presentationTicks = stream->mux.presentationTimeTicks + 1;
         }
         stream->mux.presentationTimeTicks = presentationTicks;
-        mux_access_unit(stream, unit, bytes, presentationTicks);
+        mux_access_unit(runtime, unit, bytes, presentationTicks);
 
         if (options->realtime) {
             u64 wanted = stream->mux.startMs +
@@ -1717,23 +2032,17 @@ static void play_file(Session *session, Options *options, int unitCount)
          * jump". */
         if (options->gapMs > 0 && options->gapEvery > 0 &&
             ((frame + 1) % (u64)options->gapEvery) == 0) {
-            gapsSent++;
-            if ((gapsSent & 0x07) == 1)
-                log_message("gap %ld after frame %ld (%d ms of silence)",
-                            (long)gapsSent, (long)(frame + 1), options->gapMs);
+            if (((frame + 1) / (u64)options->gapEvery & 0x07) == 1)
+                log_message("gap after frame %ld (%d ms of silence)",
+                            (long)(frame + 1), options->gapMs);
             usleep((unsigned)options->gapMs * 1000u);
         }
         if (!options->loop && frame + 1 >= (u64)unitCount) break;
     }
 }
 
-/* ------------------------------------------------------------------ 16. probe
- * Join the group and dump whatever is already on it: prove the unit's own sender
- * is live and see its exact RTP fields, or capture its datagrams so ours can be
- * diffed against them. */
+/* ------------------------------------------------------------------ 16. probe */
 
-/* "address%interface" in place: the interface defaults to the VLAN the cluster
- * listens on. Shared by the output settings and the probe. */
 static void split_destination(char *text, const char **interfaceName)
 {
     *interfaceName = "eth0.5";
@@ -1866,9 +2175,7 @@ int probe_group(const char *destination, int port, const char *output, int count
     return 0;
 }
 
-/* ------------------------------------------------- 17. output socket and ctl
- * The port is taken only when told to, which is also the exact moment it becomes
- * free. See docs/development/pathb-supervisor-handover.md. */
+/* ------------------------------------------------- 17. output socket and ctl */
 
 int output_socket_open(OutputSettings *output)
 {
@@ -1930,46 +2237,53 @@ int output_socket_open(OutputSettings *output)
     return descriptor;
 }
 
-void output_bind(Session *session, int port)
+void output_bind(Runtime *runtime, int port)
 {
+    Stream *stream = &runtime->stream;
     int descriptor;
-    if (session->stream.outFd >= 0) return;
-    if (port > 0) g_output.sourcePort = port;
-    descriptor = output_socket_open(&g_output);
+
+    if (stream->outFd >= 0) return;
+    if (port > 0) runtime->output.sourcePort = port;
+    descriptor = output_socket_open(&runtime->output);
     if (descriptor < 0) { log_message("ctl: bind did not happen"); return; }
-    session->stream.outFd = descriptor;
-    session->stream.emitter.count = session->stream.emitter.cursor = 0;
-    supervisor_set_bound(g_output.sourcePort);
-    supervisor_set_ready(0);
+    stream->outFd = descriptor;
+    stream->pipe.count = stream->pipe.cursor = 0;
+    supervisor_set_bound(runtime, runtime->output.sourcePort);
+    supervisor_set_ready(runtime, 0);
     log_message("ctl: PORT OURS");
-    supervisor_publish(1);
+    supervisor_publish(runtime, 1);
 }
 
-void output_unbind(Session *session)
+void output_unbind(Runtime *runtime)
 {
-    if (session->stream.outFd < 0) return;
-    close(session->stream.outFd);
-    session->stream.outFd = -1;
-    session->stream.emitter.count = session->stream.emitter.cursor = 0;
-    supervisor_set_bound(0);
-    supervisor_set_ready(0);
+    Stream *stream = &runtime->stream;
+
+    if (stream->outFd < 0) return;
+    close(stream->outFd);
+    stream->outFd = -1;
+    stream->pipe.count = stream->pipe.cursor = 0;
+    stream->pipe.nextSlotStartNs = 0;
+    stream->pipe.lastEmissionNs = 0;
+    supervisor_set_bound(runtime, 0);
+    supervisor_set_ready(runtime, 0);
     log_message("ctl: port released");
-    supervisor_publish(1);
+    supervisor_publish(runtime, 1);
 }
 
 /* 0 = nothing new, 1 = bind, 2 = unbind, -1 = unrecognised (never acted on) */
-int control_poll(void)
+int control_poll(Runtime *runtime)
 {
+    ControlChannel *control = &runtime->control;
     char buffer[CONTROL_COMMAND_BYTES];
     int descriptor, action = 0;
     long received;
     int index;
 
-    if (!g_control.path[0]) return 0;
-    if (current_time_ms() - g_control.lastPollMs < CONTROL_POLL_INTERVAL_MS) return 0;
-    g_control.lastPollMs = current_time_ms();
+    if (!control->path[0]) return 0;
+    if (current_time_ms() - control->lastPollMs < CONTROL_POLL_INTERVAL_MS) return 0;
+    control->lastPollMs = current_time_ms();
 
-    descriptor = open(g_control.path, O_RDONLY);
+    descriptor = open(control->path, O_RDONLY);
     if (descriptor < 0) return 0;
     received = read(descriptor, buffer, sizeof buffer - 1);
     close(descriptor);
@@ -1977,20 +2291,20 @@ int control_poll(void)
     buffer[received] = 0;
     for (index = 0; index < (int)received; index++)
         if (buffer[index] == '\n' || buffer[index] == '\r') buffer[index] = 0;
-    if (!strcmp(buffer, g_control.lastCommand)) return 0;
+    if (!strcmp(buffer, control->lastCommand)) return 0;
     {   int copy = 0;
-        while (copy < (int)sizeof g_control.lastCommand - 1 && buffer[copy]) {
-            g_control.lastCommand[copy] = buffer[copy];
+        while (copy < (int)sizeof control->lastCommand - 1 && buffer[copy]) {
+            control->lastCommand[copy] = buffer[copy];
             copy++;
         }
-        g_control.lastCommand[copy] = 0;
+        control->lastCommand[copy] = 0;
     }
 
     if (!strncmp(buffer, "bind", 4)) {
         /* The port travels WITH the command, so a supervisor that discovers a new
          * multi-screen-server port never has to restart this process. */
         int requested = atoi(buffer + 4);
-        if (requested > 0 && requested < 65536) { g_control.requestedPort = requested; action = 1; }
+        if (requested > 0 && requested < 65536) { control->requestedPort = requested; action = 1; }
         else { log_message("ctl: 'bind' without a valid port -- ignored"); action = -1; }
     } else if (!strncmp(buffer, "unbind", 6)) {
         action = 2;
@@ -2048,6 +2362,7 @@ int parse_options(int argc, char **arguments, Options *options)
         else if (!strcmp(argument, "--out") && value) { options->output = value; index++; }
         else if (!strcmp(argument, "--conn-state") && value) { options->statePath = value; index++; }
         else if (!strcmp(argument, "--ctl") && value) { options->controlPath = value; index++; }
+        else if (!strcmp(argument, "--trace") && value) { options->tracePath = value; index++; }
         else if (!strcmp(argument, "--monitor")) options->monitor = 1;
         else if (!strcmp(argument, "--pkts-per-dgram") && value) { options->packetsPerDatagram = atoi(value); index++; }
         else if (!strcmp(argument, "--ssrc") && value) { options->ssrc = atoi(value); index++; }
@@ -2077,7 +2392,7 @@ int parse_options(int argc, char **arguments, Options *options)
             Pe("mib3clusterstream: --pace-ms, --no-pace, --ka-ms and --no-ka were removed.\n"
                "  Output pacing is intra-frame and always on; idle fill was measured and refuted.\n"
                "  Use --spread-pct (fraction of the interval to spread a unit over) or --jit-ms\n"
-               "  (buffer depth).  See docs/development/pathb-pacing-and-timing.md\n");
+               "  (start depth).  See docs/development/pathb-pacing-and-timing.md\n");
             return 2;
         }
         else { Pe("unknown arg\n"); return 2; }
@@ -2109,28 +2424,6 @@ void output_settings_from_options(OutputSettings *output, Options *options)
 }
 
 /* ------------------------------------------------ 19. entry point and bodies */
-
-static void arm_diagnostics(Options *options)
-{
-    if (options->statePath && *options->statePath && strcmp(options->statePath, "off") != 0) {
-        usize_t length = strlen(options->statePath);
-        if (length < sizeof g_supervisor.path) {
-            memcpy(g_supervisor.path, options->statePath, length);
-            g_supervisor.path[length] = 0;
-        } else {
-            log_message("--conn-state: path too long, publisher disabled");
-        }
-    }
-    if (options->controlPath && *options->controlPath) {
-        usize_t length = strlen(options->controlPath);
-        if (length < sizeof g_control.path) {
-            memcpy(g_control.path, options->controlPath, length);
-            g_control.path[length] = 0;
-        } else {
-            log_message("--ctl: path too long, control channel disabled");
-        }
-    }
-}
 
 static int open_listener(const char *path)
 {
@@ -2164,9 +2457,9 @@ static int open_listener(const char *path)
 
 int mib3_run(int argc, char **arguments)
 {
+    static Runtime runtime;
     Options options;
-    Session session;
-    Stream *stream = &session.stream;
+    Stream *stream = &runtime.stream;
     int listener = -1;
     int unitCount = 0;
     u8 *blob = 0;
@@ -2175,21 +2468,15 @@ int mib3_run(int argc, char **arguments)
 
     result = parse_options(argc, arguments, &options);
     if (result) return result;
-    g_spreadPercent = options.spreadPercent;
-    arm_diagnostics(&options);
 
-    session_initialise(&session, &options);
+    runtime_initialise(&runtime, &options);
     stream->mux.packetsPerDatagram = options.packetsPerDatagram;
     stream->mux.ssrc = (u32)options.ssrc;
     stream->mux.transportStreamId = options.transportStreamId;
     stream->mux.pmtPid = options.pmtPid;
     stream->mux.elementaryPid = options.elementaryPid;
     stream->mux.pcrPid = options.elementaryPid;
-    stream->emitter.stride = RTP_HEADER_BYTES + options.packetsPerDatagram * TRANSPORT_PACKET_BYTES;
-
-    g_timing.ring.values = g_timingValues;
-    g_timing.ring.capacity = TIMING_RING_CAPACITY;
-    g_timingEnabled = options.statisticsTiming;
+    stream->pipe.stride = RTP_HEADER_BYTES + options.packetsPerDatagram * TRANSPORT_PACKET_BYTES;
 
     if (options.probe)
         return probe_group(options.destination, options.destinationPort, options.output,
@@ -2199,14 +2486,14 @@ int mib3_run(int argc, char **arguments)
         stream->outFd = open(options.output + 5, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (stream->outFd < 0) { log_message("cannot open out"); return 1; }
     } else {
-        output_settings_from_options(&g_output, &options);
+        output_settings_from_options(&runtime.output, &options);
         if (options.monitor) {
             /* The supervisor decides when the port is ours; until then this
              * process only watches the shim's stream. */
             stream->outFd = -1;
             log_message("monitor: AU socket only -- the port is taken on 'bind <port>'");
         } else {
-            int descriptor = output_socket_open(&g_output);
+            int descriptor = output_socket_open(&runtime.output);
             if (descriptor < 0) return descriptor == -2 ? 3 : 1;
             stream->outFd = descriptor;
         }
@@ -2217,7 +2504,7 @@ int mib3_run(int argc, char **arguments)
     if (!strncmp(options.input, "unix:", 5)) {
         listener = open_listener(options.input + 5);
         if (listener < 0) return 1;
-        session_run(&session, listener);   /* never returns */
+        session_run(&runtime, listener);   /* never returns */
         close(listener);
     } else {
         int descriptor = (!strcmp(options.input, "-")) ? 0 : open(options.input, O_RDONLY);
@@ -2236,11 +2523,11 @@ int mib3_run(int argc, char **arguments)
                                        FILE_ACCESS_UNIT_LIMIT);
         log_message("access units: %d", unitCount);
         if (unitCount == 0) return 1;
-        play_file(&session, &options, unitCount);
+        play_file(&runtime, &options, unitCount);
     }
 
-    emitter_release_all(stream, 0);
-    mux_flush(stream);
+    pipe_release_all(&runtime);
+    mux_flush(&runtime);
     log_message("datagrams: %ld", (long)stream->mux.sequence);
     {   u64 elapsed = current_time_ms() - stream->mux.startMs;
         log_message("elapsed_ms: %ld", (long)elapsed);
@@ -2248,10 +2535,15 @@ int mib3_run(int argc, char **arguments)
         if (elapsed > 0)
             log_message("datagrams/sec: %ld", (long)(((u64)stream->mux.sequence * 1000ull) / elapsed));
     }
-    timing_report();
+    timing_report(&runtime);
     if (listener >= 0) close(listener);
+    trace_close(&runtime);
     if (stream->outFd >= 0) close(stream->outFd);
-    queue_release(&session);
+    free(stream->pipe.bytes);
+    free(stream->pipe.datagrams);
+    free(runtime.session.record);
+    free(runtime.session.folded);
+    free(runtime.session.parameters.bytes);
     return 0;
 }
 

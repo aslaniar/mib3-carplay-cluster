@@ -30,7 +30,7 @@ set -u
 # The shim is the build with the cluster nav-text gate (the address and
 # arrival-time bands) and the tuned safe area; both are field-verified.
 SHIM_PIN=c789666fa9fccfcad45a5607e5785482
-SENDER_PIN=a9ab16d0bb8f29ed0ceda3f3ad69472d
+SENDER_PIN=bd8c1f20615985bcd54b127ff498b194
 WHEEL_PIN=e689515fc20a701f0e84d62d9dcd6251
 
 KIT=/tmp/kit
@@ -136,7 +136,7 @@ knobs() {
              MIB3_SHIM_VA_INITIAL=2 \
              "MIB3_SHIM_VA0=0,0,1280,480,0,0,1280,480" \
              "MIB3_SHIM_VA1=0,0,1280,480,0,0,1280,440" \
-             "MIB3_SHIM_VA2=0,0,1280,480,0,0,1280,400" \
+             "MIB3_SHIM_VA2=0,0,1280,480,0,10,1280,400" \
              "MIB3_SHIM_VA3=0,0,1280,480,0,0,1280,360" \
              "MIB3_SHIM_URL=maps:/car/instrumentcluster/map?showETA=no&maneuverLayout=topAligned&showSpeedLimit=no" \
              MIB3_SHIM_CMDACK=1; do

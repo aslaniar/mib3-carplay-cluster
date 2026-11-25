@@ -147,6 +147,9 @@ chk N12a_kit_sets_knob "$(grep -q 'MIB3_SHIM_NAVTEXT=filter' "$KIT/pathb_daemon.
     "pathb_daemon.sh sets the gate"
 chk N12b_safe_area "$(grep -q 'MIB3_SHIM_VA_INITIAL=2' "$KIT/pathb_daemon.sh" && echo 1 || echo 0)" \
     "pathb_daemon.sh sets the tuned safe area"
+chk N12f_safe_box "$( { grep -q 'MIB3_SHIM_VA2=0,0,1280,480,0,10,1280,400' "$KIT/pathb_daemon.sh" \
+                    && grep -q 'MIB3_SHIM_VA2=0,0,1280,480,0,10,1280,400' "$REPO/up.sh"; } && echo 1 || echo 0)" \
+    "both places carry the safe box dropped 10 px"
 chk N12c_up_sh_pin "$(grep -q "${MD5A:-zzz}" "$REPO/up.sh" && echo 1 || echo 0)" "up.sh pins this build"
 chk N12d_inject_pin "$(grep -q "${MD5A:-zzz}" "$REPO/src/inject/run_inject.sh" && echo 1 || echo 0)" "run_inject.sh pins this build"
 chk N12e_push_pin "$(grep -q "${MD5A:-zzz}" "$KIT/push_kit.sh" && echo 1 || echo 0)" "push_kit.sh pins this build"
